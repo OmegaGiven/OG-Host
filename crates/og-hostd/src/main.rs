@@ -1,6 +1,7 @@
 //! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
 
 mod containers;
+mod idmap;
 
 use std::path::PathBuf;
 
@@ -53,6 +54,9 @@ enum Cmd {
         /// Publish a port: [host_ip:]host_port:container_port[/udp], repeatable.
         #[arg(short = 'p', long = "publish")]
         publish: Vec<String>,
+        /// Bind mount: /host/path:/container/path[:ro], repeatable.
+        #[arg(short = 'v', long = "volume")]
+        volume: Vec<String>,
         /// Command (replaces the image's CMD).
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -137,7 +141,8 @@ async fn main() -> Result<()> {
             }
             println!("unpacked {image} into {} in {:.1}s", dest.display(), t0.elapsed().as_secs_f64());
         }
-        Cmd::Run { image, name, env, memory, user, entrypoint, network, publish, command } => {
+        Cmd::Run { image, name, env, memory, user, entrypoint, network, publish, volume, command } => {
+            let binds = volume.iter().map(|v| containers::parse_bind(v)).collect::<Result<Vec<_>>>()?;
             let digest = ensure_pulled(&cli.root, &store, &image, true).await?;
             let memory = memory.map(|m| containers::parse_size(&m)).transpose()?;
             let ports = publish.iter().map(|p| og_net::PortMap::parse(p)).collect::<Result<Vec<_>, _>>()?;
@@ -146,6 +151,7 @@ async fn main() -> Result<()> {
             let meta = tokio::task::spawn_blocking(move || {
                 node.run(&image, &digest, name.as_deref(), choice, ports, |o| {
                     o.env = env;
+                    o.mounts = binds;
                     o.memory_max = memory;
                     o.user = user;
                     if let Some(e) = entrypoint {

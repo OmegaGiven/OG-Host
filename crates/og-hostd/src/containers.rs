@@ -211,6 +211,16 @@ impl Node {
             }
         }
 
+        // bind mounts into a user-namespaced container go through id-mapped staging mounts
+        if let Some(userns) = opts.userns_path.clone() {
+            let staging_dir = PathBuf::from("/run/og-host/idmap").join(&id);
+            for (n, m) in opts.mounts.iter_mut().enumerate() {
+                let staging = staging_dir.join(n.to_string());
+                crate::idmap::map_mount(&m.source, &staging, &userns)?;
+                m.source = staging;
+            }
+        }
+
         // per-container /etc/resolv.conf, /etc/hosts, /etc/hostname (bind-mounted read-only)
         let etc = dir.join("etc");
         std::fs::create_dir_all(&etc)?;
@@ -340,6 +350,7 @@ impl Node {
             bail!("another running container uses this container's network");
         }
         self.net.detach(id)?;
+        crate::idmap::cleanup(&PathBuf::from("/run/og-host/idmap").join(id));
         self.destroy_sandbox(id);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -348,6 +359,22 @@ impl Node {
     pub fn log_path(&self, id: &str) -> PathBuf {
         self.dir(id).join("log")
     }
+}
+
+/// `/host/path:/container/path[:ro|:rw]`
+pub fn parse_bind(s: &str) -> Result<og_runtime::BindMount> {
+    let parts: Vec<&str> = s.split(':').collect();
+    let (src, dst, ro) = match parts.as_slice() {
+        [a, b] => (*a, *b, false),
+        [a, b, "ro"] => (*a, *b, true),
+        [a, b, "rw"] => (*a, *b, false),
+        _ => bail!("bad volume {s:?} (use /host:/container[:ro])"),
+    };
+    let source = std::fs::canonicalize(src).with_context(|| format!("volume source {src:?}"))?;
+    if !dst.starts_with('/') {
+        bail!("volume target {dst:?} must be absolute");
+    }
+    Ok(og_runtime::BindMount { source, target: PathBuf::from(dst), read_only: ro })
 }
 
 pub fn parse_size(s: &str) -> Result<i64> {
