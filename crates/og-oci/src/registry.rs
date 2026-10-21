@@ -294,3 +294,37 @@ mod tests {
         assert_eq!(sniff_media_type(br#"{"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}"#), MT_DOCKER_MANIFEST);
     }
 }
+
+/// The parts of an OCI image config that matter for running it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageConfig {
+    #[serde(default)]
+    pub architecture: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub config: RunConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RunConfig {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub env: Option<Vec<String>>,
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    pub cmd: Option<Vec<String>>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub exposed_ports: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub volumes: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub stop_signal: Option<String>,
+}

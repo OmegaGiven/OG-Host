@@ -1,4 +1,6 @@
-//! og-hostd — OG-Host node daemon. For now: image pull + unpack, the first engine milestone.
+//! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
+
+mod containers;
 
 use std::path::PathBuf;
 
@@ -28,6 +30,39 @@ enum Cmd {
         #[arg(long)]
         owners: bool,
     },
+    /// Create and start a container (pulls the image if needed).
+    Run {
+        image: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// KEY=value, repeatable.
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Hard memory cap, e.g. 256m.
+        #[arg(long)]
+        memory: Option<String>,
+        /// Run as this user (uid, uid:gid, name).
+        #[arg(long)]
+        user: Option<String>,
+        /// Replace the image's entrypoint.
+        #[arg(long)]
+        entrypoint: Option<String>,
+        /// Command (replaces the image's CMD).
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// List containers.
+    Ps,
+    /// Print a container's output.
+    Logs { container: String },
+    /// Stop a container (SIGTERM, then SIGKILL after the timeout).
+    Stop {
+        container: String,
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
+    /// Remove a stopped container.
+    Rm { container: String },
 }
 
 /// refs/<registry>/<repository>/<tag-or-digest> -> manifest digest
@@ -35,36 +70,51 @@ fn ref_path(root: &std::path::Path, r: &Reference) -> PathBuf {
     root.join("refs").join(&r.registry).join(&r.repository).join(r.manifest_ref().replace(':', "_"))
 }
 
+async fn ensure_pulled(root: &std::path::Path, store: &Store, image: &str, quiet: bool) -> Result<String> {
+    let r = Reference::parse(image)?;
+    let p = ref_path(root, &r);
+    if let Ok(d) = tokio::fs::read_to_string(&p).await {
+        return Ok(d.trim().to_string());
+    }
+    let t0 = std::time::Instant::now();
+    let img = Registry::new().pull(&r, store).await.with_context(|| format!("pulling {r}"))?;
+    tokio::fs::create_dir_all(p.parent().unwrap()).await?;
+    tokio::fs::write(&p, &img.manifest_digest).await?;
+    if !quiet {
+        let total: u64 = img.manifest.layers.iter().map(|l| l.size).sum();
+        println!("{r}\n  manifest {}\n  {} layers, {:.1} MB, {:.1}s", img.manifest_digest, img.manifest.layers.len(), total as f64 / 1e6, t0.elapsed().as_secs_f64());
+    }
+    Ok(img.manifest_digest)
+}
+
+fn ago(t: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let s = now.saturating_sub(t);
+    match s {
+        0..=59 => format!("{s}s ago"),
+        60..=3599 => format!("{}m ago", s / 60),
+        3600..=86399 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86400),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
     let cli = Cli::parse();
     let store = Store::open(cli.root.join("content")).await?;
+    let node = containers::Node { root: cli.root.clone(), store: store.clone(), runtime_root: PathBuf::from("/run/og-host/runtime") };
     match cli.cmd {
         Cmd::Pull { image } => {
             let r = Reference::parse(&image)?;
-            let t0 = std::time::Instant::now();
-            let img = Registry::new().pull(&r, &store).await.with_context(|| format!("pulling {r}"))?;
-            let p = ref_path(&cli.root, &r);
-            tokio::fs::create_dir_all(p.parent().unwrap()).await?;
-            tokio::fs::write(&p, &img.manifest_digest).await?;
-            let total: u64 = img.manifest.layers.iter().map(|l| l.size).sum();
-            println!(
-                "{r}\n  manifest {}\n  {} layers, {:.1} MB, {:.1}s",
-                img.manifest_digest,
-                img.manifest.layers.len(),
-                total as f64 / 1e6,
-                t0.elapsed().as_secs_f64()
-            );
+            let _ = tokio::fs::remove_file(ref_path(&cli.root, &r)).await; // explicit pull refreshes the tag
+            ensure_pulled(&cli.root, &store, &image, false).await?;
         }
         Cmd::Unpack { image, dest, owners } => {
-            let r = Reference::parse(&image)?;
-            let digest = tokio::fs::read_to_string(ref_path(&cli.root, &r))
-                .await
-                .with_context(|| format!("{r} is not pulled; run `og-hostd pull {image}` first"))?;
-            let manifest: og_oci::registry::Manifest = serde_json::from_slice(&store.read(digest.trim()).await?)?;
+            let digest = ensure_pulled(&cli.root, &store, &image, true).await?;
+            let manifest: og_oci::registry::Manifest = serde_json::from_slice(&store.read(&digest).await?)?;
             std::fs::create_dir_all(&dest)?;
             let opts = unpack::UnpackOptions { preserve_owner: owners, id_offset: 0 };
             let t0 = std::time::Instant::now();
@@ -74,7 +124,51 @@ async fn main() -> Result<()> {
                 let stats = tokio::task::spawn_blocking(move || unpack::apply_layer(&dest, unpack::open_layer(&path)?, &opts)).await??;
                 println!("  {} {:?}", &layer.digest[..19], stats);
             }
-            println!("unpacked {r} into {} in {:.1}s", dest.display(), t0.elapsed().as_secs_f64());
+            println!("unpacked {image} into {} in {:.1}s", dest.display(), t0.elapsed().as_secs_f64());
+        }
+        Cmd::Run { image, name, env, memory, user, entrypoint, command } => {
+            let digest = ensure_pulled(&cli.root, &store, &image, true).await?;
+            let memory = memory.map(|m| containers::parse_size(&m)).transpose()?;
+            let t0 = std::time::Instant::now();
+            let meta = tokio::task::spawn_blocking(move || {
+                node.run(&image, &digest, name.as_deref(), |o| {
+                    o.env = env;
+                    o.memory_max = memory;
+                    o.user = user;
+                    if let Some(e) = entrypoint {
+                        o.entrypoint = Some(vec![e]);
+                    }
+                    if !command.is_empty() {
+                        o.command = Some(command);
+                    }
+                })
+            })
+            .await??;
+            println!("{} {} started in {:.2}s", meta.name, &meta.id[..12], t0.elapsed().as_secs_f64());
+        }
+        Cmd::Ps => {
+            println!("{:<14} {:<20} {:<34} {:<10} {}", "ID", "NAME", "IMAGE", "STATE", "CREATED");
+            for (m, s) in node.list()? {
+                let state = match (s.state.as_str(), s.exit_code) {
+                    ("exited", Some(c)) => format!("exited({c})"),
+                    (st, _) => st.to_string(),
+                };
+                println!("{:<14} {:<20} {:<34} {:<10} {}", &m.id[..12], m.name, m.image, state, ago(m.created_at));
+            }
+        }
+        Cmd::Logs { container } => {
+            let m = node.find(&container)?;
+            print!("{}", String::from_utf8_lossy(&std::fs::read(node.log_path(&m.id)).unwrap_or_default()));
+        }
+        Cmd::Stop { container, timeout } => {
+            let m = node.find(&container)?;
+            let st = tokio::task::spawn_blocking(move || node.stop(&m.id, timeout)).await??;
+            println!("{} {}", container, st.state);
+        }
+        Cmd::Rm { container } => {
+            let m = node.find(&container)?;
+            node.remove(&m.id)?;
+            println!("removed {}", m.name);
         }
     }
     Ok(())

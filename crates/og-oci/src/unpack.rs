@@ -63,8 +63,19 @@ fn clean_rel(name: &Path) -> Result<PathBuf> {
 }
 
 /// Resolve `rel` under `root` as if `root` were `/`: symlinks in intermediate components
-/// are followed but confined to `root`; the final component is not followed.
+/// are followed but confined to `root`; the final component is not followed (right for
+/// writes, which replace whatever is there).
 pub fn secure_join(root: &Path, rel: &Path) -> Result<PathBuf> {
+    resolve_in_root(root, rel, false)
+}
+
+/// Like [`secure_join`] but also follows a symlink in the final component, still confined to
+/// `root`. Use this for reads (e.g. an image's /etc/passwd), never for writes.
+pub fn secure_resolve(root: &Path, rel: &Path) -> Result<PathBuf> {
+    resolve_in_root(root, rel, true)
+}
+
+fn resolve_in_root(root: &Path, rel: &Path, follow_last: bool) -> Result<PathBuf> {
     let mut parts: Vec<std::ffi::OsString> = rel.components().filter_map(|c| match c {
         Component::Normal(p) => Some(p.to_os_string()),
         _ => None,
@@ -80,7 +91,7 @@ pub fn secure_join(root: &Path, rel: &Path) -> Result<PathBuf> {
         let candidate = current.join(&part);
         let is_last = parts.is_empty();
         match fs::symlink_metadata(root.join(&candidate)) {
-            Ok(m) if m.file_type().is_symlink() && !is_last => {
+            Ok(m) if m.file_type().is_symlink() && (!is_last || follow_last) => {
                 hops += 1;
                 if hops > MAX_SYMLINK_HOPS {
                     return Err(Error::UnsafePath(format!("{}: too many symlinks", rel.display())));
@@ -399,6 +410,10 @@ mod tests {
         assert_eq!(secure_join(root, Path::new("lib/x.so")).unwrap(), root.join("usr/lib/x.so"));
         assert_eq!(secure_join(root, Path::new("lib64/x.so")).unwrap(), root.join("usr/lib/x.so"));
         assert_eq!(secure_join(root, Path::new("../../../etc/passwd")).unwrap(), root.join("etc/passwd"));
+        // reads may follow a final symlink, but only inside the root
+        std::os::unix::fs::symlink("/etc/hostname", root.join("h")).unwrap();
+        assert_eq!(secure_join(root, Path::new("h")).unwrap(), root.join("h"));
+        assert_eq!(secure_resolve(root, Path::new("h")).unwrap(), root.join("etc/hostname"));
         // symlink loop is cut off, not followed forever
         std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
         assert!(secure_join(root, Path::new("loop/x")).is_err());
