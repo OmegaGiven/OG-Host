@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 og-oci = { path = "../og-oci" }
 og-runtime = { path = "../og-runtime" }
+og-net = { path = "../og-net" }
 serde.workspace = true
 libc = "0.2"
 anyhow.workspace = true

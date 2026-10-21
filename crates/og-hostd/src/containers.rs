@@ -25,6 +25,33 @@ pub struct Meta {
     pub manifest_digest: String,
     pub created_at: u64,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub net: Option<og_net::Attachment>,
+    /// `host`, `none`, `container:<id>`, or a network name.
+    #[serde(default)]
+    pub network_mode: String,
+}
+
+/// How a container is connected.
+#[derive(Debug, Clone)]
+pub enum NetChoice {
+    Network(String),
+    None,
+    Host,
+    Container(String),
+}
+
+impl NetChoice {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "none" => NetChoice::None,
+            "host" => NetChoice::Host,
+            _ => match s.strip_prefix("container:").or_else(|| s.strip_prefix("service:")) {
+                Some(c) => NetChoice::Container(c.to_string()),
+                None => NetChoice::Network(s.to_string()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -41,6 +68,7 @@ pub struct Node {
     pub root: PathBuf,
     pub store: Store,
     pub runtime_root: PathBuf,
+    pub net: og_net::Net,
 }
 
 fn now() -> u64 {
@@ -100,7 +128,15 @@ impl Node {
     }
 
     /// Create and start a container from a pulled image.
-    pub fn run(&self, image: &str, manifest_digest: &str, name: Option<&str>, opts_in: impl FnOnce(&mut RunOptions)) -> Result<Meta> {
+    pub fn run(
+        &self,
+        image: &str,
+        manifest_digest: &str,
+        name: Option<&str>,
+        net_choice: NetChoice,
+        ports: Vec<og_net::PortMap>,
+        opts_in: impl FnOnce(&mut RunOptions),
+    ) -> Result<Meta> {
         let id = new_id()?;
         let name = name.map(str::to_string).unwrap_or_else(|| format!("c-{}", &id[..8]));
         if !valid_name(&name) {
@@ -127,14 +163,118 @@ impl Node {
         let mut opts = RunOptions::new(name.clone(), rootfs.clone(), PathBuf::from(format!("/og-host/{name}")));
         opts.userns = Some(map);
         opts_in(&mut opts);
+
+        // networking: namespace + address before the container exists
+        if !ports.is_empty() && !matches!(net_choice, NetChoice::Network(_)) {
+            bail!("ports can only be published on a network (not with none/host/container:)");
+        }
+        // own sandbox (user + network namespace) unless sharing another container's or the host's
+        let sandbox = dir.join("sandbox");
+        if matches!(net_choice, NetChoice::Network(_) | NetChoice::None) {
+            self.create_sandbox(&id, &sandbox, map)?;
+            opts.userns_path = Some(sandbox.join("user"));
+        }
+        let (attachment, network_mode, my_ip) = match &net_choice {
+            NetChoice::Network(n) => {
+                let a = self.net.attach(&id, n, &ports).with_context(|| format!("attaching to network {n:?}"))?;
+                opts.network = og_runtime::Network::Join(a.netns.clone());
+                let ip = a.ip;
+                (Some(a), n.clone(), ip)
+            }
+            NetChoice::None => {
+                let ns = self.net.create_netns(&id)?;
+                opts.network = og_runtime::Network::Join(ns.clone());
+                (Some(og_net::Attachment { owner: id.clone(), netns: ns, network: None, ip: None, gateway: None, prefix: None, host_veth: None, ports: vec![] }), "none".into(), None)
+            }
+            NetChoice::Host => {
+                opts.network = og_runtime::Network::Host;
+                opts.userns = None; // the host network can't be used from a user namespace
+                (None, "host".into(), None)
+            }
+            NetChoice::Container(other) => {
+                let o = self.find(other)?;
+                let ns = o.net.as_ref().map(|a| a.netns.clone()).context("that container has no network namespace to share")?;
+                opts.network = og_runtime::Network::Join(ns);
+                // join its user namespace too: a netns can only be entered from the userns owning it
+                opts.userns_path = Some(self.dir(&o.id).join("sandbox/user"));
+                (None, format!("container:{}", o.id), o.net.as_ref().and_then(|a| a.ip))
+            }
+        };
+        if opts.userns.is_none() {
+            // without a user namespace, files keep their image ownership
+            let _ = std::fs::remove_dir_all(&rootfs);
+            std::fs::create_dir_all(&rootfs)?;
+            let plain = unpack::UnpackOptions { preserve_owner: true, id_offset: 0 };
+            for layer in &manifest.layers {
+                let path = self.store.blob_path(&layer.digest)?;
+                unpack::apply_layer(&rootfs, unpack::open_layer(&path)?, &plain)?;
+            }
+        }
+
+        // per-container /etc/resolv.conf, /etc/hosts, /etc/hostname (bind-mounted read-only)
+        let etc = dir.join("etc");
+        std::fs::create_dir_all(&etc)?;
+        std::fs::write(etc.join("resolv.conf"), og_net::container_resolv_conf())?;
+        std::fs::write(etc.join("hosts"), og_net::container_hosts(&name, my_ip, &[]))?;
+        std::fs::write(etc.join("hostname"), format!("{name}\n"))?;
+        if !matches!(net_choice, NetChoice::Host) {
+            for f in ["resolv.conf", "hosts", "hostname"] {
+                // the target must exist inside the image for the bind mount
+                let target = og_oci::unpack::secure_join(&rootfs, std::path::Path::new("etc").join(f).as_path())?;
+                if let Some(p) = target.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                if std::fs::symlink_metadata(&target).map(|m| !m.is_file()).unwrap_or(true) {
+                    let _ = std::fs::remove_file(&target);
+                    std::fs::write(&target, "")?;
+                }
+                opts.mounts.push(og_runtime::BindMount { source: etc.join(f), target: PathBuf::from("/etc").join(f), read_only: true });
+            }
+        }
         let spec = og_runtime::build_spec(&image_cfg, &opts)?;
         let args = spec.process().as_ref().and_then(|p| p.args().clone()).unwrap_or_default();
         og_runtime::write_bundle(&dir.join("bundle"), &spec)?;
 
-        let meta = Meta { id: id.clone(), name, image: image.to_string(), manifest_digest: manifest_digest.to_string(), created_at: now(), args };
+        let meta = Meta { id: id.clone(), name, image: image.to_string(), manifest_digest: manifest_digest.to_string(), created_at: now(), args, net: attachment, network_mode };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
-        self.spawn_shim(&id)?;
+        if let Err(e) = self.spawn_shim(&id) {
+            let _ = self.net.detach(&id);
+            self.destroy_sandbox(&id);
+            return Err(e);
+        }
         Ok(meta)
+    }
+
+    /// uid:gid of the container's root on the host (from its rootfs owner), if it's remapped.
+    fn stdio_owner(&self, id: &str) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(self.dir(id).join("rootfs")).ok()?;
+        (m.uid() != 0).then(|| format!("{}:{}", m.uid(), m.gid()))
+    }
+
+    fn create_sandbox(&self, id: &str, dir: &std::path::Path, map: IdMap) -> Result<()> {
+        let shim = std::env::current_exe()?.with_file_name("og-shim");
+        let out = Command::new(&shim)
+            .arg("sandbox")
+            .arg("--dir").arg(dir)
+            .arg("--netns-link").arg(PathBuf::from("/run/netns").join(og_net::netns_name(id)))
+            .arg("--host-start").arg(map.host_start.to_string())
+            .arg("--size").arg(map.size.to_string())
+            .output()
+            .context("running og-shim sandbox")?;
+        if !out.status.success() {
+            bail!("creating sandbox: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    fn destroy_sandbox(&self, id: &str) {
+        for f in ["user", "net"] {
+            let p = self.dir(id).join("sandbox").join(f);
+            if let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
+                unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
     }
 
     fn spawn_shim(&self, id: &str) -> Result<()> {
@@ -144,10 +284,11 @@ impl Node {
             bail!("og-shim not found next to og-hostd ({})", shim.display());
         }
         let mut cmd = Command::new(&shim);
-        cmd.args(["--id", id, "--bundle"]).arg(dir.join("bundle"))
+        cmd.args(["run", "--id", id, "--bundle"]).arg(dir.join("bundle"))
             .arg("--state-root").arg(&self.runtime_root)
             .arg("--log").arg(dir.join("log"))
             .arg("--status").arg(dir.join("status.json"))
+            .args(self.stdio_owner(id).map(|o| vec!["--stdio-owner".to_string(), o]).unwrap_or_default())
             .stdin(Stdio::null()).stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("shim.log"))?));
         // new session: the shim (and so the container) outlives this process and its terminal
@@ -195,6 +336,11 @@ impl Node {
         if !dir.starts_with(self.root.join("containers")) || dir == self.root.join("containers") {
             bail!("refusing to remove {}", dir.display());
         }
+        if self.list()?.iter().any(|(m, st)| m.network_mode == format!("container:{id}") && st.state == "running") {
+            bail!("another running container uses this container's network");
+        }
+        self.net.detach(id)?;
+        self.destroy_sandbox(id);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

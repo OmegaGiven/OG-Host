@@ -1,0 +1,17 @@
+[package]
+name = "og-net"
+description = "OG-Host container networking: network namespaces, bridges, veth, IPAM, NAT and port publishing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

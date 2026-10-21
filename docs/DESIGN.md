@@ -205,3 +205,28 @@ One daemon per node. Any node's UI shows the whole cluster (two nodes today).
 - Cloud Hypervisor vs QEMU only (Windows + GPU passthrough maturity).
 - How far to take the native Dockerfile builder vs keeping BuildKit.
 - Licence (Apache-2.0 or MPL-2.0, as OG Paper uses).
+
+## 10. Benchmark plan: OG-Host vs Proxmox VE
+
+Two VMs side by side on the same physical host, identical resources (e.g. 4 vCPU, 8 GB RAM,
+64 GB virtio disk on the same storage, same bridge), one running Proxmox VE 9 (workloads in
+LXC and in Docker inside an LXC/VM, as people actually run them), one running OG-Host. The
+same workloads on both, each test run three times, medians reported.
+
+| Area | Measurement |
+|---|---|
+| Boot | power-on to "all workloads healthy" |
+| Idle overhead | RAM and CPU used by the platform itself with zero workloads, and with the full set idle |
+| Start latency | time to start one container / a 10-service compose stack, cold and warm cache |
+| Density | how many identical small services (nginx, redis, a Node app) start before the first OOM or health failure |
+| Memory pressure | fill memory with a batch job: does a protected service (Postgres) keep its latency? who gets killed? |
+| Reclaim | after a burst, how fast and how much memory returns to the pool |
+| Network | iperf3 container↔container, host→published port, published port from the LAN; latency p50/p99 |
+| Disk | fio random/sequential inside a container volume; image pull + unpack time |
+| GPU (on hardware) | two GPU workloads sharing one card vs passthrough; time-to-first-frame for Wolf |
+| Updates | time to update the host and roll back a bad update; downtime per service |
+| Security | open ports on the host, processes running as host root, container breakout test suite, Lynis/CIS-style host scan, CVE scan (grype/trivy) of the host image, default capability sets, user-namespace use |
+| Footprint | install size, number of packages, lines of code on the privileged path |
+
+Results go in `bench/results/<date>/` with the scripts that produced them, so every number can
+be reproduced.

@@ -47,6 +47,12 @@ enum Cmd {
         /// Replace the image's entrypoint.
         #[arg(long)]
         entrypoint: Option<String>,
+        /// default | <network> | none | host | container:<name>
+        #[arg(long, default_value = "default")]
+        network: String,
+        /// Publish a port: [host_ip:]host_port:container_port[/udp], repeatable.
+        #[arg(short = 'p', long = "publish")]
+        publish: Vec<String>,
         /// Command (replaces the image's CMD).
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -105,7 +111,12 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let store = Store::open(cli.root.join("content")).await?;
-    let node = containers::Node { root: cli.root.clone(), store: store.clone(), runtime_root: PathBuf::from("/run/og-host/runtime") };
+    let node = containers::Node {
+        root: cli.root.clone(),
+        store: store.clone(),
+        runtime_root: PathBuf::from("/run/og-host/runtime"),
+        net: og_net::Net::new(cli.root.join("networks")),
+    };
     match cli.cmd {
         Cmd::Pull { image } => {
             let r = Reference::parse(&image)?;
@@ -126,12 +137,14 @@ async fn main() -> Result<()> {
             }
             println!("unpacked {image} into {} in {:.1}s", dest.display(), t0.elapsed().as_secs_f64());
         }
-        Cmd::Run { image, name, env, memory, user, entrypoint, command } => {
+        Cmd::Run { image, name, env, memory, user, entrypoint, network, publish, command } => {
             let digest = ensure_pulled(&cli.root, &store, &image, true).await?;
             let memory = memory.map(|m| containers::parse_size(&m)).transpose()?;
+            let ports = publish.iter().map(|p| og_net::PortMap::parse(p)).collect::<Result<Vec<_>, _>>()?;
+            let choice = containers::NetChoice::parse(&network);
             let t0 = std::time::Instant::now();
             let meta = tokio::task::spawn_blocking(move || {
-                node.run(&image, &digest, name.as_deref(), |o| {
+                node.run(&image, &digest, name.as_deref(), choice, ports, |o| {
                     o.env = env;
                     o.memory_max = memory;
                     o.user = user;
@@ -144,16 +157,19 @@ async fn main() -> Result<()> {
                 })
             })
             .await??;
-            println!("{} {} started in {:.2}s", meta.name, &meta.id[..12], t0.elapsed().as_secs_f64());
+            let ip = meta.net.as_ref().and_then(|a| a.ip).map(|i| format!(" ip {i}")).unwrap_or_default();
+            println!("{} {} started in {:.2}s{ip}", meta.name, &meta.id[..12], t0.elapsed().as_secs_f64());
         }
         Cmd::Ps => {
-            println!("{:<14} {:<20} {:<34} {:<10} {}", "ID", "NAME", "IMAGE", "STATE", "CREATED");
+            println!("{:<14} {:<16} {:<26} {:<10} {:<15} {:<22} {}", "ID", "NAME", "IMAGE", "STATE", "IP", "PORTS", "CREATED");
             for (m, s) in node.list()? {
+                let ip = m.net.as_ref().and_then(|a| a.ip).map(|i| i.to_string()).unwrap_or_else(|| m.network_mode.clone());
+                let ports = m.net.as_ref().map(|a| a.ports.iter().map(|p| format!("{}->{}", p.host_port, p.container_port)).collect::<Vec<_>>().join(",")).unwrap_or_default();
                 let state = match (s.state.as_str(), s.exit_code) {
                     ("exited", Some(c)) => format!("exited({c})"),
                     (st, _) => st.to_string(),
                 };
-                println!("{:<14} {:<20} {:<34} {:<10} {}", &m.id[..12], m.name, m.image, state, ago(m.created_at));
+                println!("{:<14} {:<16} {:<26} {:<10} {:<15} {:<22} {}", &m.id[..12], m.name, m.image, state, ip, ports, ago(m.created_at));
             }
         }
         Cmd::Logs { container } => {

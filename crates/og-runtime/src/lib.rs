@@ -98,6 +98,9 @@ pub struct RunOptions {
     pub network: Network,
     /// `None` disables the user namespace (needed for host networking, some privileged apps).
     pub userns: Option<IdMap>,
+    /// Join this existing user namespace (a sandbox's) instead of creating one; its id
+    /// mapping must match `userns` (used for rootfs ownership).
+    pub userns_path: Option<PathBuf>,
     pub cap_add: Vec<Capability>,
     pub cap_drop: Vec<Capability>,
     pub read_only_root: bool,
@@ -127,6 +130,7 @@ impl RunOptions {
             mounts: Vec::new(),
             network: Network::Isolated,
             userns: Some(IdMap::default()),
+            userns_path: None,
             cap_add: Vec::new(),
             cap_drop: Vec::new(),
             read_only_root: false,
@@ -263,7 +267,7 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         Network::Host => {}
     }
     if opts.userns.is_some() {
-        namespaces.push(ns(LinuxNamespaceType::User, None)?);
+        namespaces.push(ns(LinuxNamespaceType::User, opts.userns_path.as_deref())?);
     }
 
     // mounts: the standard container set, then user binds
@@ -332,7 +336,7 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         .readonly_paths(
             ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         );
-    if let Some(map) = opts.userns {
+    if let Some(map) = opts.userns.filter(|_| opts.userns_path.is_none()) {
         let m = LinuxIdMappingBuilder::default().container_id(0u32).host_id(map.host_start).size(map.size).build()?;
         linux = linux.uid_mappings(vec![m]).gid_mappings(vec![m]);
     }

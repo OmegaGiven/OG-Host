@@ -17,8 +17,19 @@ use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::syscall::syscall::SyscallType;
 use serde::Serialize;
 
+mod sandbox;
+
 #[derive(Parser)]
 #[command(name = "og-shim", about = "OG-Host per-container supervisor")]
+enum Cli {
+    /// Create, start and supervise one container.
+    Run(Args),
+    /// Create a sandbox: a user namespace with the given id mapping and a network namespace
+    /// owned by it, pinned as files so containers can join both later.
+    Sandbox(sandbox::SandboxArgs),
+}
+
+#[derive(clap::Args)]
 struct Args {
     /// Container id (also the libcontainer state directory name).
     #[arg(long)]
@@ -35,6 +46,10 @@ struct Args {
     /// Where to write {"pid":..} once started and {"exit_code":..} at the end.
     #[arg(long)]
     status: PathBuf,
+    /// Host uid:gid of the container's root (owner of its stdio pipe). Needed when the
+    /// container joins a sandbox's user namespace, as its config then has no id mappings.
+    #[arg(long)]
+    stdio_owner: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -86,7 +101,16 @@ fn write_status(path: &PathBuf, s: &Status) {
 }
 
 fn main() {
-    let args = Args::parse();
+    let args = match Cli::parse() {
+        Cli::Run(a) => a,
+        Cli::Sandbox(a) => {
+            if let Err(e) = sandbox::create(&a) {
+                eprintln!("og-shim sandbox: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    };
     if let Err(e) = run(&args) {
         write_status(&args.status, &Status { state: "failed", pid: None, exit_code: None, signal: None, started_at: None, finished_at: Some(now()), error: Some(format!("{e:#}")) });
         eprintln!("og-shim: {e:#}");
@@ -106,7 +130,13 @@ fn run(args: &Args) -> Result<()> {
     // re-opens /dev/stdout (/proc/self/fd/1) with its *mapped* uid, so the pipe must belong to
     // the container's root (what runc does too). The shim copies the pipe into the log.
     let (read_end, write_end) = pipe()?;
-    if let Some((uid, gid)) = mapped_root(&args.bundle) {
+    let owner = args
+        .stdio_owner
+        .as_deref()
+        .and_then(|o| o.split_once(':'))
+        .and_then(|(u, g)| Some((u.parse().ok()?, g.parse().ok()?)))
+        .or_else(|| mapped_root(&args.bundle));
+    if let Some((uid, gid)) = owner {
         use std::os::fd::AsRawFd;
         if unsafe { libc::fchown(write_end.as_raw_fd(), uid, gid) } != 0 {
             bail!("fchown stdio pipe: {}", std::io::Error::last_os_error());
