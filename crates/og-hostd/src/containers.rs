@@ -37,6 +37,14 @@ pub struct Meta {
     pub service: Option<String>,
     #[serde(default)]
     pub restart: Option<String>,
+    /// "running" or "stopped" — what the user wants; the supervisor works towards it.
+    #[serde(default)]
+    pub desired: String,
+    /// Bind mounts as requested (before id-mapping), so they can be rebuilt after a reboot.
+    #[serde(default)]
+    pub binds: Vec<(PathBuf, PathBuf, bool)>,
+    #[serde(default)]
+    pub healthcheck: Option<og_compose::Healthcheck>,
 }
 
 /// Extra settings that only compose (or later the API) provides.
@@ -50,6 +58,7 @@ pub struct Extra {
     pub extra_hosts: Vec<(String, String)>,
     /// Other services already running in the project (name, ip): known from the start.
     pub peers: Vec<(String, String)>,
+    pub healthcheck: Option<og_compose::Healthcheck>,
 }
 
 /// How a container is connected.
@@ -257,6 +266,7 @@ impl Node {
             volume_mounts.push(og_runtime::BindMount { source: data, target: PathBuf::from(target), read_only: *ro });
         }
 
+        let requested_binds: Vec<(PathBuf, PathBuf, bool)> = opts.mounts.iter().map(|m| (m.source.clone(), m.target.clone(), m.read_only)).collect();
         // bind mounts into a user-namespaced container go through id-mapped staging mounts
         if let Some(userns) = opts.userns_path.clone() {
             let staging_dir = PathBuf::from("/run/og-host/idmap").join(&id);
@@ -310,6 +320,9 @@ impl Node {
             project: extra.project,
             service: extra.service,
             restart: extra.restart,
+            desired: "running".into(),
+            binds: requested_binds,
+            healthcheck: extra.healthcheck,
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         if let Err(e) = self.spawn_shim(&id) {
@@ -352,6 +365,69 @@ impl Node {
         }
     }
 
+    fn save_meta(&self, m: &Meta) -> Result<()> {
+        let p = self.dir(&m.id).join("meta.json");
+        let tmp = p.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
+        std::fs::rename(tmp, p)?;
+        Ok(())
+    }
+
+    pub fn set_desired(&self, id: &str, desired: &str) -> Result<()> {
+        let mut m = self.find(id)?;
+        m.desired = desired.to_string();
+        self.save_meta(&m)
+    }
+
+    /// Start an existing container again. Recreates what lives under /run and is lost on a
+    /// host reboot or after a stop: the sandbox namespaces, network attachment (same address,
+    /// same published ports) and id-mapped bind mounts. Everything is idempotent.
+    pub fn start(&self, id: &str) -> Result<()> {
+        let mut meta = self.find(id)?;
+        if self.status(&meta.id).state == "running" && !self.list()?.iter().any(|(m, st)| m.id == meta.id && st.state == "dead") {
+            return Ok(());
+        }
+        let dir = self.dir(&meta.id);
+        let mounted = mounted_paths();
+        let sandbox = dir.join("sandbox");
+        let own_sandbox = meta.network_mode == "none" || (meta.net.as_ref().is_some_and(|a| a.network.is_some()) && !meta.network_mode.starts_with("container:"));
+        if own_sandbox && !mounted.contains(&sandbox.join("user")) {
+            let _ = self.net.detach_netns_only(&meta.id);
+            self.create_sandbox(&meta.id, &sandbox, IdMap::default())?;
+        }
+        if let Some(a) = meta.net.clone() {
+            if let Some(network) = &a.network {
+                let fresh = self.net.attach(&meta.id, network, &a.ports).with_context(|| format!("re-attaching to {network}"))?;
+                meta.net = Some(fresh);
+                self.save_meta(&meta)?;
+            }
+        }
+        if meta.network_mode.starts_with("container:") {
+            let other = meta.network_mode.trim_start_matches("container:");
+            if self.status(other).state != "running" {
+                bail!("{} shares the network of a container that isn't running", meta.name);
+            }
+        }
+        let userns_file = if meta.network_mode.starts_with("container:") {
+            self.dir(meta.network_mode.trim_start_matches("container:")).join("sandbox/user")
+        } else {
+            sandbox.join("user")
+        };
+        let staging_dir = PathBuf::from("/run/og-host/idmap").join(&meta.id);
+        if userns_file.exists() {
+            for (n, (src, _, _)) in meta.binds.iter().enumerate() {
+                let staging = staging_dir.join(n.to_string());
+                if !mounted.contains(&staging) {
+                    crate::idmap::map_mount(src, &staging, &userns_file)?;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(dir.join("status.json"));
+        meta.desired = "running".into();
+        self.save_meta(&meta)?;
+        self.spawn_shim(&meta.id)
+    }
+
     fn spawn_shim(&self, id: &str) -> Result<()> {
         let dir = self.dir(id);
         let shim = std::env::current_exe()?.with_file_name("og-shim");
@@ -389,6 +465,7 @@ impl Node {
     }
 
     pub fn stop(&self, id: &str, timeout_s: u64) -> Result<Status> {
+        let _ = self.set_desired(id, "stopped");
         let st = self.status(id);
         let Some(pid) = st.pid.filter(|_| st.state == "running") else { return Ok(st) };
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -476,6 +553,16 @@ pub fn parse_bind(s: &str) -> Result<og_runtime::BindMount> {
         bail!("volume target {dst:?} must be absolute");
     }
     Ok(og_runtime::BindMount { source, target: PathBuf::from(dst), read_only: ro })
+}
+
+/// Paths that are currently mount points (from /proc/self/mountinfo).
+pub fn mounted_paths() -> std::collections::HashSet<PathBuf> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split(' ').nth(4))
+        .map(|p| PathBuf::from(p.replace("\\040", " ")))
+        .collect()
 }
 
 pub fn parse_size(s: &str) -> Result<i64> {

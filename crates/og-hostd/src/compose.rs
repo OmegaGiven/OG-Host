@@ -127,6 +127,7 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project) -> Result<
             volumes,
             extra_hosts: s.extra_hosts.clone(),
             peers: project_peers(node, &p.name)?,
+            healthcheck: s.healthcheck.clone(),
         };
         let image = s.image.clone().unwrap();
         let digest = digests[&s.name].clone();

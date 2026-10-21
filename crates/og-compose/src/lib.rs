@@ -10,7 +10,7 @@ pub mod interp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 #[derive(Debug, thiserror::Error)]
@@ -53,7 +53,7 @@ pub struct Build {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Healthcheck {
     /// `["CMD", ...]`, `["CMD-SHELL", "..."]`, or empty when disabled.
     pub test: Vec<String>,

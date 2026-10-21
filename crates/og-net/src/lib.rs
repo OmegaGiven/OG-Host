@@ -358,7 +358,34 @@ impl Net {
         })
     }
 
+    /// Delete the rules tagged for `owner` (used before re-publishing, and on detach).
+    fn unpublish(&self, owner: &str) -> Result<()> {
+        let tag = format!("og:{owner}");
+        if let Ok(rules) = self.table_rules() {
+            let mut script = String::new();
+            for (h, chain, c) in rules {
+                if c == tag {
+                    let _ = writeln!(script, "delete rule ip {TABLE} {chain} handle {h}");
+                }
+            }
+            if !script.is_empty() {
+                nft_apply(&script)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop only the namespace link (for rebuilding a sandbox after a reboot).
+    pub fn detach_netns_only(&self, owner: &str) -> Result<()> {
+        let ns_name = ifname("og-", owner);
+        if Path::new("/run/netns").join(&ns_name).exists() {
+            run(&["ip", "netns", "del", &ns_name])?;
+        }
+        Ok(())
+    }
+
     fn publish(&self, owner: &str, ip: Ipv4Addr, ports: &[PortMap]) -> Result<()> {
+        self.unpublish(owner)?; // idempotent: re-attaching never duplicates rules
         if ports.is_empty() {
             return Ok(());
         }
@@ -383,18 +410,7 @@ impl Net {
 
     /// Remove everything `owner` had: rules, veth, namespace, address. Safe to call twice.
     pub fn detach(&self, owner: &str) -> Result<()> {
-        let tag = format!("og:{owner}");
-        if let Ok(rules) = self.table_rules() {
-            let mut script = String::new();
-            for (h, chain, c) in rules {
-                if c == tag {
-                    let _ = writeln!(script, "delete rule ip {TABLE} {chain} handle {h}");
-                }
-            }
-            if !script.is_empty() {
-                nft_apply(&script)?;
-            }
-        }
+        self.unpublish(owner)?;
         let veth = ifname("ogv", owner);
         if Path::new("/sys/class/net").join(&veth).exists() {
             let _ = run(&["ip", "link", "del", &veth]);

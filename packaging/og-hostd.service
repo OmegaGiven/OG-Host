@@ -1,0 +1,15 @@
+[Unit]
+Description=OG-Host node daemon (containers, networking, restart policies, API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/og-hostd serve --listen 127.0.0.1:8411
+Restart=always
+RestartSec=2
+# Containers are supervised by their own og-shim processes, so stopping or restarting the
+# daemon must not kill them.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

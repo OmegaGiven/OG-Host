@@ -3,6 +3,7 @@
 mod compose;
 mod containers;
 mod idmap;
+mod serve;
 
 use std::path::PathBuf;
 
@@ -90,6 +91,14 @@ enum Cmd {
         #[arg(long)]
         volumes: bool,
     },
+    /// Run the node daemon: API, restart policies, health monitoring.
+    Serve {
+        /// Also listen on TCP (e.g. 127.0.0.1:8411); requires the bearer token.
+        #[arg(long)]
+        listen: Option<String>,
+    },
+    /// Start a stopped container.
+    Start { container: String },
     /// Check a compose file: services in start order, what's used, and unsupported keys.
     /// Prints names and counts only, never values (compose files hold secrets).
     Config {
@@ -222,6 +231,14 @@ async fn main() -> Result<()> {
             let p = og_compose::load(&file, project.as_deref(), &env)?;
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || compose::down(&node, &root, &p, volumes)).await??;
+        }
+        Cmd::Serve { listen } => {
+            serve::serve(node, cli.root.clone(), listen).await?;
+        }
+        Cmd::Start { container } => {
+            let m = node.find(&container)?;
+            tokio::task::block_in_place(|| node.start(&m.id))?;
+            println!("{} started", m.name);
         }
         Cmd::Config { file, project } => {
             let env: og_compose::interp::Vars = std::env::vars().collect();
