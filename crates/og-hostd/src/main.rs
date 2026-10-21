@@ -1,5 +1,6 @@
 //! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
 
+mod compose;
 mod containers;
 mod idmap;
 
@@ -73,6 +74,22 @@ enum Cmd {
     },
     /// Remove a stopped container.
     Rm { container: String },
+    /// Create and start every service of a compose project.
+    Up {
+        #[arg(short = 'f', long = "file", default_value = "docker-compose.yml")]
+        file: PathBuf,
+        #[arg(short = 'p', long = "project-name")]
+        project: Option<String>,
+    },
+    /// Stop and remove a compose project's containers (volumes are kept unless --volumes).
+    Down {
+        #[arg(short = 'f', long = "file", default_value = "docker-compose.yml")]
+        file: PathBuf,
+        #[arg(short = 'p', long = "project-name")]
+        project: Option<String>,
+        #[arg(long)]
+        volumes: bool,
+    },
     /// Check a compose file: services in start order, what's used, and unsupported keys.
     /// Prints names and counts only, never values (compose files hold secrets).
     Config {
@@ -88,7 +105,7 @@ fn ref_path(root: &std::path::Path, r: &Reference) -> PathBuf {
     root.join("refs").join(&r.registry).join(&r.repository).join(r.manifest_ref().replace(':', "_"))
 }
 
-async fn ensure_pulled(root: &std::path::Path, store: &Store, image: &str, quiet: bool) -> Result<String> {
+pub(crate) async fn ensure_pulled(root: &std::path::Path, store: &Store, image: &str, quiet: bool) -> Result<String> {
     let r = Reference::parse(image)?;
     let p = ref_path(root, &r);
     if let Ok(d) = tokio::fs::read_to_string(&p).await {
@@ -157,7 +174,7 @@ async fn main() -> Result<()> {
             let choice = containers::NetChoice::parse(&network);
             let t0 = std::time::Instant::now();
             let meta = tokio::task::spawn_blocking(move || {
-                node.run(&image, &digest, name.as_deref(), choice, ports, |o| {
+                node.run(&image, &digest, name.as_deref(), choice, ports, containers::Extra::default(), |o| {
                     o.env = env;
                     o.mounts = binds;
                     o.memory_max = memory;
@@ -194,6 +211,17 @@ async fn main() -> Result<()> {
             let m = node.find(&container)?;
             let st = tokio::task::spawn_blocking(move || node.stop(&m.id, timeout)).await??;
             println!("{} {}", container, st.state);
+        }
+        Cmd::Up { file, project } => {
+            let env: og_compose::interp::Vars = std::env::vars().collect();
+            let p = og_compose::load(&file, project.as_deref(), &env)?;
+            compose::up(&node, &cli.root, &store, &p).await?;
+        }
+        Cmd::Down { file, project, volumes } => {
+            let env: og_compose::interp::Vars = std::env::vars().collect();
+            let p = og_compose::load(&file, project.as_deref(), &env)?;
+            let root = cli.root.clone();
+            tokio::task::spawn_blocking(move || compose::down(&node, &root, &p, volumes)).await??;
         }
         Cmd::Config { file, project } => {
             let env: og_compose::interp::Vars = std::env::vars().collect();

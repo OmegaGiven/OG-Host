@@ -30,6 +30,26 @@ pub struct Meta {
     /// `host`, `none`, `container:<id>`, or a network name.
     #[serde(default)]
     pub network_mode: String,
+    /// Compose project and service this container belongs to.
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub restart: Option<String>,
+}
+
+/// Extra settings that only compose (or later the API) provides.
+#[derive(Debug, Clone, Default)]
+pub struct Extra {
+    pub project: Option<String>,
+    pub service: Option<String>,
+    pub restart: Option<String>,
+    /// Named volumes: (volume dir on host, target in container, read-only).
+    pub volumes: Vec<(PathBuf, String, bool)>,
+    pub extra_hosts: Vec<(String, String)>,
+    /// Other services already running in the project (name, ip): known from the start.
+    pub peers: Vec<(String, String)>,
 }
 
 /// How a container is connected.
@@ -135,6 +155,7 @@ impl Node {
         name: Option<&str>,
         net_choice: NetChoice,
         ports: Vec<og_net::PortMap>,
+        extra: Extra,
         opts_in: impl FnOnce(&mut RunOptions),
     ) -> Result<Meta> {
         let id = new_id()?;
@@ -211,6 +232,31 @@ impl Node {
             }
         }
 
+        // named volumes: created on first use and seeded from the image's own content at that
+        // path (Docker's copy-up), so e.g. a database data dir starts with the right owner.
+        // Their files are already in the container's id range: plain bind, no id-mapping.
+        let mut volume_mounts = Vec::new();
+        for (vol_dir, target, ro) in &extra.volumes {
+            let data = vol_dir.join("_data");
+            if !data.exists() {
+                std::fs::create_dir_all(&data)?;
+                let src = og_oci::unpack::secure_join(&rootfs, std::path::Path::new(target.trim_start_matches('/')))?;
+                if src.is_dir() {
+                    let st = Command::new("cp").arg("-a").arg(format!("{}/.", src.display())).arg(&data).status()?;
+                    if !st.success() {
+                        bail!("seeding volume {} from the image failed", vol_dir.display());
+                    }
+                    use std::os::unix::fs::MetadataExt;
+                    let md = std::fs::metadata(&src)?;
+                    std::os::unix::fs::lchown(&data, Some(md.uid()), Some(md.gid()))?;
+                } else {
+                    let owner = if opts.userns.is_some() { map.host_start } else { 0 };
+                    std::os::unix::fs::lchown(&data, Some(owner), Some(owner))?;
+                }
+            }
+            volume_mounts.push(og_runtime::BindMount { source: data, target: PathBuf::from(target), read_only: *ro });
+        }
+
         // bind mounts into a user-namespaced container go through id-mapped staging mounts
         if let Some(userns) = opts.userns_path.clone() {
             let staging_dir = PathBuf::from("/run/og-host/idmap").join(&id);
@@ -221,11 +267,18 @@ impl Node {
             }
         }
 
+        opts.mounts.extend(volume_mounts);
+
         // per-container /etc/resolv.conf, /etc/hosts, /etc/hostname (bind-mounted read-only)
         let etc = dir.join("etc");
         std::fs::create_dir_all(&etc)?;
         std::fs::write(etc.join("resolv.conf"), og_net::container_resolv_conf())?;
-        std::fs::write(etc.join("hosts"), og_net::container_hosts(&name, my_ip, &[]))?;
+        let gateway = attachment.as_ref().and_then(|a| a.gateway).map(|g| g.to_string()).unwrap_or_else(|| "127.0.0.1".into());
+        let extra_hosts: Vec<(String, String)> =
+            extra.extra_hosts.iter().map(|(h, ip)| (h.clone(), if ip == "host-gateway" { gateway.clone() } else { ip.clone() })).collect();
+        let hosts_entries: Vec<(String, String)> = extra.peers.iter().cloned().chain(extra_hosts.iter().cloned()).collect();
+        std::fs::write(etc.join("hosts"), og_net::container_hosts(extra.service.as_deref().unwrap_or(&name), my_ip, &hosts_entries))?;
+        std::fs::write(etc.join("extra_hosts.json"), serde_json::to_vec(&extra_hosts)?)?;
         std::fs::write(etc.join("hostname"), format!("{name}\n"))?;
         if !matches!(net_choice, NetChoice::Host) {
             for f in ["resolv.conf", "hosts", "hostname"] {
@@ -245,7 +298,19 @@ impl Node {
         let args = spec.process().as_ref().and_then(|p| p.args().clone()).unwrap_or_default();
         og_runtime::write_bundle(&dir.join("bundle"), &spec)?;
 
-        let meta = Meta { id: id.clone(), name, image: image.to_string(), manifest_digest: manifest_digest.to_string(), created_at: now(), args, net: attachment, network_mode };
+        let meta = Meta {
+            id: id.clone(),
+            name,
+            image: image.to_string(),
+            manifest_digest: manifest_digest.to_string(),
+            created_at: now(),
+            args,
+            net: attachment,
+            network_mode,
+            project: extra.project,
+            service: extra.service,
+            restart: extra.restart,
+        };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         if let Err(e) = self.spawn_shim(&id) {
             let _ = self.net.detach(&id);
@@ -354,6 +419,42 @@ impl Node {
         self.destroy_sandbox(id);
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    /// Rewrite a container's /etc/hosts in place (same inode, so the bind mount sees it).
+    pub fn set_hosts(&self, meta: &Meta, peers: &[(String, String)]) -> Result<()> {
+        let dir = self.dir(&meta.id).join("etc");
+        let extra: Vec<(String, String)> = std::fs::read(dir.join("extra_hosts.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let ip = meta.net.as_ref().and_then(|a| a.ip);
+        let all: Vec<(String, String)> = peers.iter().cloned().chain(extra).collect();
+        let text = og_net::container_hosts(meta.service.as_deref().unwrap_or(&meta.name), ip, &all);
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(dir.join("hosts"))?;
+        f.write_all(text.as_bytes())?;
+        Ok(())
+    }
+
+    /// Run a command inside a running container (its namespaces and root, as `user`).
+    /// Returns (exit code, combined output). Used for healthchecks.
+    pub fn exec(&self, id: &str, argv: &[String], user: Option<(u32, u32)>, timeout_s: u64) -> Result<(i32, String)> {
+        let st = self.status(id);
+        let pid = st.pid.filter(|_| st.state == "running").context("container is not running")?;
+        let mut cmd = Command::new("timeout");
+        cmd.arg("--kill-after=2").arg(format!("{timeout_s}s")).arg("nsenter").arg("-t").arg(pid.to_string()).args(["-a", "-r", "-w"]);
+        if let Some((u, g)) = user {
+            cmd.arg(format!("-S{u}")).arg(format!("-G{g}"));
+        }
+        cmd.arg("--").args(argv);
+        let out = cmd.stdin(Stdio::null()).output().context("running nsenter")?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Ok((out.status.code().unwrap_or(-1), text))
+    }
+
+    /// uid/gid the container's process runs as (inside the container), from its bundle.
+    pub fn process_user(&self, id: &str) -> Option<(u32, u32)> {
+        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(self.dir(id).join("bundle/config.json")).ok()?).ok()?;
+        Some((cfg["process"]["user"]["uid"].as_u64()? as u32, cfg["process"]["user"]["gid"].as_u64()? as u32))
     }
 
     pub fn log_path(&self, id: &str) -> PathBuf {

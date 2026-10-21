@@ -9,11 +9,14 @@
 
 pub mod users;
 
+pub use oci_spec::runtime::Capability;
+
 use std::path::{Path, PathBuf};
 
 use og_oci::registry::ImageConfig;
 use oci_spec::runtime::{
-    Capability, LinuxBuilder, LinuxCapabilitiesBuilder, LinuxIdMappingBuilder, LinuxMemoryBuilder, LinuxNamespace,
+    LinuxBuilder, LinuxCapabilitiesBuilder, LinuxDeviceBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder,
+    LinuxDeviceType, LinuxIdMappingBuilder, LinuxMemoryBuilder, LinuxNamespace,
     LinuxNamespaceBuilder, LinuxNamespaceType, LinuxPidsBuilder, LinuxResourcesBuilder, LinuxCpuBuilder, Mount,
     MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
@@ -95,6 +98,10 @@ pub struct RunOptions {
     /// `uid`, `uid:gid`, `name` or `name:group`; resolved inside the rootfs.
     pub user: Option<String>,
     pub mounts: Vec<BindMount>,
+    /// tmpfs mounts (target, size in bytes).
+    pub tmpfs: Vec<(PathBuf, Option<u64>)>,
+    /// Host device nodes passed through at the same path (e.g. /dev/net/tun).
+    pub devices: Vec<PathBuf>,
     pub network: Network,
     /// `None` disables the user namespace (needed for host networking, some privileged apps).
     pub userns: Option<IdMap>,
@@ -128,6 +135,8 @@ impl RunOptions {
             working_dir: None,
             user: None,
             mounts: Vec::new(),
+            tmpfs: Vec::new(),
+            devices: Vec::new(),
             network: Network::Isolated,
             userns: Some(IdMap::default()),
             userns_path: None,
@@ -301,6 +310,62 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         );
     }
 
+    for (target, size) in &opts.tmpfs {
+        if !target.is_absolute() {
+            return Err(Error::Invalid(format!("tmpfs target {} must be absolute", target.display())));
+        }
+        let mut o = vec!["nosuid".to_string(), "nodev".to_string(), "mode=1777".to_string()];
+        if let Some(sz) = size {
+            o.push(format!("size={sz}"));
+        }
+        mounts.push(MountBuilder::default().destination(target.clone()).typ("tmpfs".to_string()).source(PathBuf::from("tmpfs")).options(o).build()?);
+    }
+
+    // devices: deny everything, allow the standard set (as runc/Docker do), plus passthroughs.
+    // Without this, a container lacking a user namespace could mknod e.g. a raw disk.
+    let mut device_rules = vec![LinuxDeviceCgroupBuilder::default().allow(false).access("rwm".to_string()).build()?];
+    let allow = |typ: LinuxDeviceType, major: Option<i64>, minor: Option<i64>, access: &str| -> Result<LinuxDeviceCgroup> {
+        let mut b = LinuxDeviceCgroupBuilder::default().allow(true).typ(typ).access(access.to_string());
+        if let Some(m) = major {
+            b = b.major(m);
+        }
+        if let Some(m) = minor {
+            b = b.minor(m);
+        }
+        Ok(b.build()?)
+    };
+    for (maj, min) in [(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (5, 0), (5, 2)] {
+        device_rules.push(allow(LinuxDeviceType::C, Some(maj), Some(min), "rwm")?);
+    }
+    device_rules.push(allow(LinuxDeviceType::C, Some(136), None, "rwm")?); // /dev/pts/*
+    let mut linux_devices = Vec::new();
+    for dev in &opts.devices {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let md = std::fs::metadata(dev).map_err(|e| Error::Invalid(format!("device {}: {e}", dev.display())))?;
+        let ft = md.file_type();
+        let typ = if ft.is_char_device() {
+            LinuxDeviceType::C
+        } else if ft.is_block_device() {
+            LinuxDeviceType::B
+        } else {
+            return Err(Error::Invalid(format!("{} is not a device node", dev.display())));
+        };
+        let rdev = md.rdev();
+        let (major, minor) = (libc_major(rdev), libc_minor(rdev));
+        linux_devices.push(
+            LinuxDeviceBuilder::default()
+                .path(dev.clone())
+                .typ(typ)
+                .major(major)
+                .minor(minor)
+                .file_mode(md.mode() & 0o777)
+                .uid(0u32)
+                .gid(0u32)
+                .build()?,
+        );
+        device_rules.push(allow(typ, Some(major), Some(minor), "rwm")?);
+    }
+
     // resources: cgroup v2 memory knobs go through `unified` so low/high are expressible
     let mut unified = std::collections::HashMap::new();
     if let Some(h) = opts.memory_high {
@@ -309,7 +374,7 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
     if let Some(l) = opts.memory_low {
         unified.insert("memory.low".to_string(), l.to_string());
     }
-    let mut res = LinuxResourcesBuilder::default().pids(LinuxPidsBuilder::default().limit(opts.pids_max).build()?);
+    let mut res = LinuxResourcesBuilder::default().pids(LinuxPidsBuilder::default().limit(opts.pids_max).build()?).devices(device_rules);
     if let Some(m) = opts.memory_max {
         res = res.memory(LinuxMemoryBuilder::default().limit(m).build()?);
     }
@@ -322,6 +387,7 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
 
     let mut linux = LinuxBuilder::default()
         .namespaces(namespaces)
+        .devices(linux_devices)
         .resources(res.build()?)
         .cgroups_path(opts.cgroup_path.clone())
         .masked_paths(
@@ -350,6 +416,14 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         .linux(linux.build()?)
         .build()?;
     Ok(spec)
+}
+
+// glibc's major()/minor() encoding for dev_t
+fn libc_major(dev: u64) -> i64 {
+    (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0000_0fff)) as i64
+}
+fn libc_minor(dev: u64) -> i64 {
+    (((dev >> 12) & 0xffff_ff00) | (dev & 0x0000_00ff)) as i64
 }
 
 /// Write `<bundle>/config.json`.
@@ -417,6 +491,21 @@ mod tests {
         let types: Vec<_> = linux.namespaces().as_ref().unwrap().iter().map(|n| n.typ()).collect();
         assert!(types.contains(&LinuxNamespaceType::User) && types.contains(&LinuxNamespaceType::Network));
         assert_eq!(linux.uid_mappings().as_ref().unwrap()[0].host_id(), 100_000);
+    }
+
+    #[test]
+    fn devices_default_deny_and_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = opts();
+        o.rootfs = dir.path().to_path_buf();
+        o.devices = vec![PathBuf::from("/dev/null")];
+        let s = build_spec(&img(None, Some(&["x"]), &[]), &o).unwrap();
+        let rules = s.linux().as_ref().unwrap().resources().as_ref().unwrap().devices().clone().unwrap();
+        assert!(!rules[0].allow(), "first rule denies everything");
+        let devs = s.linux().as_ref().unwrap().devices().clone().unwrap();
+        assert_eq!((devs[0].major(), devs[0].minor()), (1, 3), "/dev/null is 1:3");
+        o.devices = vec![PathBuf::from("/etc/hostname")];
+        assert!(build_spec(&img(None, Some(&["x"]), &[]), &o).is_err(), "regular files are not devices");
     }
 
     #[test]

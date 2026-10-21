@@ -11,4 +11,4 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 libc = "0.2"
-libcontainer = { version = "0.7.0", default-features = false, features = ["v2", "libseccomp"] }
+libcontainer = { version = "0.7.0", default-features = false, features = ["v2", "libseccomp", "cgroupsv2_devices"] }

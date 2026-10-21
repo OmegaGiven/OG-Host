@@ -282,6 +282,35 @@ impl Net {
         Ok(self.table_rules()?.iter().any(|(_, _, com)| com == c))
     }
 
+    /// Remove a network: its NAT/isolation rules, bridge and state. Refused while in use.
+    pub fn remove(&self, name: &str) -> Result<()> {
+        let Some(net) = self.get(name)? else { return Ok(()) };
+        if let Ok(text) = std::fs::read_to_string(self.ipam_path(name)) {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if v["allocations"].as_object().is_some_and(|a| !a.is_empty()) {
+                return Err(Error::Invalid(format!("network {name:?} still has containers attached")));
+            }
+        }
+        let tag = format!("og-net:{name}");
+        if let Ok(rules) = self.table_rules() {
+            let mut script = String::new();
+            for (h, chain, c) in rules {
+                if c == tag {
+                    let _ = writeln!(script, "delete rule ip {TABLE} {chain} handle {h}");
+                }
+            }
+            if !script.is_empty() {
+                nft_apply(&script)?;
+            }
+        }
+        if Path::new("/sys/class/net").join(&net.bridge).exists() {
+            run(&["ip", "link", "del", &net.bridge])?;
+        }
+        let _ = std::fs::remove_file(self.ipam_path(name));
+        std::fs::remove_file(self.def_path(name))?;
+        Ok(())
+    }
+
     /// A namespace with only loopback (up). Used for `network: none` and as the first step of attach.
     pub fn create_netns(&self, owner: &str) -> Result<PathBuf> {
         let name = ifname("og-", owner);
