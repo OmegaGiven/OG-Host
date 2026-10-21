@@ -117,7 +117,7 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn new_id() -> Result<String> {
+pub fn new_id() -> Result<String> {
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
@@ -596,18 +596,60 @@ impl Node {
     /// Run a command inside a running container (its namespaces and root, as `user`).
     /// Returns (exit code, combined output). Used for healthchecks.
     pub fn exec(&self, id: &str, argv: &[String], user: Option<(u32, u32)>, timeout_s: u64) -> Result<(i32, String)> {
-        let st = self.status(id);
-        let pid = st.pid.filter(|_| st.state == "running").context("container is not running")?;
+        // same confinement as docker exec (cgroup, capabilities, seccomp), bounded by `timeout`
+        let user = user.map(|(u, g)| format!("{u}:{g}"));
+        let inner = self.exec_command(id, argv, user.as_deref(), &[], None)?;
         let mut cmd = Command::new("timeout");
-        cmd.arg("--kill-after=2").arg(format!("{timeout_s}s")).arg("nsenter").arg("-t").arg(pid.to_string()).args(["-a", "-r", "-w"]);
-        if let Some((u, g)) = user {
-            cmd.arg(format!("-S{u}")).arg(format!("-G{g}"));
-        }
-        cmd.arg("--").args(argv);
-        let out = cmd.stdin(Stdio::null()).output().context("running nsenter")?;
+        cmd.arg("--kill-after=2").arg(format!("{timeout_s}s")).arg(inner.get_program()).args(inner.get_args());
+        let out = cmd.stdin(Stdio::null()).output().context("running og-shim exec")?;
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         Ok((out.status.code().unwrap_or(-1), text))
+    }
+
+    /// `og-shim exec` command for a running container. `user` is Docker's form (name, uid,
+    /// uid:gid, name:group), resolved against the container's own /etc/passwd and /etc/group;
+    /// None means the container's configured user.
+    pub fn exec_command(&self, id: &str, argv: &[String], user: Option<&str>, env: &[String], cwd: Option<&str>) -> Result<std::process::Command> {
+        let st = self.status(id);
+        if st.state != "running" {
+            bail!("container {id} is not running");
+        }
+        if argv.is_empty() {
+            bail!("no command given");
+        }
+        let (uid, gid, extra) = match user.filter(|u| !u.is_empty()) {
+            Some(u) => {
+                let ids = og_runtime::users::resolve(&self.dir(id).join("rootfs"), Some(u)).map_err(|e| anyhow::anyhow!("user {u:?}: {e}"))?;
+                (ids.uid, ids.gid, ids.additional_gids)
+            }
+            None => {
+                let (u, g) = self.process_user(id).unwrap_or((0, 0));
+                (u, g, Vec::new())
+            }
+        };
+        let shim = std::env::current_exe()?.with_file_name("og-shim");
+        let mut cmd = Command::new(&shim);
+        cmd.args(["exec", "--id", id]).arg("--state-root").arg(&self.runtime_root).arg("--user").arg(format!("{uid}:{gid}"));
+        for g in extra {
+            cmd.arg("--additional-gids").arg(g.to_string());
+        }
+        if let Some(c) = cwd.filter(|c| !c.is_empty()) {
+            cmd.arg("--cwd").arg(c);
+        }
+        for e in env {
+            cmd.arg("--env").arg(e);
+        }
+        let owner = self.stdio_owner(id).or_else(|| {
+            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(self.dir(id).join("bundle/config.json")).ok()?).ok()?;
+            let host = |k: &str| cfg["linux"][k].as_array()?.iter().find(|m| m["containerID"].as_u64() == Some(0))?["hostID"].as_u64();
+            Some(format!("{}:{}", host("uidMappings")?, host("gidMappings")?))
+        });
+        if let Some(o) = owner {
+            cmd.arg("--stdio-owner").arg(o);
+        }
+        cmd.arg("--").args(argv);
+        Ok(cmd)
     }
 
     /// uid/gid the container's process runs as (inside the container), from its bundle.
@@ -619,6 +661,11 @@ impl Node {
     pub fn log_path(&self, id: &str) -> PathBuf {
         self.dir(id).join("log")
     }
+}
+
+/// Docker's `seccomp=unconfined` / `seccomp:unconfined` security option.
+pub fn is_seccomp_unconfined(opt: &str) -> bool {
+    matches!(opt.trim(), "seccomp=unconfined" | "seccomp:unconfined")
 }
 
 /// `/host/path:/container/path[:ro|:rw]`

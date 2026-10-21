@@ -61,6 +61,9 @@ enum Cmd {
         /// Bind mount: /host/path:/container/path[:ro], repeatable.
         #[arg(short = 'v', long = "volume")]
         volume: Vec<String>,
+        /// GPUs: all, or a GPU index/UUID; or any CDI name (vendor.com/class=name). Repeatable.
+        #[arg(long = "gpus")]
+        gpus: Vec<String>,
         /// Command (replaces the image's CMD).
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -198,7 +201,8 @@ async fn main() -> Result<()> {
             }
             println!("unpacked {image} into {} in {:.1}s", dest.display(), t0.elapsed().as_secs_f64());
         }
-        Cmd::Run { image, name, env, memory, user, entrypoint, network, publish, volume, command } => {
+        Cmd::Run { image, name, env, memory, user, entrypoint, network, publish, volume, gpus, command } => {
+            let cdi: Vec<String> = gpus.iter().map(|g| if g.contains('=') { g.clone() } else { format!("nvidia.com/gpu={g}") }).collect();
             let binds = volume.iter().map(|v| containers::parse_bind(v)).collect::<Result<Vec<_>>>()?;
             let digest = ensure_pulled(&cli.root, &store, &image, true).await?;
             let memory = memory.map(|m| containers::parse_size(&m)).transpose()?;
@@ -209,6 +213,7 @@ async fn main() -> Result<()> {
                 node.run(&image, &digest, name.as_deref(), choice, ports, containers::Extra::default(), |o| {
                     o.env = env;
                     o.mounts = binds;
+                    o.cdi_devices = cdi;
                     o.memory_max = memory;
                     o.user = user;
                     if let Some(e) = entrypoint {

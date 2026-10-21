@@ -124,9 +124,6 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
         if s.privileged {
             eprintln!("warning: {}: privileged mode is not supported; running with default privileges", s.name);
         }
-        if s.gpus {
-            eprintln!("warning: {}: GPU access is not wired up yet", s.name);
-        }
 
         // wait for dependencies to be ready, not just started
         for (dep, cond) in &s.depends_on {
@@ -167,6 +164,10 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
                 o.mounts = binds;
                 o.tmpfs = tmpfs;
                 o.devices = devices;
+                o.seccomp_unconfined = svc.security_opt.iter().any(|x| crate::containers::is_seccomp_unconfined(x));
+                if svc.gpus {
+                    o.cdi_devices = vec!["nvidia.com/gpu=all".into()];
+                }
                 o.cap_add = cap_add;
                 o.cap_drop = cap_drop;
                 o.memory_max = memory;

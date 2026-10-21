@@ -30,3 +30,7 @@ tempfile = "3"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Security fixes for exec (see vendor/libcontainer/OG-HOST-PATCHES.md)
+[patch.crates-io]
+libcontainer = { path = "vendor/libcontainer" }

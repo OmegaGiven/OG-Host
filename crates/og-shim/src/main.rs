@@ -24,6 +24,10 @@ mod sandbox;
 enum Cli {
     /// Create, start and supervise one container.
     Run(Args),
+    /// Run an extra process inside a running container (docker exec): joins its namespaces and
+    /// cgroup and keeps its capability bounding set, seccomp filter and no_new_privs. Uses our
+    /// stdin/stdout/stderr; exits with the process's exit code.
+    Exec(ExecArgs),
     /// Create a sandbox: a user namespace with the given id mapping and a network namespace
     /// owned by it, pinned as files so containers can join both later.
     Sandbox(sandbox::SandboxArgs),
@@ -50,6 +54,29 @@ struct Args {
     /// container joins a sandbox's user namespace, as its config then has no id mappings.
     #[arg(long)]
     stdio_owner: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ExecArgs {
+    #[arg(long)]
+    id: String,
+    #[arg(long, default_value = "/run/og-host/runtime")]
+    state_root: PathBuf,
+    /// uid:gid inside the container (default: root).
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    additional_gids: Vec<u32>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// KEY=VALUE, repeatable; added to the container's environment.
+    #[arg(long)]
+    env: Vec<String>,
+    /// Host uid:gid of the container's root; our stdio pipes are handed to it (see run).
+    #[arg(long)]
+    stdio_owner: Option<String>,
+    #[arg(trailing_var_arg = true, required = true)]
+    argv: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -110,6 +137,13 @@ fn main() {
             }
             return;
         }
+        Cli::Exec(a) => match exec(&a) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("og-shim exec: {e:#}");
+                std::process::exit(126);
+            }
+        },
     };
     if let Err(e) = run(&args) {
         write_status(&args.status, &Status { state: "failed", pid: None, exit_code: None, signal: None, started_at: None, finished_at: Some(now()), error: Some(format!("{e:#}")) });
@@ -210,4 +244,84 @@ fn run(args: &Args) -> Result<()> {
     }
     write_status(&args.status, &Status { state: "exited", pid: Some(pid), exit_code, signal, started_at: Some(started_at), finished_at: Some(now()), error: None });
     Ok(())
+}
+
+fn parse_pair(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+fn exec(args: &ExecArgs) -> Result<i32> {
+    use std::os::fd::FromRawFd;
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        bail!("prctl(PR_SET_CHILD_SUBREAPER): {}", std::io::Error::last_os_error());
+    }
+    // only pipes/sockets are handed over; never chown a real file such as /dev/null
+    if let Some((uid, gid)) = args.stdio_owner.as_deref().and_then(parse_pair) {
+        for fd in 0..3 {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } == 0 {
+                let kind = st.st_mode & libc::S_IFMT;
+                if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
+                    unsafe { libc::fchown(fd, uid, gid) };
+                }
+            }
+        }
+    }
+    let dup = |fd: i32| -> Result<OwnedFd> {
+        let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if n < 0 {
+            bail!("dup fd {fd}: {}", std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(n) })
+    };
+    let (uid, gid) = match args.user.as_deref() {
+        Some(u) => parse_pair(u).context("--user must be uid:gid")?,
+        None => (0, 0),
+    };
+    let env = args.env.iter().filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
+    let (stdin, stdout, stderr) = (dup(0)?, dup(1)?, dup(2)?);
+    let pid = ContainerBuilder::new(args.id.clone(), SyscallType::default())
+        .with_root_path(&args.state_root)
+        .context("state root")?
+        .with_stdin(stdin)
+        .with_stdout(stdout)
+        .with_stderr(stderr)
+        .as_tenant()
+        .with_container_args(args.argv.clone())
+        .with_env(env)
+        .with_cwd(args.cwd.clone())
+        .with_user(Some(uid))
+        .with_group(Some(gid))
+        .with_additional_gids(args.additional_gids.clone())
+        .with_detach(true)
+        .build()
+        .context("exec in container")?
+        .as_raw();
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
+    }
+    loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                let s = PENDING_SIGNAL.swap(0, Ordering::SeqCst);
+                if s != 0 {
+                    unsafe { libc::kill(pid, s) };
+                }
+                continue;
+            }
+            bail!("waitpid: {e}");
+        }
+        if r == pid {
+            if libc::WIFEXITED(status) {
+                return Ok(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                return Ok(128 + libc::WTERMSIG(status));
+            }
+        }
+    }
 }

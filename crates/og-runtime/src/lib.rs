@@ -7,6 +7,8 @@
 //! - memory/CPU controls exposed as cgroup v2 knobs (`memory.low/high/max`, `cpu.weight`)
 //!   so OG-Host's resource brain can adjust them live.
 
+pub mod cdi;
+pub mod seccomp;
 pub mod users;
 
 pub use oci_spec::runtime::Capability;
@@ -16,7 +18,7 @@ use std::path::{Path, PathBuf};
 use og_oci::registry::ImageConfig;
 use oci_spec::runtime::{
     LinuxBuilder, LinuxCapabilitiesBuilder, LinuxDeviceBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder,
-    LinuxDeviceType, LinuxIdMappingBuilder, LinuxMemoryBuilder, LinuxNamespace,
+    LinuxDeviceType, HookBuilder, HooksBuilder, LinuxIdMappingBuilder, LinuxMemoryBuilder, LinuxNamespace,
     LinuxNamespaceBuilder, LinuxNamespaceType, LinuxPidsBuilder, LinuxResourcesBuilder, LinuxCpuBuilder, Mount,
     MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
@@ -102,6 +104,8 @@ pub struct RunOptions {
     pub tmpfs: Vec<(PathBuf, Option<u64>)>,
     /// Host device nodes passed through at the same path (e.g. /dev/net/tun).
     pub devices: Vec<PathBuf>,
+    /// CDI devices, e.g. `nvidia.com/gpu=all` (resolved from /etc/cdi, /var/run/cdi).
+    pub cdi_devices: Vec<String>,
     pub network: Network,
     /// `None` disables the user namespace (needed for host networking, some privileged apps).
     pub userns: Option<IdMap>,
@@ -110,6 +114,8 @@ pub struct RunOptions {
     pub userns_path: Option<PathBuf>,
     pub cap_add: Vec<Capability>,
     pub cap_drop: Vec<Capability>,
+    /// Run without the default seccomp profile (Docker's `--security-opt seccomp=unconfined`).
+    pub seccomp_unconfined: bool,
     pub read_only_root: bool,
     /// cgroup v2 memory.max (hard cap), memory.high (throttle point), memory.low (protection).
     pub memory_max: Option<i64>,
@@ -137,11 +143,13 @@ impl RunOptions {
             mounts: Vec::new(),
             tmpfs: Vec::new(),
             devices: Vec::new(),
+            cdi_devices: Vec::new(),
             network: Network::Isolated,
             userns: Some(IdMap::default()),
             userns_path: None,
             cap_add: Vec::new(),
             cap_drop: Vec::new(),
+            seccomp_unconfined: false,
             read_only_root: false,
             memory_max: None,
             memory_high: None,
@@ -220,6 +228,14 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
     if matches!(opts.network, Network::Host) && opts.userns.is_some() {
         return Err(Error::Invalid("host networking needs the user namespace disabled".into()));
     }
+    // CDI devices (GPUs): fold their edits into the options before anything else uses them
+    let cdi = if opts.cdi_devices.is_empty() { None } else { Some(cdi::Registry::load().resolve(&opts.cdi_devices)?) };
+    let mut opts = opts.clone();
+    if let Some(e) = &cdi {
+        opts.devices.extend(e.device_paths());
+        opts.env.extend(e.env.iter().cloned());
+    }
+    let opts = &opts;
     let args = resolve_args(image, opts)?;
     let env = resolve_env(image, opts);
     let cwd = opts.working_dir.clone().or_else(|| image.config.working_dir.clone()).filter(|w| !w.is_empty()).unwrap_or_else(|| "/".into());
@@ -310,6 +326,25 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         );
     }
 
+    if let Some(e) = &cdi {
+        for m in &e.mounts {
+            if !Path::new(&m.host_path).exists() {
+                continue; // stale spec entry (driver updated): skip rather than fail
+            }
+            let mut o: Vec<String> = m.options.clone();
+            if !o.iter().any(|x| x == "bind" || x == "rbind") {
+                o.push("bind".into());
+            }
+            mounts.push(
+                MountBuilder::default()
+                    .destination(PathBuf::from(&m.container_path))
+                    .typ("bind".to_string())
+                    .source(PathBuf::from(&m.host_path))
+                    .options(o)
+                    .build()?,
+            );
+        }
+    }
     for (target, size) in &opts.tmpfs {
         if !target.is_absolute() {
             return Err(Error::Invalid(format!("tmpfs target {} must be absolute", target.display())));
@@ -406,9 +441,37 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         let m = LinuxIdMappingBuilder::default().container_id(0u32).host_id(map.host_start).size(map.size).build()?;
         linux = linux.uid_mappings(vec![m]).gid_mappings(vec![m]);
     }
+    if !opts.seccomp_unconfined {
+        linux = linux.seccomp(seccomp::default_profile(&caps));
+    }
+
+    // CDI hooks (e.g. nvidia-cdi-hook update-ldcache / create-symlinks)
+    let mut hooks = std::collections::BTreeMap::<String, Vec<oci_spec::runtime::Hook>>::new();
+    if let Some(e) = &cdi {
+        for h in &e.hooks {
+            let mut hb = HookBuilder::default().path(PathBuf::from(&h.path)).args(h.args.clone());
+            if !h.env.is_empty() {
+                hb = hb.env(h.env.clone());
+            }
+            hooks.entry(h.hook_name.clone()).or_default().push(hb.build()?);
+        }
+    }
+    let mut hb = HooksBuilder::default();
+    for (name, list) in hooks {
+        hb = match name.as_str() {
+            "createRuntime" => hb.create_runtime(list),
+            "createContainer" => hb.create_container(list),
+            "startContainer" => hb.start_container(list),
+            "prestart" => hb.prestart(list),
+            "poststart" => hb.poststart(list),
+            "poststop" => hb.poststop(list),
+            _ => hb,
+        };
+    }
 
     let spec = SpecBuilder::default()
         .version("1.0.2".to_string())
+        .hooks(hb.build()?)
         .root(RootBuilder::default().path(opts.rootfs.clone()).readonly(opts.read_only_root).build()?)
         .hostname(opts.hostname.clone())
         .process(process)

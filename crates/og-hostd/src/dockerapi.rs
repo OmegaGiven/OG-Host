@@ -94,6 +94,11 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/containers/{id}/attach", post(container_attach))
         .route("/containers/{id}/logs", get(container_logs))
         .route("/containers/{id}/stats", get(container_stats))
+        .route("/containers/{id}/exec", post(exec_create))
+        .route("/exec/{id}/start", post(exec_start))
+        .route("/exec/{id}/json", get(exec_inspect))
+        .route("/exec/{id}/resize", post(exec_resize))
+        .route("/containers/{id}/resize", post(exec_resize))
         .route("/containers/{id}", delete(container_delete))
         .route("/build", post(image_build))
         .route("/images/json", get(images_list))
@@ -458,6 +463,10 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
         }
         warnings.push("privileged mode is not supported; the container runs with the default capability set".to_string());
     }
+    let seccomp_unconfined = str_vec(&hc["SecurityOpt"]).iter().any(|o| crate::containers::is_seccomp_unconfined(o));
+    if seccomp_unconfined && ctx.scope.is_some() {
+        return Err(DErr(StatusCode::FORBIDDEN, "seccomp=unconfined is not allowed on this socket".into()));
+    }
     if b.tty == Some(true) {
         warnings.push("TTY is not supported yet; output is captured as plain logs".to_string());
     }
@@ -540,8 +549,26 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
     }
 
     let devices: Vec<PathBuf> = hc["Devices"].as_array().into_iter().flatten().filter_map(|d| d["PathOnHost"].as_str().map(PathBuf::from)).collect();
-    if hc["DeviceRequests"].as_array().is_some_and(|a| !a.is_empty()) {
-        warnings.push("GPU device requests are not supported yet".to_string());
+    // --gpus / DeviceRequests -> CDI names
+    let mut cdi_devices = Vec::new();
+    for req in hc["DeviceRequests"].as_array().into_iter().flatten() {
+        let driver = req["Driver"].as_str().unwrap_or("");
+        let gpu_caps = req["Capabilities"].as_array().is_some_and(|c| c.iter().flat_map(|x| x.as_array().cloned().unwrap_or_default()).any(|v| v == "gpu"));
+        if driver == "cdi" {
+            cdi_devices.extend(str_vec(&req["DeviceIDs"]));
+        } else if driver == "nvidia" || gpu_caps {
+            let ids = str_vec(&req["DeviceIDs"]);
+            if !ids.is_empty() {
+                cdi_devices.extend(ids.iter().map(|i| format!("nvidia.com/gpu={i}")));
+            } else if req["Count"].as_i64().unwrap_or(-1) == -1 {
+                cdi_devices.push("nvidia.com/gpu=all".into());
+            } else {
+                let n = req["Count"].as_i64().unwrap_or(1).max(1);
+                cdi_devices.extend((0..n).map(|i| format!("nvidia.com/gpu={i}")));
+            }
+        } else {
+            warnings.push(format!("device request with driver {driver:?} not supported"));
+        }
     }
     let caps = |k: &str| -> std::result::Result<Vec<og_runtime::Capability>, DErr> {
         str_vec(&hc[k])
@@ -614,6 +641,8 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
             o.mounts = binds;
             o.tmpfs = tmpfs;
             o.devices = devices;
+            o.cdi_devices = cdi_devices;
+            o.seccomp_unconfined = seccomp_unconfined;
             o.cap_add = cap_add;
             o.cap_drop = cap_drop;
             o.memory_max = memory;
@@ -790,6 +819,207 @@ async fn container_attach(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>, 
         .header(header::UPGRADE, "tcp")
         .body(Body::empty())
         .unwrap())
+}
+
+// ---- exec ----------------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct ExecRec {
+    container: String,
+    argv: Vec<String>,
+    env: Vec<String>,
+    cwd: Option<String>,
+    user: Option<String>,
+    tty: bool,
+    stdin: bool,
+    running: bool,
+    started: bool,
+    exit_code: Option<i32>,
+    pid: Option<u32>,
+    created: std::time::Instant,
+}
+
+static EXECS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, ExecRec>>> = std::sync::LazyLock::new(Default::default);
+
+fn exec_get(ctx: &Ctx, id: &str) -> R<ExecRec> {
+    let rec = EXECS.lock().unwrap().get(id).cloned().ok_or_else(|| not_found(&format!("exec instance {id}")))?;
+    find(ctx, &rec.container)?; // scope check: the container must be visible to this client
+    Ok(rec)
+}
+
+fn exec_update(id: &str, f: impl FnOnce(&mut ExecRec)) {
+    if let Some(r) = EXECS.lock().unwrap().get_mut(id) {
+        f(r);
+    }
+}
+
+async fn exec_create(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>, Json(b): Json<Value>) -> R<(StatusCode, Json<Value>)> {
+    let m = find(&ctx, &id)?;
+    if ctx.d.node.status(&m.id).state != "running" {
+        return Err(DErr(StatusCode::CONFLICT, format!("container {} is not running", m.id)));
+    }
+    if b["Privileged"].as_bool() == Some(true) {
+        return Err(DErr(StatusCode::FORBIDDEN, "privileged exec is not supported".into()));
+    }
+    let argv = str_vec(&b["Cmd"]);
+    if argv.is_empty() {
+        return Err(DErr(StatusCode::BAD_REQUEST, "no exec command specified".into()));
+    }
+    let eid = crate::containers::new_id().map_err(DErr::from)?;
+    {
+        let mut all = EXECS.lock().unwrap();
+        // forget finished execs after an hour
+        all.retain(|_, r| r.running || r.created.elapsed() < Duration::from_secs(3600));
+        all.insert(
+            eid.clone(),
+            ExecRec {
+                container: m.id.clone(),
+                argv,
+                env: str_vec(&b["Env"]),
+                cwd: b["WorkingDir"].as_str().map(String::from),
+                user: b["User"].as_str().map(String::from),
+                tty: b["Tty"].as_bool().unwrap_or(false),
+                stdin: b["AttachStdin"].as_bool().unwrap_or(false),
+                running: false,
+                started: false,
+                exit_code: None,
+                pid: None,
+                created: std::time::Instant::now(),
+            },
+        );
+    }
+    Ok((StatusCode::CREATED, Json(json!({ "Id": eid }))))
+}
+
+async fn exec_start(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>, req: Request<Body>) -> R<Response> {
+    let rec = exec_get(&ctx, &id)?;
+    if rec.started {
+        return Err(DErr(StatusCode::CONFLICT, "exec instance already started".into()));
+    }
+    let upgrade = req.headers().get(header::UPGRADE).is_some();
+    let (parts, body) = req.into_parts();
+    let b: Value = axum::body::to_bytes(body, 1 << 20).await.ok().and_then(|x| serde_json::from_slice(&x).ok()).unwrap_or(Value::Null);
+    let detach = b["Detach"].as_bool().unwrap_or(false);
+    let tty = rec.tty || b["Tty"].as_bool().unwrap_or(false);
+    let std_cmd = ctx.d.node.exec_command(&rec.container, &rec.argv, rec.user.as_deref(), &rec.env, rec.cwd.as_deref()).map_err(DErr::from)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.kill_on_drop(false);
+    if detach {
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdin(if rec.stdin && upgrade { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+    }
+    let mut child = cmd.spawn().map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, format!("starting exec: {e}")))?;
+    let pid = child.id();
+    exec_update(&id, |r| {
+        r.started = true;
+        r.running = true;
+        r.pid = pid;
+    });
+    let finish = |id: String, code: Option<i32>| exec_update(&id, |r| {
+        r.running = false;
+        r.exit_code = Some(code.unwrap_or(-1));
+    });
+    if detach {
+        let id2 = id.clone();
+        tokio::spawn(async move {
+            let code = child.wait().await.ok().and_then(|s| s.code());
+            finish(id2, code);
+        });
+        return Ok(StatusCode::OK.into_response());
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, stream: u8, tx: tokio::sync::mpsc::Sender<Vec<u8>>| async move {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = if tty { buf[..n].to_vec() } else { frame(stream, &buf[..n]) };
+                    if tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    let out = tokio::spawn(pump(Box::new(child.stdout.take().unwrap()), 1, tx.clone()));
+    let err = tokio::spawn(pump(Box::new(child.stderr.take().unwrap()), 2, tx));
+    let child_stdin = child.stdin.take();
+    let id2 = id.clone();
+    let waiter = tokio::spawn(async move {
+        let _ = out.await;
+        let _ = err.await;
+        let code = child.wait().await.ok().and_then(|s| s.code());
+        finish(id2, code);
+    });
+
+    if !upgrade {
+        // plain HTTP client: stream the output as the body, no stdin
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|c| (Ok::<_, std::io::Error>(axum::body::Bytes::from(c)), rx)) });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, if tty { "application/vnd.docker.raw-stream" } else { "application/vnd.docker.multiplexed-stream" })
+            .body(Body::from_stream(stream))
+            .unwrap());
+    }
+    let req = Request::from_parts(parts, Body::empty());
+    tokio::spawn(async move {
+        let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
+        let io = hyper_util::rt::TokioIo::new(upgraded);
+        let (mut rd, mut wr) = tokio::io::split(io);
+        if let Some(mut sin) = child_stdin {
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut rd, &mut sin).await;
+                let _ = sin.shutdown().await; // client closed its side: EOF to the process
+            });
+        }
+        while let Some(chunk) = rx.recv().await {
+            if wr.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        let _ = waiter.await;
+        let _ = wr.shutdown().await;
+    });
+    Ok(Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONTENT_TYPE, if tty { "application/vnd.docker.raw-stream" } else { "application/vnd.docker.multiplexed-stream" })
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "tcp")
+        .body(Body::empty())
+        .unwrap())
+}
+
+async fn exec_inspect(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>) -> R<Json<Value>> {
+    let r = exec_get(&ctx, &id)?;
+    Ok(Json(json!({
+        "ID": id,
+        "ContainerID": r.container,
+        "Running": r.running,
+        "ExitCode": r.exit_code,
+        "Pid": r.pid.unwrap_or(0),
+        "OpenStdin": r.stdin,
+        "OpenStdout": true,
+        "OpenStderr": true,
+        "CanRemove": !r.running && r.started,
+        "ProcessConfig": {
+            "tty": r.tty,
+            "entrypoint": r.argv.first(),
+            "arguments": r.argv.get(1..).unwrap_or_default(),
+            "privileged": false,
+            "user": r.user.clone().unwrap_or_default(),
+        },
+    })))
+}
+
+/// No real terminals yet (exec -t streams raw without a pty); accept resizes so clients don't fail.
+async fn exec_resize() -> StatusCode {
+    StatusCode::OK
 }
 
 #[derive(Deserialize)]
