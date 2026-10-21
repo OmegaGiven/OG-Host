@@ -73,6 +73,14 @@ enum Cmd {
     },
     /// Remove a stopped container.
     Rm { container: String },
+    /// Check a compose file: services in start order, what's used, and unsupported keys.
+    /// Prints names and counts only, never values (compose files hold secrets).
+    Config {
+        #[arg(short = 'f', long = "file", default_value = "docker-compose.yml")]
+        file: PathBuf,
+        #[arg(short = 'p', long = "project-name")]
+        project: Option<String>,
+    },
 }
 
 /// refs/<registry>/<repository>/<tag-or-digest> -> manifest digest
@@ -186,6 +194,34 @@ async fn main() -> Result<()> {
             let m = node.find(&container)?;
             let st = tokio::task::spawn_blocking(move || node.stop(&m.id, timeout)).await??;
             println!("{} {}", container, st.state);
+        }
+        Cmd::Config { file, project } => {
+            let env: og_compose::interp::Vars = std::env::vars().collect();
+            let p = og_compose::load(&file, project.as_deref(), &env)?;
+            println!("project {} ({} services)", p.name, p.services.len());
+            for s in &p.services {
+                let mut feats = Vec::new();
+                if s.build.is_some() { feats.push("build".to_string()); }
+                if !s.ports.is_empty() { feats.push(format!("{} ports", s.ports.len())); }
+                let (binds, vols) = s.mounts.iter().fold((0, 0), |(b, v), m| match m.kind {
+                    og_compose::MountKind::Bind => (b + 1, v),
+                    _ => (b, v + 1),
+                });
+                if binds > 0 { feats.push(format!("{binds} binds")); }
+                if vols > 0 { feats.push(format!("{vols} volumes")); }
+                if let Some(n) = &s.network_mode { feats.push(format!("network_mode {n}")); }
+                if s.gpus { feats.push("gpu".into()); }
+                if s.healthcheck.is_some() { feats.push("healthcheck".into()); }
+                if !s.depends_on.is_empty() { feats.push(format!("after {}", s.depends_on.iter().map(|d| d.0.as_str()).collect::<Vec<_>>().join(","))); }
+                if !s.cap_add.is_empty() { feats.push(format!("cap_add {}", s.cap_add.join(","))); }
+                if !s.devices.is_empty() { feats.push(format!("{} devices", s.devices.len())); }
+                if s.privileged { feats.push("PRIVILEGED".into()); }
+                if s.mounts.iter().any(|m| m.source.ends_with("docker.sock")) { feats.push("DOCKER-SOCKET".into()); }
+                println!("  {:<22} {:<46} {}", s.name, s.image.as_deref().unwrap_or("(build)"), feats.join(" · "));
+            }
+            for w in &p.warnings {
+                println!("  warning: {w}");
+            }
         }
         Cmd::Rm { container } => {
             let m = node.find(&container)?;

@@ -9,6 +9,7 @@ license.workspace = true
 og-oci = { path = "../og-oci" }
 og-runtime = { path = "../og-runtime" }
 og-net = { path = "../og-net" }
+og-compose = { path = "../og-compose" }
 serde.workspace = true
 libc = "0.2"
 anyhow.workspace = true
