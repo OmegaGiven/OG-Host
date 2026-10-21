@@ -127,3 +127,71 @@ mod tests {
         assert!(store.blob_path("md5:abc").is_err());
     }
 }
+
+/// Import an OCI image layout tarball (e.g. `buildctl --output type=oci`) into the store.
+/// Every blob is hashed while copied and must match the digest it is filed under; returns the
+/// digest of the (single-platform) image manifest.
+pub fn import_oci_tar(store_root: &Path, tar_path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    let blobs = store_root.join("blobs/sha256");
+    std::fs::create_dir_all(&blobs)?;
+    std::fs::create_dir_all(store_root.join("tmp"))?;
+    let mut index: Option<Vec<u8>> = None;
+    let mut archive = tar::Archive::new(std::fs::File::open(tar_path)?);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().to_string();
+        let path = path.trim_start_matches("./").to_string();
+        if path == "index.json" {
+            let mut b = Vec::new();
+            entry.read_to_end(&mut b)?;
+            index = Some(b);
+            continue;
+        }
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        let Some(hexname) = path.strip_prefix("blobs/sha256/") else { continue };
+        crate::digest_hex(&format!("sha256:{hexname}"))?; // rejects anything that isn't a clean digest
+        let dst = blobs.join(hexname);
+        if dst.exists() {
+            continue;
+        }
+        let tmp = store_root.join("tmp").join(format!("{hexname}.import.{}", std::process::id()));
+        let mut out = std::fs::File::create(&tmp)?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = entry.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
+        }
+        out.sync_all()?;
+        let actual = hex::encode(h.finalize());
+        if actual != hexname {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::DigestMismatch { expected: format!("sha256:{hexname}"), actual: format!("sha256:{actual}") });
+        }
+        std::fs::rename(&tmp, &dst)?;
+    }
+    let index = index.ok_or_else(|| Error::Unsupported("OCI tarball without index.json".into()))?;
+    let v: serde_json::Value = serde_json::from_slice(&index)?;
+    let first = v["manifests"][0].clone();
+    let mut digest = first["digest"].as_str().ok_or_else(|| Error::Unsupported("empty OCI index".into()))?.to_string();
+    // a nested index (multi-platform output): pick this machine's platform
+    if first["mediaType"].as_str() == Some(crate::registry::MT_OCI_INDEX) {
+        let inner: serde_json::Value = serde_json::from_slice(&std::fs::read(blobs.join(crate::digest_hex(&digest)?))?)?;
+        let want = crate::registry::host_platform();
+        digest = inner["manifests"]
+            .as_array()
+            .and_then(|m| m.iter().find(|d| d["platform"]["architecture"].as_str() == Some(&want.architecture)))
+            .and_then(|d| d["digest"].as_str())
+            .ok_or_else(|| Error::Unsupported("built image has no manifest for this platform".into()))?
+            .to_string();
+    }
+    Ok(digest)
+}

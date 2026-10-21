@@ -408,7 +408,7 @@ struct StackReq {
 async fn stack_up(State(app): State<App>, Json(req): Json<StackReq>) -> ApiResult<Json<serde_json::Value>> {
     let env: og_compose::interp::Vars = std::env::vars().collect();
     let p = og_compose::load(&req.file, req.project.as_deref(), &env).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-    crate::compose::up(&app.node, &app.root, &app.node.store, &p).await?;
+    crate::compose::up(&app.node, &app.root, &app.node.store, &p, false).await?;
     Ok(Json(json!({ "project": p.name, "services": p.services.len(), "warnings": p.warnings })))
 }
 

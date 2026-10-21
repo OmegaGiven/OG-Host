@@ -28,7 +28,12 @@ fn capability(name: &str) -> Result<og_runtime::Capability> {
     serde_json::from_value(serde_json::Value::String(n.clone())).with_context(|| format!("unknown capability {name:?}"))
 }
 
-pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project) -> Result<()> {
+/// Image name for a service: its `image:`, or `<project>-<service>` for build-only services.
+fn image_for(p: &Project, s: &Service) -> String {
+    s.image.clone().unwrap_or_else(|| format!("{}-{}", p.name, s.name))
+}
+
+pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: bool) -> Result<()> {
     for w in &p.warnings {
         eprintln!("warning: {w}");
     }
@@ -37,13 +42,22 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project) -> Result<
     // pull everything first, so a bad image fails before anything starts
     let mut digests = BTreeMap::new();
     for s in &p.services {
-        let Some(image) = &s.image else {
-            bail!("service {}: building images is not supported yet (`build:`); give it an `image:`", s.name);
+        let image = image_for(p, s);
+        let d = match &s.build {
+            Some(b) if rebuild || !crate::build::have_image(root, &image) => {
+                let spec = crate::build::BuildSpec {
+                    context: b.context.clone(),
+                    dockerfile: b.dockerfile.clone(),
+                    tag: image.clone(),
+                    args: b.args.clone(),
+                    target: b.target.clone(),
+                };
+                let root = root.to_path_buf();
+                let svc = s.name.clone();
+                tokio::task::spawn_blocking(move || crate::build::build(&root, &spec)).await?.with_context(|| format!("building service {svc}"))?
+            }
+            _ => crate::ensure_pulled(root, store, &image, true).await.with_context(|| format!("service {}", s.name))?,
         };
-        if s.build.is_some() {
-            eprintln!("warning: {}: has `build:`; using image {image} as-is (builds not supported yet)", s.name);
-        }
-        let d = crate::ensure_pulled(root, store, image, true).await.with_context(|| format!("service {}", s.name))?;
         digests.insert(s.name.clone(), d);
     }
 
@@ -138,7 +152,7 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project) -> Result<
             no_start: false,
             aliases: vec![s.name.clone()],
         };
-        let image = s.image.clone().unwrap();
+        let image = image_for(p, s);
         let digest = digests[&s.name].clone();
         let svc = s.clone();
         let t0 = std::time::Instant::now();

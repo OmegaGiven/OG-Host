@@ -1,5 +1,6 @@
 //! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
 
+mod build;
 mod compose;
 mod containers;
 mod dockerapi;
@@ -82,6 +83,21 @@ enum Cmd {
         file: PathBuf,
         #[arg(short = 'p', long = "project-name")]
         project: Option<String>,
+        /// Rebuild images of services with `build:` even if they exist.
+        #[arg(long)]
+        build: bool,
+    },
+    /// Build an image from a Dockerfile (via BuildKit) and tag it.
+    Build {
+        #[arg(short = 't', long = "tag")]
+        tag: String,
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        #[arg(long)]
+        target: Option<String>,
+        context: PathBuf,
     },
     /// Stop and remove a compose project's containers (volumes are kept unless --volumes).
     Down {
@@ -228,10 +244,16 @@ async fn main() -> Result<()> {
             let st = tokio::task::spawn_blocking(move || node.stop(&m.id, timeout)).await??;
             println!("{} {}", container, st.state);
         }
-        Cmd::Up { file, project } => {
+        Cmd::Up { file, project, build } => {
             let env: og_compose::interp::Vars = std::env::vars().collect();
             let p = og_compose::load(&file, project.as_deref(), &env)?;
-            compose::up(&node, &cli.root, &store, &p).await?;
+            compose::up(&node, &cli.root, &store, &p, build).await?;
+        }
+        Cmd::Build { tag, file, build_arg, target, context } => {
+            let args = build_arg.iter().filter_map(|a| a.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
+            let spec = build::BuildSpec { context, dockerfile: file, tag, args, target };
+            let root = cli.root.clone();
+            tokio::task::spawn_blocking(move || build::build(&root, &spec)).await??;
         }
         Cmd::Down { file, project, volumes } => {
             let env: og_compose::interp::Vars = std::env::vars().collect();

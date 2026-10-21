@@ -95,6 +95,7 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/containers/{id}/logs", get(container_logs))
         .route("/containers/{id}/stats", get(container_stats))
         .route("/containers/{id}", delete(container_delete))
+        .route("/build", post(image_build))
         .route("/images/json", get(images_list))
         .route("/images/create", post(images_create))
         .route("/images/{*name}", get(image_inspect_or).delete(image_delete))
@@ -906,6 +907,76 @@ async fn container_stats(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>) -
         "memory_stats": {"usage": mem, "limit": if limit == u64::MAX { 0 } else { limit }},
         "networks": {},
     })))
+}
+
+// ---------- builds ----------
+
+#[derive(Deserialize)]
+struct BuildQ {
+    t: Option<String>,
+    dockerfile: Option<String>,
+    buildargs: Option<String>,
+    target: Option<String>,
+}
+
+/// `docker build` (classic API): the body is a tar of the build context.
+async fn image_build(State(ctx): State<Ctx>, Query(q): Query<BuildQ>, body: Body) -> R<Response> {
+    if ctx.scope.is_some() {
+        return Err(DErr(StatusCode::FORBIDDEN, "builds are not allowed on this socket".into()));
+    }
+    let tag = q.t.clone().unwrap_or_else(|| format!("og-build-{}", now()));
+    let dir = ctx.d.root.join("tmp").join(format!("ctx-{}-{}", std::process::id(), now()));
+    std::fs::create_dir_all(&dir).map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let tar_path = dir.with_extension("tar");
+    // stream the upload to disk (contexts can be large), then unpack it safely
+    {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(&tar_path).await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| DErr(StatusCode::BAD_REQUEST, e.to_string()))?;
+            f.write_all(&chunk).await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        f.flush().await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    let args: BTreeMap<String, String> = q
+        .buildargs
+        .as_deref()
+        .and_then(|a| serde_json::from_str::<BTreeMap<String, Option<String>>>(a).ok())
+        .map(|m| m.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect())
+        .unwrap_or_default();
+    let root = ctx.d.root.clone();
+    let (dir2, tar2) = (dir.clone(), tar_path.clone());
+    let spec = crate::build::BuildSpec { context: dir.clone(), dockerfile: q.dockerfile.clone(), tag: tag.clone(), args, target: q.target.clone() };
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+        // the same escape-proof unpacker used for image layers: a context can't write outside `dir`
+        og_oci::unpack::apply_layer(&dir2, og_oci::unpack::open_layer(&tar2)?, &og_oci::unpack::UnpackOptions::default())?;
+        crate::build::build_with(&root, &spec, true)
+    })
+    .await
+    .map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&tar_path);
+    let mut out = String::new();
+    match result {
+        Ok((digest, log)) => {
+            for l in log.lines() {
+                out.push_str(&json!({"stream": format!("{l}\n")}).to_string());
+                out.push('\n');
+            }
+            let id = ctx.d.node.store.read_sync(&digest).ok().and_then(|b| serde_json::from_slice::<og_oci::registry::Manifest>(&b).ok()).map(|m| m.config.digest).unwrap_or(digest);
+            out.push_str(&json!({"aux": {"ID": id}}).to_string());
+            out.push('\n');
+            out.push_str(&json!({"stream": format!("Successfully built {}\nSuccessfully tagged {tag}\n", &id[7..19])}).to_string());
+            out.push('\n');
+        }
+        Err(e) => {
+            out.push_str(&json!({"errorDetail": {"message": format!("{e:#}")}, "error": format!("{e:#}")}).to_string());
+            out.push('\n');
+        }
+    }
+    Ok(Response::builder().header(header::CONTENT_TYPE, "application/json").body(Body::from(out)).unwrap())
 }
 
 // ---------- images ----------
