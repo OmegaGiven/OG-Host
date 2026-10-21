@@ -2,6 +2,7 @@
 
 mod compose;
 mod containers;
+mod dockerapi;
 mod idmap;
 mod serve;
 
@@ -96,6 +97,10 @@ enum Cmd {
         /// Also listen on TCP (e.g. 127.0.0.1:8411); requires the bearer token.
         #[arg(long)]
         listen: Option<String>,
+        /// Scoped Docker API socket: name:label=value -> /run/og-host/docker-<name>.sock,
+        /// limited to containers carrying that label. Repeatable.
+        #[arg(long = "docker-scope")]
+        docker_scope: Vec<String>,
     },
     /// Start a stopped container.
     Start { container: String },
@@ -147,6 +152,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
+    // behave like a normal CLI when piped into `head` etc. (exit quietly on SIGPIPE)
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
     let store = Store::open(cli.root.join("content")).await?;
     let node = containers::Node {
@@ -232,8 +239,8 @@ async fn main() -> Result<()> {
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || compose::down(&node, &root, &p, volumes)).await??;
         }
-        Cmd::Serve { listen } => {
-            serve::serve(node, cli.root.clone(), listen).await?;
+        Cmd::Serve { listen, docker_scope } => {
+            serve::serve(node, cli.root.clone(), listen, docker_scope).await?;
         }
         Cmd::Start { container } => {
             let m = node.find(&container)?;

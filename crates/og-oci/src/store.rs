@@ -46,6 +46,11 @@ impl Store {
         Ok(tokio::fs::try_exists(self.blob_path(digest)?).await?)
     }
 
+    /// Blocking read, for callers outside async code.
+    pub fn read_sync(&self, digest: &str) -> Result<Vec<u8>> {
+        Ok(std::fs::read(self.blob_path(digest)?)?)
+    }
+
     pub async fn read(&self, digest: &str) -> Result<Vec<u8>> {
         Ok(tokio::fs::read(self.blob_path(digest)?).await?)
     }

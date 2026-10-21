@@ -83,7 +83,26 @@ fn load_or_create_token(root: &Path) -> Result<String> {
     Ok(t)
 }
 
-pub async fn serve(node: Node, root: PathBuf, listen: Option<String>) -> Result<()> {
+/// Serve the Docker Engine API on a unix socket (optionally scoped to one label).
+fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::Scope>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    listener.set_nonblocking(true)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = tokio::net::UnixListener::from_std(listener)?;
+    let router = crate::dockerapi::router(crate::dockerapi::Ctx { d: app, scope: scope.clone() });
+    let svc = tower::ServiceExt::map_request(router, crate::dockerapi::strip_version);
+    eprintln!("og-hostd: Docker API on {}{}", path.display(), scope.map(|s| format!(" (scope {}: label {}={})", s.name, s.key, s.value)).unwrap_or_default());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, tower::make::Shared::new(svc)).await {
+            eprintln!("og-hostd: docker socket stopped: {e}");
+        }
+    });
+    Ok(())
+}
+
+pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>) -> Result<()> {
     let token = if listen.is_some() { Some(load_or_create_token(&root)?) } else { None };
     let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()) });
 
@@ -123,6 +142,16 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>) -> Result<
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("og-hostd: API on {}", sock.display());
+    spawn_docker_socket(app.clone(), PathBuf::from("/run/og-host/docker.sock"), None)?;
+    for spec in docker_scopes {
+        let (name, label) = spec.split_once(':').context("--docker-scope wants name:label=value")?;
+        let (key, value) = label.split_once('=').unwrap_or((label, ""));
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            anyhow::bail!("bad scope name {name:?}");
+        }
+        let scope = crate::dockerapi::Scope { name: name.into(), key: key.into(), value: value.into() };
+        spawn_docker_socket(app.clone(), PathBuf::from(format!("/run/og-host/docker-{name}.sock")), Some(scope))?;
+    }
     let unix_router = router.clone();
     let unix_task = tokio::spawn(async move { axum::serve(unix, unix_router).await });
 
@@ -152,6 +181,10 @@ impl Daemon {
     fn supervise(&self) {
         let Ok(list) = self.node.list() else { return };
         for (m, st) in list {
+            if m.auto_remove && matches!(st.state.as_str(), "exited" | "dead" | "failed") {
+                let _ = self.node.remove(&m.id);
+                continue;
+            }
             let wants_running = m.desired.is_empty() || m.desired == "running";
             if !wants_running || st.state == "running" || st.state == "created" {
                 continue;

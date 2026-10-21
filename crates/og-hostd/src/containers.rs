@@ -45,6 +45,14 @@ pub struct Meta {
     pub binds: Vec<(PathBuf, PathBuf, bool)>,
     #[serde(default)]
     pub healthcheck: Option<og_compose::Healthcheck>,
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Remove the container once it exits (docker run --rm).
+    #[serde(default)]
+    pub auto_remove: bool,
+    /// Extra names other containers on the same network can use (network aliases).
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 /// Extra settings that only compose (or later the API) provides.
@@ -59,6 +67,11 @@ pub struct Extra {
     /// Other services already running in the project (name, ip): known from the start.
     pub peers: Vec<(String, String)>,
     pub healthcheck: Option<og_compose::Healthcheck>,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub auto_remove: bool,
+    /// Create only; don't start (Docker API `create`).
+    pub no_start: bool,
+    pub aliases: Vec<String>,
 }
 
 /// How a container is connected.
@@ -320,16 +333,24 @@ impl Node {
             project: extra.project,
             service: extra.service,
             restart: extra.restart,
-            desired: "running".into(),
+            desired: if extra.no_start { "created".into() } else { "running".into() },
             binds: requested_binds,
             healthcheck: extra.healthcheck,
+            labels: extra.labels,
+            auto_remove: extra.auto_remove,
+            aliases: extra.aliases,
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        if extra.no_start {
+            return Ok(meta);
+        }
+        self.refresh_network_hosts(&meta); // before the process starts
         if let Err(e) = self.spawn_shim(&id) {
             let _ = self.net.detach(&id);
             self.destroy_sandbox(&id);
             return Err(e);
         }
+        self.refresh_network_hosts(&meta);
         Ok(meta)
     }
 
@@ -384,7 +405,8 @@ impl Node {
     /// same published ports) and id-mapped bind mounts. Everything is idempotent.
     pub fn start(&self, id: &str) -> Result<()> {
         let mut meta = self.find(id)?;
-        if self.status(&meta.id).state == "running" && !self.list()?.iter().any(|(m, st)| m.id == meta.id && st.state == "dead") {
+        let current = self.list()?.into_iter().find(|(m, _)| m.id == meta.id).map(|(_, st)| st.state).unwrap_or_default();
+        if current == "running" {
             return Ok(());
         }
         let dir = self.dir(&meta.id);
@@ -425,7 +447,54 @@ impl Node {
         let _ = std::fs::remove_file(dir.join("status.json"));
         meta.desired = "running".into();
         self.save_meta(&meta)?;
-        self.spawn_shim(&meta.id)
+        self.refresh_network_hosts(&meta); // before the process starts
+        self.spawn_shim(&meta.id)?;
+        self.refresh_network_hosts(&meta);
+        Ok(())
+    }
+
+    /// Network a container is reachable on (its own, or the one it shares).
+    fn network_of(&self, m: &Meta, all: &[(Meta, Status)]) -> Option<(String, std::net::Ipv4Addr)> {
+        if let Some(a) = &m.net {
+            if let (Some(n), Some(ip)) = (&a.network, a.ip) {
+                return Some((n.clone(), ip));
+            }
+        }
+        let other = m.network_mode.strip_prefix("container:")?;
+        let (o, _) = all.iter().find(|(o, _)| o.id == other)?;
+        let a = o.net.as_ref()?;
+        Some((a.network.clone()?, a.ip?))
+    }
+
+    /// Docker-style name resolution: every running container on the same network gets every
+    /// other's name, service name and aliases in its /etc/hosts.
+    pub fn refresh_network_hosts(&self, changed: &Meta) {
+        let Ok(all) = self.list() else { return };
+        let Some((net, _)) = self.network_of(changed, &all) else { return };
+        let members: Vec<(&Meta, std::net::Ipv4Addr)> = all
+            .iter()
+            // the container being started counts too: its hosts file must be complete
+            // before its process starts resolving names
+            .filter(|(m, st)| st.state == "running" || m.id == changed.id)
+            .filter_map(|(m, _)| self.network_of(m, &all).filter(|(n, _)| *n == net).map(|(_, ip)| (m, ip)))
+            .collect();
+        for (m, _) in &members {
+            let mut peers = Vec::new();
+            for (o, ip) in &members {
+                if o.id == m.id {
+                    continue;
+                }
+                let mut names = vec![o.name.clone()];
+                names.extend(o.service.clone());
+                names.extend(o.aliases.iter().cloned());
+                names.sort();
+                names.dedup();
+                for n in names {
+                    peers.push((n, ip.to_string()));
+                }
+            }
+            let _ = self.set_hosts(m, &peers);
+        }
     }
 
     fn spawn_shim(&self, id: &str) -> Result<()> {
@@ -478,6 +547,19 @@ impl Node {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         std::thread::sleep(std::time::Duration::from_millis(300));
         Ok(self.status(id))
+    }
+
+    /// Send a signal to the container's main process.
+    pub fn kill(&self, id: &str, signal: i32) -> Result<()> {
+        let st = self.status(id);
+        let pid = st.pid.filter(|_| st.state == "running").context("container is not running")?;
+        if signal == libc::SIGKILL || signal == libc::SIGTERM {
+            let _ = self.set_desired(id, "stopped");
+        }
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            bail!("kill: {}", std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {

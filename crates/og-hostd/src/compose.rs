@@ -128,6 +128,15 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project) -> Result<
             extra_hosts: s.extra_hosts.clone(),
             peers: project_peers(node, &p.name)?,
             healthcheck: s.healthcheck.clone(),
+            labels: {
+                let mut l = s.labels.clone();
+                l.insert("com.docker.compose.project".into(), p.name.clone());
+                l.insert("com.docker.compose.service".into(), s.name.clone());
+                l
+            },
+            auto_remove: false,
+            no_start: false,
+            aliases: vec![s.name.clone()],
         };
         let image = s.image.clone().unwrap();
         let digest = digests[&s.name].clone();
