@@ -132,11 +132,52 @@ async function tabSummary() {
     <div class="panel set-card"><h3>${ic('hdd')}Disks</h3>${v.disks.map((d) => kv(d.id, `${esc(d.bus)} · ${d.allocated != null ? `${H.bytes(d.allocated)} used` : ''}<small class="muted block addr">${esc(d.file)}</small>`)).join('') || '<p class="muted">No disks.</p>'}
       ${vm.cdroms.map((c, i) => kv(`cdrom${i}`, c ? esc(c) : '<span class="muted">empty</span>')).join('')}</div>
   </div>
+  <div id="vmHa"></div>
   ${vm.comment ? `<p class="muted">${esc(vm.comment)}</p>` : ''}
   <div class="section-head"><h2>Serial console output</h2><span class="sp"></span><button class="link-btn" id="vmLogRefresh">${ic('refresh')} Refresh</button></div>
   <pre class="task-log" id="vmLog"></pre>`;
   H.hydrateIcons($('#vmBody'));
   loadSerial();
+  paintHa();
+}
+
+async function paintHa() {
+  const el = $('#vmHa'); if (!el) return;
+  const [cl, ha] = await Promise.all([api('/v1/cluster').catch(() => null), api('/v1/ha').catch(() => null)]);
+  if (!cl || !cl.cluster || !ha) { el.innerHTML = ''; return; }
+  const r = ha.resources.find((x) => x.vm === V.cur);
+  const others = cl.nodes.filter((n) => !n.local).map((n) => n.name);
+  const edit = H.can('Cluster.Modify', '/nodes');
+  el.innerHTML = `<div class="panel set-card"><h3>${ic('shieldok')}High availability ${r && r.resource.enabled ? '<span class="chip good">on</span>' : '<span class="chip">off</span>'}</h3>
+    <p class="muted">${r && r.resource.enabled ? `Copied to <b>${esc(r.resource.standby)}</b> every ${r.resource.interval_min} min${r.last_replica_s != null ? ` (last ${H.dur(r.last_replica_s)} ago)` : ''}. If this node is gone for ${ha.takeover_after_s / 60} minutes, ${esc(r.resource.standby)} starts it from the latest copy.` : 'Keep a copy on another node and start it there if this node goes down (you lose at most one copy interval of changes).'}</p>
+    ${edit ? `<form class="form row2" id="haForm"><label>Standby node<select name="standby">${others.map((o) => `<option ${r?.resource.standby === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></label><label>Copy every (minutes)<input name="interval" type="number" min="1" value="${r?.resource.interval_min || 15}"></label></form>
+    <div class="toolbar">${r ? '<button class="ghost-btn" id="haOff">Turn off</button>' : ''}<span class="sp"></span><button class="primary-btn" id="haOn">${r ? 'Save' : 'Turn on'}</button></div>` : ''}
+    ${!ha.witness && cl.nodes.length === 2 ? '<p class="muted small">Two nodes: set a witness address on the Cluster page, or nothing can take over.</p>' : ''}</div>`;
+  H.hydrateIcons(el);
+  const on = $('#haOn');
+  if (on) on.onclick = () => { const f = $('#haForm'); api(`/v1/ha/${encodeURIComponent(V.cur)}`, { method: 'PUT', body: { standby: f.standby.value, interval_min: +f.interval.value } }).then(() => { toast('High availability on'); paintHa(); }, fail); };
+  const off = $('#haOff');
+  if (off) off.onclick = () => api(`/v1/ha/${encodeURIComponent(V.cur)}`, { method: 'DELETE' }).then(() => { toast('High availability off'); paintHa(); }, fail);
+}
+
+async function migrateModal(name) {
+  const cl = await api('/v1/cluster').catch(() => null);
+  if (!cl || !cl.cluster) return toast('Moving VMs needs a cluster (Cluster page)', true);
+  const host = V.host || await api('/v1/vms/host').catch(() => ({ pools: [] }));
+  const v = V.list.find((x) => x.vm.name === name);
+  const running = v && v.state !== 'stopped';
+  const { box, close } = H.modal(`<h3>${ic('servers')}Move ${esc(name)}</h3><form class="form">
+    <p class="muted">${running ? 'Live: the VM keeps running while its disks and memory move (a few milliseconds of pause at the end).' : 'The VM is off: its disks are copied, then it is removed here.'} Everything travels encrypted with the cluster's certificates.</p>
+    <div class="row2"><label>To node<select name="node">${cl.nodes.filter((n) => !n.local && n.online).map((n) => `<option>${esc(n.name)}</option>`).join('')}</select></label><label>Disks into pool <span class="muted small">there</span><input name="pool" placeholder="same name, or local"></label></div>
+    ${running ? '' : '<label class="check"><input type="checkbox" name="start"> Start it there</label>'}<p class="err"></p>
+    <div class="modal-actions"><button type="button" class="ghost-btn" data-x>Cancel</button><button class="primary-btn">Move</button></div></form>`);
+  box.querySelector('[data-x]').onclick = close;
+  box.querySelector('form').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    if (!f.node.value) { box.querySelector('.err').textContent = 'No other node is online'; return; }
+    try { const r = await api(`/v1/vms/${encodeURIComponent(name)}/migrate`, { method: 'POST', body: { node: f.node.value, pool: f.pool.value.trim() || null, start: !!f.start?.checked } }); close(); H.taskLog(r.task, () => { location.hash = '#vms'; }); } catch (err) { box.querySelector('.err').textContent = err.message; }
+  };
 }
 
 async function loadSerial() {
@@ -367,12 +408,12 @@ async function onClick(e) {
   else if ((el = on('[data-vmenu-off]'))) {
     e.stopPropagation();
     const n = el.dataset.vmenuOff;
-    H.showMenu(el, [['copy', 'Clone…', () => cloneModal(n)], ['layers', 'Make it a template', async () => { if (await H.confirmBox(`Make ${n} a template?`, 'It can\'t start any more; new VMs are cloned from it (linked clones share its disks, so they become read-only).', 'Make template')) api(`/v1/vms/${encodeURIComponent(n)}/template`, { method: 'POST' }).then(reload, fail); }]]);
+    H.showMenu(el, [['servers', 'Move to another node…', () => migrateModal(n)], ['copy', 'Clone…', () => cloneModal(n)], ['layers', 'Make it a template', async () => { if (await H.confirmBox(`Make ${n} a template?`, 'It can\'t start any more; new VMs are cloned from it (linked clones share its disks, so they become read-only).', 'Make template')) api(`/v1/vms/${encodeURIComponent(n)}/template`, { method: 'POST' }).then(reload, fail); }]]);
   } else if ((el = on('[data-nic]'))) nicModal(+el.dataset.nic);
   else if ((el = on('[data-vmenu]'))) {
     e.stopPropagation();
     const n = el.dataset.vmenu;
-    H.showMenu(el, [['copy', 'Clone…', () => cloneModal(n)], ['restart', 'Reboot', () => vmAction('reboot', n)], ['pause', 'Pause', () => vmAction('pause', n)], ['restart', 'Reset (hard)', () => vmAction('reset', n)], null, ['stop', 'Power off now (no shutdown)', async () => { if (await H.confirmBox(`Pull the plug on ${n}?`, 'Like holding the power button: unsaved work in the VM is lost.', 'Power off')) vmAction('stop', n); }, 'stop']]);
+    H.showMenu(el, [['servers', 'Move to another node (live)…', () => migrateModal(n)], ['copy', 'Clone…', () => cloneModal(n)], ['restart', 'Reboot', () => vmAction('reboot', n)], ['pause', 'Pause', () => vmAction('pause', n)], ['restart', 'Reset (hard)', () => vmAction('reset', n)], null, ['stop', 'Power off now (no shutdown)', async () => { if (await H.confirmBox(`Pull the plug on ${n}?`, 'Like holding the power button: unsaved work in the VM is lost.', 'Power off')) vmAction('stop', n); }, 'stop']]);
   } else if ((el = on('[data-vt]'))) { V.tab = el.dataset.vt; if (!V.cur) return; paintTab(); }
   else if ((el = on('tr[data-vm]'))) location.hash = `#vms/${encodeURIComponent(el.dataset.vm)}`;
   else if (on('#vmNew')) { if (!V.host) V.host = await api('/v1/vms/host').catch(() => null); newVm(); }

@@ -46,10 +46,26 @@ function paint() {
     ${d.cluster ? '' : `<div class="panel set-card"><p class="muted">Link servers, at home or at other sites, into one cluster: manage them all from any of them, share accounts and permissions, and copy backups to another site so a stack can come back up there. Nodes talk over mutual TLS on port ${d.port}; each still runs its own containers and VMs.</p></div>`}
     <div class="node-grid" id="clNodes"></div>
     ${d.cluster ? `<div class="section-head"><h2>Sync jobs</h2><span class="muted">copy backups to a datastore on another node</span><span class="sp"></span>${canEdit() ? `<button class="link-btn" id="sjAdd">${ic('plus')} New sync job</button>` : ''}</div>
-    <div class="panel table-wrap"><table class="table"><thead><tr><th>Job</th><th>When</th><th>From</th><th>To</th><th>Keep there</th><th></th></tr></thead><tbody id="sjRows"></tbody></table></div>` : ''}`;
+    <div class="panel table-wrap"><table class="table"><thead><tr><th>Job</th><th>When</th><th>From</th><th>To</th><th>Keep there</th><th></th></tr></thead><tbody id="sjRows"></tbody></table></div>
+    <div class="section-head"><h2>High availability</h2><span class="muted">VMs that start on another node if theirs goes down (turn it on from a VM's page)</span></div>
+    <div id="haPanel"></div>` : ''}`;
   H.hydrateIcons($('#view-cluster'));
   paintNodes();
   paintJobs();
+  paintHa();
+}
+
+async function paintHa() {
+  const el = $('#haPanel'); if (!el) return;
+  const ha = await api('/v1/ha').catch(() => null); if (!ha) return;
+  const two = C.data.nodes.length === 2;
+  el.innerHTML = `<div class="panel set-card">
+    <form class="form row2" id="witForm"><label>Witness <span class="muted small">an address both sites can reach (router, a NAS, a third box): with ${two ? 'two nodes it decides who may take over' : 'a majority of nodes this is optional'}</span><input name="w" value="${esc(ha.witness || '')}" placeholder="192.168.1.1"></label><span>${canEdit() ? '<button class="ghost-btn">Save witness</button>' : ''}</span></form>
+    <div class="panel table-wrap"><table class="table"><tbody>${ha.resources.map((r) => `<tr><td><a href="#vms/${encodeURIComponent(r.vm)}"><b>${esc(r.vm)}</b></a></td><td>runs on ${esc(r.resource.owner)}</td><td>copy on ${esc(r.resource.standby)} every ${r.resource.interval_min} min</td><td>${r.resource.enabled ? '<span class="chip good">on</span>' : '<span class="chip">off</span>'}</td></tr>`).join('') || '<tr><td class="muted">No HA VMs yet.</td></tr>'}</tbody></table></div>
+    ${ha.log.length ? `<details><summary class="muted small">HA log</summary><pre class="secret">${esc(ha.log.join('\n'))}</pre></details>` : ''}
+    <p class="muted small">Takeover after ${ha.takeover_after_s / 60} minutes away; a node cut off from everyone stops its HA VMs after ${ha.fence_after_s} s, so a VM never runs twice.</p></div>`;
+  const wf = $('#witForm');
+  wf.onsubmit = (e) => { e.preventDefault(); api('/v1/ha/witness', { method: 'PUT', body: { witness: wf.w.value.trim() } }).then(() => { toast('Witness saved'); paintHa(); }, (er) => toast(er.message, true)); };
 }
 
 function paintNodes() {
