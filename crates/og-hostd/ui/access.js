@@ -11,6 +11,8 @@ const TABS = [
   ['tokens', 'link', 'API tokens', 'Access.Audit'],
   ['audit', 'note', 'Audit log', 'Access.Audit'],
   ['firewall', 'shield', 'Firewall', 'Sys.Audit', '/system'],
+  ['updates', 'download', 'Updates', 'Sys.Audit', '/system'],
+  ['ai', 'sparkle', 'AI', 'Sys.Modify', '/'],
 ];
 let cur = 'account';
 
@@ -34,7 +36,7 @@ function open(tab) {
   $('#setTabs').hidden = tabs.length < 2;
   $('#setMeta').textContent = S.me ? `signed in as ${S.me.user}` : '';
   $('#setBody').innerHTML = '<p class="muted">Loading…</p>';
-  ({ account, users, groups, roles, acl, tokens, audit, firewall })[cur]().catch(fail);
+  ({ account, users, groups, roles, acl, tokens, audit, firewall, updates, ai })[cur]().catch(fail);
 }
 const again = () => open(cur);
 
@@ -355,4 +357,99 @@ async function firewall() {
     '[data-fdown]': (el) => move(+el.dataset.fdown, 1),
     '[data-fdel]': (el) => { sync(); fw.rules.splice(+el.dataset.fdel, 1); firewall().catch(fail); },
   });
+}
+
+// ---------------------------------------------------------------- updates
+async function updates() {
+  const u = await api('/v1/update');
+  const cl = await api('/v1/cluster').catch(() => null);
+  const edit = H.can('Sys.Update', '/system');
+  const c = u.config;
+  const last = u.last ? `${u.last.status === 'ok' ? '<span class="chip good">updated</span>' : '<span class="chip crit">rolled back</span>'} ${esc(u.last.from)} → ${esc(u.last.to)} · ${when(u.last.done)}` : '';
+  const av = u.available;
+  $('#setBody').innerHTML = `
+    <div class="set-grid">
+      <div class="panel set-card">
+        <h3>${ic('server')}OG-Host ${esc(u.version)} <span class="chip">${esc(u.arch)}</span></h3>
+        ${u.pending ? `<p class="muted">Update to ${esc(u.pending.to)} on trial (start ${u.pending.attempts} of 3): kept after a minute of running, else rolled back.</p>` : ''}
+        ${last ? `<p class="muted small">Last: ${last}</p>` : ''}
+        <div id="upAvail">${av ? availHtml(av) : '<p class="muted">Not checked yet.</p>'}</div>
+        <div class="row-actions" style="justify-content:flex-start;gap:8px">
+          <button class="ghost-btn" id="upCheck">${ic('refresh')}Check now</button>
+          ${edit ? `<button class="primary-btn" id="upInstall" ${av && av.newer ? '' : 'hidden'}>${ic('download')}Install</button>` : ''}
+          ${edit && cl && cl.cluster ? `<button class="ghost-btn" id="upCluster">${ic('servers')}Update all ${cl.nodes.length} nodes</button>` : ''}
+        </div>
+        <p class="muted small">Containers and VMs keep running while og-hostd restarts.</p>
+      </div>
+      <div class="panel set-card">
+        <h3>${ic('sliders')}Where updates come from</h3>
+        <form class="form" id="upForm">
+          <div class="row2"><label>Channel<select name="channel" ${edit ? '' : 'disabled'}>${['stable', 'beta', 'dev'].map((x) => `<option ${c.channel === x ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
+          <label>Automatically<select name="auto" ${edit ? '' : 'disabled'}>${[['notify', 'tell me'], ['download', 'check only'], ['install', 'install']].map(([v, l]) => `<option value="${v}" ${c.auto === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+          <label>Mirrors <span class="muted small">one per line, tried in order</span><textarea name="mirrors" rows="2" ${edit ? '' : 'disabled'} placeholder="https://mirror.example/og-host">${esc(c.mirrors.join('\n'))}</textarea></label>
+          <label>Check<input name="schedule" value="${esc(c.schedule)}" ${edit ? '' : 'disabled'}></label>
+          ${edit ? '<button class="primary-btn">Save</button>' : ''}
+        </form>
+        <p class="muted small">Trusted release keys: ${u.keys.length ? u.keys.map((k) => `<code>${esc(k)}</code>`).join(' ') : '<b>none</b> (add one in /etc/og-host/trusted-keys)'}</p>
+      </div>
+    </div>
+    <div class="section-head"><h2>System packages</h2><span class="muted">Debian / Ubuntu updates for this server</span><span class="sp"></span>${edit ? `<button class="link-btn" id="pkRefresh">${ic('refresh')} Refresh lists</button><button class="primary-btn" id="pkUpgrade">${ic('download')}Upgrade all</button>` : ''}</div>
+    <div class="panel table-wrap"><table class="table"><tbody id="pkRows"><tr><td class="muted">Loading…</td></tr></tbody></table></div>`;
+  H.hydrateIcons($('#setBody'));
+  api('/v1/update/packages').then((list) => {
+    const el = $('#pkRows'); if (!el) return;
+    el.innerHTML = list.map((p) => `<tr><td><b>${esc(p.name)}</b></td><td class="addr">${esc(p.from || '')}</td><td class="addr">→ ${esc(p.version || '')}</td></tr>`).join('') || '<tr><td class="muted">Everything is up to date (as of the last list refresh).</td></tr>';
+  }).catch((e) => { const el = $('#pkRows'); if (el) el.innerHTML = `<tr><td class="muted">${esc(e.message)}</td></tr>`; });
+  $('#upForm').onsubmit = async (e) => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(e.target).entries());
+    try { await api('/v1/update/config', { method: 'PUT', body: { channel: v.channel, auto: v.auto, schedule: v.schedule, mirrors: v.mirrors.split(/\s+/).filter(Boolean) } }); toast('Saved'); } catch (err) { fail(err); }
+  };
+  onClick({
+    '#upCheck': async (el) => {
+      el.disabled = true;
+      try { const a = await api('/v1/update/check', { method: 'POST' }); $('#upAvail').innerHTML = availHtml(a); const b = $('#upInstall'); if (b) b.hidden = !a.newer; } catch (e) { $('#upAvail').innerHTML = `<p class="err">${esc(e.message)}</p>`; } finally { el.disabled = false; }
+    },
+    '#upInstall': () => api('/v1/update/install', { method: 'POST' }).then((r) => H.taskLog(r.task, () => setTimeout(() => location.reload(), 6000)), fail),
+    '#upCluster': async () => { if (await H.confirmBox('Update every node?', 'One at a time, this one last; it stops at the first node that doesn\'t come back on the new version.', 'Update all')) api('/v1/update/cluster', { method: 'POST' }).then((r) => H.taskLog(r.task), fail); },
+    '#pkRefresh': () => api('/v1/update/packages', { method: 'POST', body: { upgrade: false } }).then((r) => H.taskLog(r.task, () => updates()), fail),
+    '#pkUpgrade': async () => { if (await H.confirmBox('Upgrade system packages?', 'Runs apt-get full-upgrade on this server. Some services may restart.', 'Upgrade')) api('/v1/update/packages', { method: 'POST', body: { upgrade: true } }).then((r) => H.taskLog(r.task, () => updates()), fail); },
+  });
+}
+
+function availHtml(a) {
+  const m = a.manifest;
+  return `<p>${a.newer ? `<span class="chip accent">new</span> <b>OG-Host ${esc(m.version)}</b> is available` : `Up to date (the mirror has ${esc(m.version)})`} <span class="muted small">· ${esc(m.channel)} · signed by ${esc(a.key)} · ${esc(a.mirror)}</span></p>${a.newer && m.notes ? `<pre class="secret" style="max-height:200px;overflow:auto">${esc(m.notes)}</pre>` : ''}`;
+}
+
+// ---------------------------------------------------------------- AI
+async function ai() {
+  const c = await api('/v1/ai/config');
+  $('#setBody').innerHTML = `<div class="panel set-card">
+    <h3>${ic('sparkle')}AI ${c.configured ? '<span class="chip good">set up</span>' : '<span class="chip warn">no model yet</span>'}</h3>
+    <p class="muted">OG-Host's own assistant. It talks to any OpenAI-compatible model server (llama.cpp's llama-server, Ollama, vLLM, LM Studio…), ideally one on your own GPU. It uses OG-Host's tools with the permissions of whoever is chatting, and asks before it changes anything.</p>
+    <form class="form" id="aiForm">
+      <div class="row2"><label>Model server <span class="muted small">base URL with /v1</span><input name="url" value="${esc(c.url)}" placeholder="http://station:8080/v1"></label>
+      <label>Model<input name="model" value="${esc(c.model)}" list="aiModels" placeholder="as the server names it"></label></div>
+      <datalist id="aiModels"></datalist>
+      <div class="row2"><label>API key <span class="muted small">${c.has_key ? 'set (leave empty to keep, "-" to clear)' : 'optional'}</span><input name="key" type="password" autocomplete="off"></label>
+      <label>Steps per answer <span class="muted small">tool calls in a row</span><input name="max_steps" type="number" min="1" max="30" value="${c.max_steps}"></label></div>
+      <label>Temperature<input name="temperature" type="number" min="0" max="2" step="0.1" value="${c.temperature}"></label>
+      <fieldset><legend>Can do without asking (besides looking)</legend>${c.tools.filter((t) => t.changes).map((t) => `<label class="check"><input type="checkbox" name="auto:${esc(t.name)}" ${c.auto_approve.includes(t.name) ? 'checked' : ''}> ${esc(t.name)} <span class="muted small">${esc(t.description)}</span></label>`).join('')}</fieldset>
+      <div class="row-actions" style="justify-content:flex-start;gap:8px"><button class="primary-btn">Save</button><button type="button" class="ghost-btn" id="aiTest">${ic('refresh')}Find models</button><span class="muted small" id="aiTestOut"></span></div>
+    </form>
+    <details><summary class="muted small">${c.tools.length} tools</summary><ul class="muted small">${c.tools.map((t) => `<li><code>${esc(t.name)}</code>${t.changes ? ' (asks first)' : ''}: ${esc(t.description)}</li>`).join('')}</ul></details>
+  </div>`;
+  H.hydrateIcons($('#setBody'));
+  const f = $('#aiForm');
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(f).entries());
+    const auto = [...f.querySelectorAll('input[name^="auto:"]')].filter((x) => x.checked).map((x) => x.name.slice(5));
+    try { await api('/v1/ai/config', { method: 'PUT', body: { url: v.url.trim(), model: v.model.trim(), key_change: v.key, max_steps: +v.max_steps, temperature: +v.temperature, auto_approve: auto } }); toast('Saved'); S.ai = await api('/v1/ai/config'); ai(); } catch (err) { fail(err); }
+  };
+  $('#aiTest').onclick = async () => {
+    $('#aiTestOut').textContent = 'asking…';
+    try { const m = await api('/v1/ai/models'); $('#aiModels').innerHTML = m.map((x) => `<option>${esc(x)}</option>`).join(''); $('#aiTestOut').textContent = m.length ? `${m.length} model(s): ${m.join(', ')}` : 'reachable, no models listed'; if (m.length === 1 && !f.model.value) f.model.value = m[0]; } catch (e) { $('#aiTestOut').textContent = e.message; }
+  };
 }

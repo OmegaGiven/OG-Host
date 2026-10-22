@@ -21,6 +21,9 @@ pub struct Check {
     pub price: Option<f64>,
     pub summary: String,
     pub changed: bool,
+    /// fingerprint of the page text (change watches)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -181,6 +184,7 @@ impl Watches {
             price: b["price"].as_f64().or_else(|| b["price"].as_str().and_then(|s| s.parse().ok())).filter(|p| p.is_finite()),
             summary: b["summary"].as_str().unwrap_or("").chars().take(300).collect(),
             changed: b["changed"] == true,
+            fingerprint: String::new(),
         };
         send_all(lab, record(lab, id, res.clone()));
         Ok(json!({"ok": true, "recorded": res}))
@@ -299,6 +303,27 @@ async fn run_one(lab: &Arc<Lab>, w: Watch) {
         }
         r.insert(w.id.clone(), (now_ms(), Some(token.clone())));
     }
+    // cheapest first: the page's own data / fingerprint, then the local model on the page
+    // text, and only then the browser agent
+    let prev = w.last.clone();
+    let quick = match crate::quickcheck::fetch(lab, &w.url).await {
+        Ok(page) => match crate::quickcheck::decide(&w, &page, prev.as_ref()) {
+            Some(c) => Some(c),
+            None => crate::quickcheck::ask_model(lab, &w, &page, prev.as_ref()).await.ok().flatten(),
+        },
+        Err(_) => None,
+    };
+    let browser = !lab.cfg.openclaw_url.is_empty() && !lab.cfg.openclaw_password.is_empty();
+    if let Some(c) = quick {
+        send_all(lab, record(lab, &w.id, c));
+        lab.watches.running.lock().unwrap().remove(&w.id);
+        return;
+    }
+    if !browser {
+        send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "error".into(), summary: "couldn't read this page without a browser (robot check or a page that needs JavaScript)".into(), ..Default::default() }));
+        lab.watches.running.lock().unwrap().remove(&w.id);
+        return;
+    }
     let skipped = !crate::claw::station_ready(lab).await;
     if skipped {
         send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "skipped".into(), summary: "station is in Gaming mode — the AI's model is unloaded".into(), ..Default::default() }));
@@ -404,7 +429,7 @@ mod tests {
     use super::*;
 
     fn c(status: &str, stock: Option<bool>, price: Option<f64>) -> Check {
-        Check { at: 1, status: status.into(), in_stock: stock, price, summary: "s".into(), changed: false }
+        Check { at: 1, status: status.into(), in_stock: stock, price, summary: "s".into(), changed: false, fingerprint: String::new() }
     }
 
     #[test]

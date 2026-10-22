@@ -1,6 +1,7 @@
 //! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
 
 mod access_api;
+mod ai;
 mod auth;
 mod backup;
 mod backup_api;
@@ -22,7 +23,9 @@ mod stacks;
 mod stats;
 mod storage;
 mod tasks;
+mod release;
 mod tls;
+mod update;
 mod vm_api;
 mod vmrun;
 mod vms;
@@ -159,6 +162,25 @@ enum Cmd {
         #[arg(long)]
         reset_tfa: bool,
     },
+    /// Make releases (for publishers): keygen DIR, make ...
+    Release {
+        #[command(subcommand)]
+        cmd: ReleaseCmd,
+    },
+    /// Copy an update mirror (checking signatures and checksums).
+    Mirror {
+        #[command(subcommand)]
+        cmd: MirrorCmd,
+    },
+    /// Check for / install an OG-Host update from the configured mirrors.
+    Update {
+        /// install it too (else just check)
+        #[arg(long)]
+        install: bool,
+    },
+    /// (systemd ExecStartPre) count a start of an update on trial; roll back if it keeps failing.
+    #[command(hide = true)]
+    UpdateGuard,
     /// Lab control plane maintenance.
     Lab {
         #[command(subcommand)]
@@ -238,6 +260,39 @@ fn ago(t: u64) -> String {
     }
 }
 
+#[derive(Subcommand)]
+enum ReleaseCmd {
+    /// Make a release signing key in DIR.
+    Keygen { dir: PathBuf },
+    /// Pack binaries into a signed release on a mirror directory.
+    Make {
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        notes: Option<PathBuf>,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        mirror: PathBuf,
+        /// binaries to ship (og-hostd required; og-shim)
+        #[arg(long = "bin", required = true)]
+        bins: Vec<PathBuf>,
+        #[arg(long)]
+        arch: Option<String>,
+        /// the mirror's public URL (for install.sh)
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MirrorCmd {
+    /// Copy URL's releases into DIR.
+    Sync { url: String, dir: PathBuf },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -246,6 +301,18 @@ async fn main() -> Result<()> {
     // behave like a normal CLI when piped into `head` etc. (exit quietly on SIGPIPE)
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
+    // publishing tools need no server state (and no root)
+    match &cli.cmd {
+        Cmd::UpdateGuard => {
+            update::guard(&cli.root);
+            return Ok(());
+        }
+        Cmd::Release { cmd: ReleaseCmd::Keygen { dir } } => return release::keygen(dir),
+        Cmd::Release { cmd: ReleaseCmd::Make { version, channel, notes, key, mirror, bins, arch, url } } => {
+            return release::make(&release::MakeOpts { version: version.clone(), channel: channel.clone(), notes: notes.clone(), key: key.clone(), mirror: mirror.clone(), bins: bins.clone(), arch: arch.clone(), url: url.clone() })
+        }
+        _ => {}
+    }
     let store = Store::open(cli.root.join("content")).await?;
     let node = containers::Node {
         root: cli.root.clone(),
@@ -369,6 +436,17 @@ async fn main() -> Result<()> {
                 println!("account {id} saved; sign in on the web UI");
             }
         }
+        Cmd::Release { .. } | Cmd::UpdateGuard => unreachable!("handled before the store opens"),
+        Cmd::Mirror { cmd } => match cmd {
+            MirrorCmd::Sync { url, dir } => release::sync(&cli.root, &url, &dir).await?,
+        },
+        Cmd::Update { install } => {
+            let a = update::check(&cli.root).await?;
+            println!("installed {}, mirror {} has {} on {} (signed by {})", update::VERSION, a.mirror, a.manifest.version, a.manifest.channel, a.key);
+            if install && a.newer {
+                println!("use the web UI or POST /v1/update/install on a running server (it restarts the daemon)");
+            }
+        }
         Cmd::Lab { cmd } => match cmd {
             LabCmd::Import { from, env, with_secrets } => {
                 let done = og_lab::import_omegaenv(&from, env.as_deref(), &cli.root.join("lab"), with_secrets)?;
@@ -385,6 +463,8 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key, lab, cluster_port } => {
+            // an update on trial: count this start, roll back if it keeps failing
+            update::startup_check(&cli.root);
             let tls = match listen_tls {
                 Some(addr) => Some((addr, tls::cert_files(&cli.root, tls_cert, tls_key)?)),
                 None => None,

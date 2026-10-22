@@ -448,6 +448,19 @@ impl Cluster {
     }
 }
 
+/// Call a /v1 path on another node as `who` (JSON in, JSON out).
+pub async fn call_node(d: &Daemon, node: &str, who: &Who, method: reqwest::Method, path: &str) -> Result<Value> {
+    let n = d.cluster.node(node)?;
+    let c = d.cluster.client()?;
+    let r = c.request(method, format!("https://{}/cluster/v1/proxy{path}", n.addr)).header("x-og-user", who_header(who)).json(&json!({})).send().await.with_context(|| format!("{node} isn't reachable"))?;
+    let st = r.status();
+    let v: Value = r.json().await.unwrap_or(Value::Null);
+    if !st.is_success() {
+        bail!("{node}: {}", v["error"].as_str().unwrap_or(st.as_str()));
+    }
+    Ok(v)
+}
+
 fn who_header(w: &Who) -> String {
     match w {
         Who::User(u) => format!("user {u}"),

@@ -29,6 +29,7 @@ pub mod logs;
 pub mod mcp;
 pub mod metrics;
 pub mod notify;
+pub mod quickcheck;
 pub mod store;
 pub mod watches;
 
@@ -115,6 +116,8 @@ pub struct Lab {
     pub claw: claw::Claw,
     pub views: Mutex<Vec<Value>>,
     pub local: RwLock<Option<Arc<dyn LocalNode>>>,
+    /// OG-Host's AI model server (for watch checks the rules can't decide)
+    pub ai: RwLock<Option<quickcheck::AiCfg>>,
     pub http: reqwest::Client,
     /// Same, but never following redirects (health checks, icon fetches).
     http_nr: reqwest::Client,
@@ -201,6 +204,7 @@ impl Lab {
             claw: claw::Claw::default(),
             views: Mutex::new(store::load(dir, "views.json").unwrap_or_default()),
             local: RwLock::new(None),
+            ai: RwLock::new(None),
             dir: dir.to_path_buf(),
             cfg,
             secrets,

@@ -640,6 +640,9 @@ pub async fn scheduler(d: Arc<Daemon>) {
                 }
             }
         }
+        if due(&crate::update::config(&d.root).schedule) {
+            tokio::spawn(crate::update::auto(d.clone()));
+        }
         for j in crate::cluster::sync_jobs_list(&d.root).into_iter().filter(|j| j.enabled) {
             if due(&j.schedule) {
                 if let Err(e) = crate::cluster::start_sync(&d, j.clone(), "system") {

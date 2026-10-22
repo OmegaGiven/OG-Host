@@ -42,6 +42,7 @@ export function init(h) {
   H.onStats = () => {};
   H.paletteItems = paletteItems;
   $('#clawBtn').hidden = !H.can('AI.Use', '/lab');
+  api('/v1/ai/config').then((c) => { S.ai = c; }).catch(() => {});
   $('#demoBtn').hidden = false;
   bindHome(); bindMonitor(); bindExplore(); bindWatch(); bindApps(); bindLogs(); bindClaw(); bindDemo();
   loadDemoCfg().then(() => { applyDemoChrome(); refresh(true); refreshStation(); });
@@ -1071,13 +1072,13 @@ function openClaw(prefill, send = false) {
   if (send && prefill) sendChat(); else $('#chatText').focus();
 }
 function closeClaw() { $('#claw').classList.remove('open'); $('#claw').setAttribute('aria-hidden', 'true'); }
-function renderClawState() { const s = L.station; const el = $('#clawState'); if (el) el.textContent = s?.llama_server === false ? 'brain is off — station is in Gaming mode' : 'local agent on station'; }
+function renderClawState() { const s = L.station; const el = $('#clawState'); if (!el) return; if (nativeAi()) { el.textContent = `OG-Host AI · ${S.ai.model || 'local model'}`; return; } el.textContent = s?.llama_server === false ? 'brain is off — station is in Gaming mode' : 'local agent on station'; }
 function md(s) { return esc(s).replace(/```[\w-]*\n([\s\S]*?)```/g, (_, c) => `<pre class="json">${c}</pre>`).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>'); }
 const secs = (ms) => { const t = Math.max(0, Math.round(ms / 1000)); return t < 60 ? `${t}s` : `${Math.floor(t / 60)}m ${String(t % 60).padStart(2, '0')}s`; };
 function progressHtml(m) {
   const p = m.progress; if (!p) return '';
   const steps = p.steps.map((st) => `<li class="step ${st.status}">${ic(st.status === 'running' ? 'refresh' : st.status === 'failed' ? 'x' : 'check', st.status === 'running' ? 'spin' : '')}<span>${esc(st.title)}</span>${st.note ? `<small>${esc(st.note)}</small>` : ''}</li>`).join('');
-  const appr = p.approvals.map((a) => `<div class="approval" data-appr="${esc(a.id)}"><b>${ic('shield')} The AI wants to run</b><pre>${esc(a.command)}</pre><div><button data-dec="allow-once">Allow once</button><button data-dec="allow-always" class="ghost">Always allow</button><button data-dec="deny" class="ghost">Deny</button></div></div>`).join('');
+  const appr = p.approvals.map((a) => `<div class="approval" data-appr="${esc(a.id)}"><b>${ic('shield')} The AI wants to ${a.tool ? 'use' : 'run'}</b><pre>${esc(a.command)}</pre><div><button data-dec="allow-once">Allow once</button><button data-dec="allow-always" class="ghost">Always allow</button><button data-dec="deny" class="ghost">Deny</button></div></div>`).join('');
   if (!m.typing) return steps ? `<details class="steps-done"><summary>${p.steps.length} step${p.steps.length === 1 ? '' : 's'} · ${secs(p.endedAt - p.startedAt)}</summary><ul class="steps">${steps}</ul></details>` : '';
   const thinking = !m.content && p.thinking ? `<div class="thinking">${esc(p.thinking.slice(-220))}</div>` : '';
   return `<div class="progress"><div class="status-line">${ic('refresh', 'spin')}<span>${esc(p.label)}</span><small data-since="${p.startedAt}">${secs(Date.now() - p.startedAt)}</small></div>${steps ? `<ul class="steps">${steps}</ul>` : ''}${thinking}${appr}</div>`;
@@ -1126,7 +1127,27 @@ async function followClaw(reply, signal) {
   } catch { /* aborted when the reply ends */ }
 }
 function setSending(on) { sending = on; const b = $('#chatForm .send'); b.innerHTML = ic(on ? 'stop' : 'send'); b.title = on ? 'Stop' : 'Send'; b.classList.toggle('stop', on); }
-async function stopChat() { chatAbort?.abort(); try { await api('/api/assistant/stop', { method: 'POST', body: { thread } }); } catch { /* best effort */ } }
+const nativeAi = () => !!(S.ai && S.ai.configured);
+async function stopChat() { chatAbort?.abort(); try { await api(nativeAi() ? '/v1/ai/stop' : '/api/assistant/stop', { method: 'POST', body: { thread } }); } catch { /* best effort */ } }
+/** OG-Host's own AI: tool progress and approvals come inline in the reply stream. */
+function onAiEvent(reply, og) {
+  const p = reply.progress;
+  if (og.approval) {
+    const a = og.approval;
+    const args = JSON.stringify(a.args || {}, null, 1);
+    p.approvals.push({ id: a.id, tool: a.tool, thread: a.thread, command: `${a.tool} ${args.length > 900 ? args.slice(0, 900) + '…' : args}` });
+    p.label = 'Waiting for your approval';
+    return;
+  }
+  if (og.tool) {
+    let st = p.steps.filter((x) => x.title === og.tool && x.status === 'running').pop();
+    if (og.status === 'running') { p.steps.push({ id: `${og.tool}-${p.steps.length}`, title: og.tool, status: 'running', note: '' }); p.label = `Running ${og.tool}`; return; }
+    if (!st) st = p.steps.filter((x) => x.title === og.tool).pop();
+    if (st) { st.status = og.status === 'done' ? 'done' : 'failed'; if (og.error) st.note = og.error; if (og.status === 'denied') st.note = 'you said no'; }
+    p.approvals = p.approvals.filter((x) => x.tool !== og.tool);
+    p.label = 'Thinking…';
+  }
+}
 async function sendChat() {
   const text = $('#chatText').value.trim();
   if (!text || sending) return;
@@ -1136,11 +1157,22 @@ async function sendChat() {
   const reply = { role: 'assistant', content: '', typing: true, progress: { label: 'Sending…', steps: [], approvals: [], thinking: '', startedAt: Date.now() } };
   chat.push(reply); renderChat();
   const ac = (chatAbort = new AbortController()), follow = new AbortController();
-  followClaw(reply, follow.signal);
+  const native = nativeAi();
+  if (!native) followClaw(reply, follow.signal);
+  else reply.progress.label = 'Thinking…';
   try {
-    const r = await fetch('/api/assistant/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-OG-UI': '1' }, signal: ac.signal, body: JSON.stringify({ thread, messages: chat.filter((m) => m !== reply && !m.error).map(({ role, content }) => ({ role, content })) }) });
+    const r = await fetch(native ? '/v1/ai/chat' : '/api/assistant/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-OG-UI': '1' }, signal: ac.signal, body: JSON.stringify({ thread, messages: chat.filter((m) => m !== reply && !m.error).map(({ role, content }) => ({ role, content })) }) });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
-    await readSSE(r, (d) => { if (d === '[DONE]') return; try { reply.content += JSON.parse(d).choices?.[0]?.delta?.content || ''; renderChat(); } catch { /* keepalive */ } });
+    await readSSE(r, (d) => {
+      if (d === '[DONE]') return;
+      try {
+        const v = JSON.parse(d);
+        if (v.og) { onAiEvent(reply, v.og); renderChat(); return; }
+        const c = v.choices?.[0]?.delta?.content || '';
+        if (c && native) reply.progress.label = 'Writing reply…';
+        reply.content += c; renderChat();
+      } catch { /* keepalive */ }
+    });
     if (!reply.content) reply.content = '(no reply)';
   } catch (e) {
     reply.content = e.name === 'AbortError' ? (reply.content ? reply.content + '\n\n' : '') + '(stopped)' : `Couldn't reach the AI: ${e.message}${L.station?.llama_server === false ? '\nstation is in Gaming mode, so its model is unloaded. Switch to AI mode on Home.' : ''}`;
@@ -1164,7 +1196,14 @@ function bindClaw() {
   $('#chat').addEventListener('click', async (e) => {
     const b = e.target.closest('[data-dec]'); if (!b) return;
     const card = b.closest('[data-appr]'); card.querySelectorAll('button').forEach((x) => (x.disabled = true));
-    try { await api('/api/assistant/approve', { method: 'POST', body: { id: card.dataset.appr, decision: b.dataset.dec } }); card.remove(); }
+    try {
+      if (nativeAi()) {
+        const a = chat.flatMap((m) => m.progress?.approvals || []).find((x) => x.id === card.dataset.appr) || {};
+        await api('/v1/ai/approve', { method: 'POST', body: { id: card.dataset.appr, decision: b.dataset.dec === 'allow-always' ? 'always' : b.dataset.dec === 'deny' ? 'deny' : 'allow', thread: a.thread || '', tool: a.tool || '' } });
+      } else await api('/api/assistant/approve', { method: 'POST', body: { id: card.dataset.appr, decision: b.dataset.dec } });
+      for (const m of chat) if (m.progress) m.progress.approvals = m.progress.approvals.filter((x) => x.id !== card.dataset.appr);
+      card.remove();
+    }
     catch (er) { toast(`Approval failed: ${er.message}`, true); card.querySelectorAll('button').forEach((x) => (x.disabled = false)); }
   });
   setInterval(() => { for (const el of document.querySelectorAll('#chat [data-since]')) el.textContent = secs(Date.now() - +el.dataset.since); }, 1000);

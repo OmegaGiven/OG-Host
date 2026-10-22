@@ -398,6 +398,11 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["backup", "jobs", ..] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
         ["restore"] => r("/storage".into(), "Backup.Restore"),
         ["tasks", ..] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
+        // chat / approve check AI.Use / AI.Approve themselves; the settings are an admin's
+        ["ai", "config"] if !get => r("/".into(), "Sys.Modify"),
+        ["ai", "models"] => r("/".into(), "Sys.Modify"),
+        ["ai", ..] => None,
+        ["update", ..] => r("/system".into(), if get { "Sys.Audit" } else { "Sys.Update" }),
         ["cluster", ..] => r("/nodes".into(), if get { "Cluster.Audit" } else { "Cluster.Modify" }),
         // the node that does the work checks the actual route
         ["nodes", ..] => None,
