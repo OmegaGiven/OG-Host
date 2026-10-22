@@ -1,0 +1,33 @@
+== footprint
+RESULT disk_used_mb 1409 MB
+RESULT packages 304 
+RESULT mem_used_idle_mb 132 MB
+RESULT cpu_busy_idle_pct 0.02 %
+RESULT tcp_ports_external 7 
+RESULT root_processes 17 
+RESULT processes 22 
+== containers
+RESULT container_create_to_http_s 0.40 s
+== density
+RESULT density_30_containers_s 13.47 s
+RESULT density_mem_per_container_mb 5 MB
+RESULT density_remove_all_s 5.73 s
+== vms
+RESULT vm_linked_clone_s 0.23 s
+RESULT vm_full_clone_8g_s 4.73 s
+RESULT vm_start_to_ssh_s 14.14 s
+RESULT vm_mem_per_idle_1g_guest_mb 754 MB
+== vmdisk
+RESULT vm_fio_randread_4k_iops 101551 iops
+RESULT vm_fio_randwrite_4k_iops 105397 iops
+RESULT vm_fio_seqread_1m_mbs 1551 MB/s
+RESULT vm_fio_seqwrite_1m_mbs 344 MB/s
+== vmnet
+RESULT vm_to_vm_gbit 11.02 Gbit/s
+RESULT vm_to_vm_ping_ms 0.296 ms
+RESULT host_to_vm_gbit 28.92 Gbit/s
+== backup
+RESULT backup_vm_s 22.85 s
+RESULT backup_vm_size_mb 1342 MB
+RESULT restore_vm_s 18.45 s
+RESULT backup_vm_again_s 17.29 s

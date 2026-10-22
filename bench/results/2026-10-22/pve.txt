@@ -1,0 +1,31 @@
+== footprint
+RESULT disk_used_mb 4569 MB
+RESULT packages 742 
+RESULT mem_used_idle_mb 1443 MB
+RESULT cpu_busy_idle_pct 0.38 %
+RESULT tcp_ports_external 6 
+RESULT root_processes 41 
+RESULT processes 53 
+== containers
+RESULT container_create_to_http_s 4.42 s
+== density
+RESULT density_30_containers_s 122.86 s
+RESULT density_mem_per_container_mb -3 MB
+RESULT density_remove_all_s 76.16 s
+== vms
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+RESULT vm_linked_clone_s 1.92 s
+RESULT vm_full_clone_8g_s 7.15 s
+RESULT vm_start_to_ssh_s 14.24 s
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+RESULT vm_mem_per_idle_1g_guest_mb 563 MB
+== vmdisk
+generating cloud-init ISO
+WARN no fio
+RESULT vm_fio_randread_4k_iops  iops
+RESULT vm_fio_randwrite_4k_iops  iops
+/root/bench/bench.sh: line 91: / 1024 : syntax error: operand expected (error token is "/ 1024 ")

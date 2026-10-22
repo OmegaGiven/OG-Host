@@ -1,0 +1,24 @@
+== footprint
+RESULT disk_used_mb 1409 MB
+RESULT packages 304 
+RESULT mem_used_idle_mb 306 MB
+RESULT cpu_busy_idle_pct 0.02 %
+RESULT tcp_ports_external 7 
+RESULT root_processes 17 
+RESULT processes 22 
+== containers
+RESULT container_create_to_http_s 0.40 s
+== density
+RESULT density_30_containers_s 13.12 s
+RESULT density_mem_per_container_mb 8 MB
+RESULT density_remove_all_s 5.20 s
+== vms
+RESULT vm_linked_clone_s 0.24 s
+RESULT vm_full_clone_8g_s 5.36 s
+RESULT vm_start_to_ssh_s 14.01 s
+RESULT vm_mem_per_idle_1g_guest_mb 745 MB
+== vmdisk
+WARN no fio
+RESULT vm_fio_randread_4k_iops  iops
+RESULT vm_fio_randwrite_4k_iops  iops
+/root/bench/bench.sh: line 91: / 1024 : syntax error: operand expected (error token is "/ 1024 ")

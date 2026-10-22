@@ -742,20 +742,26 @@ impl Vms {
         // boot order
         let bootidx = |id: &str| vm.boot.iter().position(|b| b == id).map(|i| format!(",bootindex={}", i + 1)).unwrap_or_default();
         let mut sata_port = 0;
+        // disks get their own I/O threads (virtio-blk each, the SCSI controller one), off the
+        // main loop and the vCPU threads
         if vm.disks.iter().any(|d| d.bus == "scsi") {
-            push(&["-device", "virtio-scsi-pci,id=scsi0"]);
+            push(&["-object", "iothread,id=io-scsi0"]);
+            push(&["-device", "virtio-scsi-pci,id=scsi0,iothread=io-scsi0"]);
         }
         for d in &vm.disks {
             let path = self.disk_path(vm, d);
             let fmt = if path.extension().is_some_and(|e| e == "qcow2") { "qcow2" } else { "raw" };
-            let cache = if d.cache == "writeback" { "cache.direct=off" } else { "cache.direct=on,aio=native" };
+            let cache = if d.cache == "writeback" { "cache.direct=off,aio=io_uring" } else { "cache.direct=on,aio=io_uring" };
             let discard = if d.discard { ",discard=unmap,detect-zeroes=unmap" } else { "" };
             let proto = if std::fs::metadata(&path).is_ok_and(|m| { use std::os::unix::fs::FileTypeExt; m.file_type().is_block_device() }) { "host_device" } else { "file" };
             push(&["-blockdev", &format!("driver={proto},filename={},node-name=file-{id},{cache}{discard}", qv(&path.to_string_lossy()), id = d.id)]);
             push(&["-blockdev", &format!("driver={fmt},file=file-{id},node-name=drive-{id}{discard}", id = d.id)]);
             let serial = format!(",serial={}", qv(&d.serial));
             let dev = match d.bus.as_str() {
-                "virtio" => format!("virtio-blk-pci,drive=drive-{id},id={id}{serial}{}", bootidx(&d.id), id = d.id),
+                "virtio" => {
+                    push(&["-object", &format!("iothread,id=io-{}", d.id)]);
+                    format!("virtio-blk-pci,drive=drive-{id},id={id},iothread=io-{id}{serial}{}", bootidx(&d.id), id = d.id)
+                }
                 "nvme" => format!("nvme,drive=drive-{id},id={id}{serial}{}", bootidx(&d.id), id = d.id),
                 "scsi" => {
                     format!("scsi-hd,bus=scsi0.0,drive=drive-{id},id={id}{serial}{}{}", if d.ssd { ",rotation_rate=1" } else { "" }, bootidx(&d.id), id = d.id)
@@ -843,7 +849,9 @@ impl Vms {
             let primary = i == 0 && vm.vga == "none";
             push(&["-device", &format!("vfio-pci,host={p},id=hostpci{i}{}", if primary { ",x-vga=on" } else { "" })]);
         }
-        if vm.balloon > 0 && !vm.realistic {
+        // always a balloon (unless hiding the VM): free page reporting hands memory the guest
+        // frees back to the host; the brain only moves the target when `balloon` is set
+        if !vm.realistic {
             push(&["-device", "virtio-balloon-pci,id=balloon0,free-page-reporting=on"]);
         }
         if !vm.realistic {

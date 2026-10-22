@@ -76,6 +76,7 @@ pub fn id_hex(id: &Id) -> String {
     hex::encode(id)
 }
 
+#[derive(Clone)]
 pub struct Repo {
     pub dir: PathBuf,
     key: Option<Key>,
@@ -469,7 +470,7 @@ impl Repo {
 
     /// Read an archive back as a byte stream.
     pub fn reader(&self, m: &Manifest, archive: &str) -> Result<ArchiveReader<'_>> {
-        Ok(ArchiveReader { repo: self, idx: self.index(m, archive)?, pos: 0, buf: vec![], off: 0, hash: Sha256::new() })
+        Ok(ArchiveReader { repo: self, idx: self.index(m, archive)?, ahead: Default::default(), next: 0, pos: 0, buf: vec![], off: 0, hash: Sha256::new() })
     }
 
     /// Re-read every chunk of a snapshot and check the archives' checksums.
@@ -580,7 +581,7 @@ impl SnapshotWriter<'_> {
         if !valid_archive(name) || self.archives.iter().any(|a| a.name == name) {
             bail!("bad or repeated archive name {name:?}");
         }
-        Ok(ArchiveWriter { repo: self.repo, cutter: Default::default(), buf: Vec::with_capacity(chunker::MAX * 2), idx: vec![], info: ArchiveInfo { name: name.into(), ..Default::default() }, hash: Sha256::new(), dir: self.tmp.clone(), done: &mut self.archives })
+        Ok(ArchiveWriter { repo: self.repo, pool: PutPool::new(self.repo), cutter: Default::default(), buf: Vec::with_capacity(chunker::MAX * 2), idx: vec![], info: ArchiveInfo { name: name.into(), ..Default::default() }, hash: Sha256::new(), dir: self.tmp.clone(), done: &mut self.archives })
     }
 
     /// No archive added yet.
@@ -605,8 +606,44 @@ impl Drop for SnapshotWriter<'_> {
     }
 }
 
+/// Chunks are compressed (and sealed) and written by worker threads while the stream is cut;
+/// the index keeps the stream's order.
+struct PutPool {
+    tx: Option<std::sync::mpsc::SyncSender<(usize, Vec<u8>)>>,
+    rx: std::sync::mpsc::Receiver<(usize, Result<(Id, u64)>)>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    pending: usize,
+}
+
+fn threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8)
+}
+
+impl PutPool {
+    fn new(repo: &Repo) -> PutPool {
+        let n = threads();
+        let (tx, jobs) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(n * 2);
+        let (done, rx) = std::sync::mpsc::channel();
+        let jobs = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+        let workers = (0..n)
+            .map(|_| {
+                let (repo, jobs, done) = (repo.clone(), jobs.clone(), done.clone());
+                std::thread::spawn(move || loop {
+                    let job = jobs.lock().unwrap().recv();
+                    let Ok((seq, data)) = job else { break };
+                    if done.send((seq, repo.put(&data))).is_err() {
+                        break;
+                    }
+                })
+            })
+            .collect();
+        PutPool { tx: Some(tx), rx, workers, pending: 0 }
+    }
+}
+
 pub struct ArchiveWriter<'a> {
     repo: &'a Repo,
+    pool: PutPool,
     cutter: chunker::Cutter,
     buf: Vec<u8>,
     idx: Vec<(Id, u32)>,
@@ -618,13 +655,26 @@ pub struct ArchiveWriter<'a> {
 
 impl ArchiveWriter<'_> {
     fn emit(&mut self, n: usize) -> std::io::Result<()> {
-        let (id, written) = self.repo.put(&self.buf[..n]).map_err(std::io::Error::other)?;
-        self.idx.push((id, n as u32));
+        let seq = self.idx.len();
+        self.idx.push(([0; 32], n as u32));
+        let data = self.buf.drain(..n).collect::<Vec<u8>>();
+        self.pool.pending += 1;
+        self.pool.tx.as_ref().unwrap().send((seq, data)).map_err(|_| std::io::Error::other("backup workers stopped"))?;
+        // collect what's done meanwhile
+        while let Ok(r) = self.pool.rx.try_recv() {
+            self.done_chunk(r).map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
+    fn done_chunk(&mut self, (seq, r): (usize, Result<(Id, u64)>)) -> Result<()> {
+        self.pool.pending -= 1;
+        let (id, written) = r?;
+        self.idx[seq].0 = id;
         if written > 0 {
             self.info.new_chunks += 1;
             self.info.new_bytes += written;
         }
-        self.buf.drain(..n);
         Ok(())
     }
 
@@ -632,6 +682,14 @@ impl ArchiveWriter<'_> {
         if !self.buf.is_empty() {
             let n = self.buf.len();
             self.emit(n)?;
+        }
+        drop(self.pool.tx.take());
+        while self.pool.pending > 0 {
+            let r = self.pool.rx.recv().context("backup workers stopped")?;
+            self.done_chunk(r)?;
+        }
+        for w in std::mem::take(&mut self.pool.workers) {
+            let _ = w.join();
         }
         let mut b = Vec::with_capacity(12 + self.idx.len() * 36);
         b.extend_from_slice(INDEX_MAGIC);
@@ -666,6 +724,9 @@ impl Write for ArchiveWriter<'_> {
 pub struct ArchiveReader<'a> {
     repo: &'a Repo,
     idx: Vec<(Id, u32)>,
+    /// chunks read, checked and decompressed ahead by worker threads, in order
+    ahead: std::collections::VecDeque<std::sync::mpsc::Receiver<Result<Vec<u8>>>>,
+    next: usize,
     pos: usize,
     buf: Vec<u8>,
     off: usize,
@@ -685,8 +746,19 @@ impl Read for ArchiveReader<'_> {
             if self.pos >= self.idx.len() {
                 return Ok(0);
             }
+            // keep a few chunks in flight
+            while self.next < self.idx.len() && self.ahead.len() < threads() * 2 {
+                let (repo, id) = (self.repo.clone(), self.idx[self.next].0);
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(repo.get(&id));
+                });
+                self.ahead.push_back(rx);
+                self.next += 1;
+            }
             let (id, n) = self.idx[self.pos];
-            self.buf = self.repo.get(&id).map_err(std::io::Error::other)?;
+            let rx = self.ahead.pop_front().expect("chunk in flight");
+            self.buf = rx.recv().map_err(|_| std::io::Error::other("chunk reader stopped"))?.map_err(std::io::Error::other)?;
             if self.buf.len() != n as usize {
                 return Err(std::io::Error::other(format!("chunk {} has the wrong size", id_hex(&id))));
             }

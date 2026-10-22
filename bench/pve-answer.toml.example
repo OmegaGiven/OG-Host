@@ -1,0 +1,15 @@
+[global]
+keyboard = "en-us"
+country = "us"
+fqdn = "pve-bench.lab"
+mailto = "root@localhost"
+timezone = "UTC"
+
+[network]
+source = "from-dhcp"
+
+[disk-setup]
+filesystem = "ext4"
+disk-list = ["vda"]
+lvm.maxroot = 16
+lvm.swapsize = 0

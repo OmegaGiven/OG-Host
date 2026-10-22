@@ -237,10 +237,12 @@ impl Pools {
             self.create(dst, gib)?;
         }
         let out_fmt = if dp.kind == "dir" { "qcow2" } else { "raw" };
-        let mut args = vec!["convert", "-q", "-p", "-O", out_fmt];
+        // parallel, out-of-order writes; no page cache on either side (a copy the size of the
+        // disk would only push everything else out of it)
+        let mut args = vec!["convert", "-q", "-W", "-m", "16", "-T", "none", "-O", out_fmt];
         if dp.kind != "dir" {
             // target exists and is new (reads as zeros): don't write the zeros
-            args.extend(["-n", "--target-is-zero"]);
+            args.extend(["-n", "--target-is-zero", "-t", "none"]);
         }
         let s = spath.to_string_lossy().into_owned();
         let d = dpath.to_string_lossy().into_owned();
