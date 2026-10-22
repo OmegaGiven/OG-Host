@@ -94,6 +94,9 @@ async fn list(State(d): D) -> Json<Value> {
 async fn host(State(d): D) -> Json<Value> {
     let mut h = crate::vms::host_info();
     h["isos"] = json!(iso_list(&d));
+    h["bridges"] = json!(std::fs::read_dir("/sys/class/net").into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with("og") && std::path::Path::new("/sys/class/net").join(n).join("bridge").exists()).collect::<Vec<_>>());
+    h["pools"] = json!(d.vms.pools.list().iter().map(|p| json!({"id": p.id, "type": p.kind})).collect::<Vec<_>>());
+    h["templates"] = json!(d.vms.list().into_iter().filter(|v| v.template).map(|v| json!({"name": v.name, "os": v.os, "memory": v.memory, "cores": v.cores, "comment": v.comment})).collect::<Vec<_>>());
     h["networks"] = json!(d.node.net.list().unwrap_or_default().iter().map(|n| json!({"name": n.name, "subnet": n.subnet.to_string()})).collect::<Vec<_>>());
     Json(h)
 }

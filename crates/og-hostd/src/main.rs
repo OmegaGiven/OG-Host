@@ -30,6 +30,7 @@ mod tls;
 mod update;
 mod vm_api;
 mod vmrun;
+mod vmbrain;
 mod vmfw;
 mod vms;
 mod ui;

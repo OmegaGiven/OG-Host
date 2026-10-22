@@ -24,11 +24,11 @@ export function init(h) {
   L.demoOn = store.get('demo', false);
   H.setNav(
     [['home', 'grid', 'Home'], ['monitor', 'activity', 'Monitor'], ['explore', 'chart', 'Explore'], ['watch', 'eye', 'Watch'], ['apps', 'layers', 'Apps'], ['logs', 'logs', 'Logs'], ['server', 'server', 'Server']],
-    [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['backups', 'shield', 'Backups'], ['ctlogs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs'], ['cluster', 'servers', 'Cluster']],
+    [['overview', 'grid', 'Overview'], ['vms', 'monitor', 'VMs'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['network', 'net', 'Network'], ['backups', 'shield', 'Backups'], ['ctlogs', 'logs', 'Logs'], ['cluster', 'servers', 'Cluster']],
   );
   const R = H.ROUTES;
   // this server's pages live under "Server"
-  for (const k of ['overview', 'containers', 'stacks', 'images', 'storage', 'backups', 'vms', 'cluster']) if (R[k]) R[k].tab = 'server';
+  for (const k of ['overview', 'containers', 'stacks', 'images', 'storage', 'backups', 'vms', 'cluster', 'network']) if (R[k]) R[k].tab = 'server';
   R.ctlogs = { ...R.logs, tab: 'server' };
   R.server = { el: 'overview', tab: 'server', run: () => { location.replace('#overview'); } };
   R.home = { el: 'home', tab: 'home', run: () => { renderHome(); refresh(); } };

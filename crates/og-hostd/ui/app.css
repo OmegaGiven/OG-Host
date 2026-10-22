@@ -608,3 +608,13 @@ canvas.vnc:focus { box-shadow: 0 0 0 2px var(--accent); }
 .host-chip.switch { cursor: pointer; }
 .host-chip.switch::after { content: " ▾"; color: var(--text-3); }
 .host-chip.remote { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
+
+/* overview VMs */
+.ov-vms { padding: 4px 8px; display: grid; }
+.ov-vm { display: flex; align-items: center; gap: 10px; padding: 8px 6px; border-bottom: 1px solid var(--line); color: var(--text); text-decoration: none; font-size: 13px; }
+.ov-vm:last-child { border-bottom: 0; }
+.ov-vm:hover { background: var(--card-2); }
+.ov-vm .num { font: 12px var(--mono); color: var(--text-2); min-width: 54px; text-align: right; }
+details.ci { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+details.ci summary { cursor: pointer; font-size: 13px; color: var(--text-2); }
+details.ci[open] { display: grid; gap: 10px; }

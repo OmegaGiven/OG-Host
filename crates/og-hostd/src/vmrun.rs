@@ -75,6 +75,23 @@ pub fn start(d: &Daemon, name: &str) -> Result<()> {
         return Ok(());
     }
     d.vms.cloudinit_seed(&vm)?;
+    // a GPU containers are using: free it (og.gpu-preempt=true) or refuse
+    let conflicts = crate::vmbrain::gpu_conflicts(d, &vm);
+    if !conflicts.is_empty() {
+        if vm.labels.get("og.gpu-preempt").map(String::as_str) == Some("true") {
+            for (gpu, users) in &conflicts {
+                for c in users {
+                    if let Ok(m) = d.node.find(c) {
+                        let _ = d.node.stop(&m.id, 30);
+                        d.brain.lock().unwrap().note(format!("stopped {c}: VM {name} takes GPU {gpu}"));
+                    }
+                }
+            }
+        } else {
+            let list: Vec<String> = conflicts.iter().map(|(g, u)| format!("{g} (used by {})", u.join(", "))).collect();
+            bail!("GPU in use by containers: {}. Stop them, or label the VM og.gpu-preempt=true", list.join("; "));
+        }
+    }
     let qemu = crate::vms::qemu_binary().context("QEMU isn't installed (qemu-system-x86)")?;
     if !Path::new("/dev/kvm").exists() {
         bail!("this server has no /dev/kvm (virtualization off in the BIOS, or a VM without nested virtualization)");
@@ -303,6 +320,8 @@ pub async fn supervisor(d: std::sync::Arc<Daemon>) {
         })
         .await;
         first = false;
+        let d3 = d.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::vmbrain::tick(&d3)).await;
         tokio::time::sleep(Duration::from_secs(4)).await;
     }
 }
