@@ -195,13 +195,26 @@ pub async fn background(d: Arc<Daemon>) {
             }
             continue;
         }
-        // 2. VMs that moved away while we were gone: keep them off
+        // 2. VMs that moved away while we were gone: keep them off, and set the copy aside
+        // (renamed, nothing deleted) so the VM can be migrated back here later
         for (name, r) in doc.resources.iter().filter(|(_, r)| r.enabled && r.owner != me) {
-            if d.vms.get(name).is_ok() && d.vms.status(name).state != "stopped" {
+            if d.vms.get(name).is_err() || d.tasks.migrating(name) || crate::migrate::incoming(&d, name) || d.tasks.busy("ha-takeover", name) {
+                continue;
+            }
+            if d.vms.status(name).state != "stopped" {
                 note(&d, format!("{name}: now owned by {}; stopping the copy here", r.owner));
                 let d2 = d.clone();
                 let n = name.clone();
                 let _ = tokio::task::spawn_blocking(move || crate::vmrun::stop(&d2, &n, true, 0)).await;
+            }
+            // only when the owner has it (it's online and running it, as far as we can tell)
+            if peers.get(&r.owner).is_some_and(|p| p.online) && d.vms.status(name).state == "stopped" {
+                let d2 = d.clone();
+                let n = name.clone();
+                match tokio::task::spawn_blocking(move || d2.vms.set_aside(&n)).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                    Ok(new) => note(&d, format!("{name}: runs on {} now; the old copy here is kept as {new}", r.owner)),
+                    Err(e) => note(&d, format!("{name}: couldn't set the old copy aside: {e:#}")),
+                }
             }
         }
         for (name, _r) in doc.resources.iter().filter(|(_, r)| r.enabled && r.owner == me) {
@@ -229,7 +242,8 @@ pub async fn background(d: Arc<Daemon>) {
                 let due = d.ha.lock().unwrap().last_replica.get(name).is_none_or(|t| t.elapsed() >= Duration::from_secs(r.interval_min.max(1) * 60));
                 let busy = d.ha.lock().unwrap().replicating.get(name).copied().unwrap_or(false);
                 let standby_up = peers.get(&r.standby).is_some_and(|p| p.online);
-                if due && !busy && standby_up {
+                // not while it's being moved (the backup would disturb the disk mirror)
+                if due && !busy && standby_up && !d.tasks.migrating(name) {
                     d.ha.lock().unwrap().replicating.insert(name.clone(), true);
                     let d2 = d.clone();
                     let (n, res) = (name.clone(), r.clone());

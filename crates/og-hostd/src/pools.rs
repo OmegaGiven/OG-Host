@@ -264,6 +264,28 @@ impl Pools {
         Ok(dpath)
     }
 
+    /// Rename a volume within its pool.
+    pub fn rename(&self, vol: &str, new_name: &str) -> Result<String> {
+        let (p, n) = self.split(vol)?;
+        if !valid_vol(new_name) {
+            bail!("bad volume name {new_name:?}");
+        }
+        let dst = format!("{}:{new_name}", p.id);
+        if self.exists(&dst) {
+            bail!("volume {dst} exists already");
+        }
+        match p.kind.as_str() {
+            "dir" => std::fs::rename(self.path(vol)?, self.path(&dst)?)?,
+            "lvmthin" => {
+                run("lvrename", &[&p.vg, &n, new_name])?;
+            }
+            _ => {
+                run("zfs", &["rename", &format!("{}/{n}", p.dataset), &format!("{}/{new_name}", p.dataset)])?;
+            }
+        }
+        Ok(dst)
+    }
+
     /// Virtual size in bytes.
     pub fn size(&self, vol: &str) -> Result<u64> {
         let out = run("qemu-img", &["info", "-U", "--output=json", &self.path(vol)?.to_string_lossy()])?;

@@ -175,6 +175,24 @@ impl Tasks {
         }
     }
 
+    /// A live migration of VM `name` is running here.
+    pub fn migrating(&self, name: &str) -> bool {
+        let prefix = format!("{name} -> ");
+        self.running.lock().unwrap().values().any(|t| {
+            let i = t.info.lock().unwrap();
+            i.kind == "vm-migrate" && i.target.starts_with(&prefix)
+        })
+    }
+
+    /// A backup or HA replication of VM `name` is running here.
+    pub fn backing_up_vm(&self, name: &str) -> bool {
+        let label = format!("vm/{name}");
+        self.running.lock().unwrap().values().any(|t| {
+            let i = t.info.lock().unwrap();
+            (i.kind == "ha-replicate" && i.target == name) || (i.kind == "backup" && i.target == label)
+        })
+    }
+
     pub fn busy(&self, kind: &str, target: &str) -> bool {
         self.running.lock().unwrap().values().any(|t| {
             let i = t.info.lock().unwrap();

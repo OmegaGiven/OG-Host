@@ -28,6 +28,8 @@ if [ $K = pve ]; then
   echo "RESULT migrate_downtime_ms $(printf '%s\n' "${down[@]}" | med) ms"
   echo "RESULT ha_failover_s n/a (Proxmox HA needs shared storage or ZFS replication, and a third vote, for VMs on local disks)"
 elif [ $K = og ]; then
+  # the VM starts on node 1 (an earlier run may have left it on node 2)
+  ./pssh 22204 'ogapi GET /v1/vms/v60 2>/dev/null | grep -q "\"state\":\"running\"" && { T=$(ogapi POST /v1/vms/v60/migrate "{\"node\":\"og-bench\"}" | sed -n "s/.*\"task\":\"\([^\"]*\)\".*/\1/p"); ogtask $T >/dev/null; }; true'
   ./pssh 22202 "$LIB; P=og; $GS; ogapi GET /v1/vms/v60 | grep -q '\"name\"' || vm_clone 60 0; ogapi POST /v1/vms/v60/start >/dev/null; waitfor 180 vm_ready 60"
   for i in $(seq $R); do
     for dir in "22202 og-bench2" "22204 og-bench"; do set -- $dir

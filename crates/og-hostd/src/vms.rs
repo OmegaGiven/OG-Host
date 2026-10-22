@@ -1043,6 +1043,62 @@ impl Vms {
     }
 }
 
+impl Vms {
+    /// Keep a stopped VM under another name (`<name>-stale-<time>`), its own volumes renamed
+    /// with it, autostart off, new MAC addresses and UUID: for the copy a node still has after
+    /// high availability moved the VM elsewhere. Nothing is deleted (its disks may hold changes
+    /// newer than the replica the VM was restored from). Returns the new name.
+    pub fn set_aside(&self, name: &str) -> Result<String> {
+        let mut vm = self.get(name)?;
+        if self.status(name).state != "stopped" {
+            bail!("{name} is running");
+        }
+        let (y, mo, d, h, mi, _) = og_backup_civil(crate::containers::unix_now());
+        let stamp = format!("{:02}{mo:02}{d:02}-{h:02}{mi:02}", y % 100);
+        let keep = 40 - "-stale-".len() - stamp.len();
+        let new = format!("{}-stale-{stamp}", name.chars().take(keep).collect::<String>().trim_end_matches('-'));
+        if self.dir(&new).exists() {
+            bail!("{new} exists already");
+        }
+        let own = format!("vm-{name}-");
+        for disk in &mut vm.disks {
+            if let Some((_, vn)) = disk.volume.split_once(':') {
+                if let Some(rest) = vn.strip_prefix(&own) {
+                    disk.volume = self.pools.rename(&disk.volume, &format!("vm-{new}-{rest}"))?;
+                }
+            }
+        }
+        std::fs::rename(self.dir(name), self.dir(&new))?;
+        vm.name = new.clone();
+        vm.autostart = false;
+        vm.desired = "stopped".into();
+        vm.uuid.clear();
+        for n in &mut vm.nics {
+            n.mac.clear();
+            n.ports.clear();
+        }
+        vm.comment = format!("set aside: {name} runs on another node now (this copy stayed here){}", if vm.comment.is_empty() { String::new() } else { format!("; {}", vm.comment) });
+        self.normalize(&mut vm)?;
+        self.save(&vm)?;
+        Ok(new)
+    }
+}
+
+fn og_backup_civil(t: u64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = (t / 86400) as i64;
+    let secs = (t % 86400) as i64;
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d, secs / 3600, secs % 3600 / 60, secs % 60)
+}
+
 fn which(t: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(t).is_file()))
 }

@@ -85,6 +85,14 @@ pub async fn prepare(State(d): State<Arc<Daemon>>, Json(b): Json<Prepare>) -> Re
     }
 }
 
+const INCOMING: &str = ".incoming";
+
+/// A migration to this node is filling in VM `name` (from prepare to finish or abort; a
+/// marker older than a day is a leftover).
+pub fn incoming(d: &Daemon, name: &str) -> bool {
+    std::fs::metadata(d.vms.dir(name).join(INCOMING)).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(86400)))
+}
+
 fn prepare_inner(d: &Daemon, b: Prepare) -> Result<Value> {
     let mut vm = b.vm;
     let name = vm.name.clone();
@@ -97,6 +105,8 @@ fn prepare_inner(d: &Daemon, b: Prepare) -> Result<Value> {
     let tls = tls_dir(d)?;
     let dir = d.vms.dir(&name);
     std::fs::create_dir_all(&dir)?;
+    // until finish/abort: high availability here leaves this copy alone
+    std::fs::write(dir.join(INCOMING), "")?;
     let mut made = vec![];
     let r = (|| -> Result<Value> {
         // settings, UEFI variables, TPM
@@ -162,6 +172,7 @@ pub struct Finish {
 pub async fn finish(State(d): State<Arc<Daemon>>, UrlPath(name): UrlPath<String>, Json(b): Json<Finish>) -> Response {
     let d2 = d.clone();
     let r = tokio::task::spawn_blocking(move || -> Result<()> {
+        let _ = std::fs::remove_file(d2.vms.dir(&name).join(INCOMING));
         let _ = d2.vms.qmp(&name, "nbd-server-stop", json!({}));
         if b.live {
             // the VM runs here now
@@ -233,6 +244,17 @@ pub async fn migrate(State(d): State<Arc<Daemon>>, Extension(w): Extension<og_ac
 }
 
 async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq) -> Result<()> {
+    // a backup (or HA replication) of it finishes first: it pauses the VM and reads its disks
+    let w0 = Instant::now();
+    while d.tasks.backing_up_vm(name) {
+        if w0.elapsed() > Duration::from_secs(600) {
+            bail!("{name} is being backed up; try again when that's done");
+        }
+        if w0.elapsed() < Duration::from_millis(600) {
+            t.log(format!("waiting for the backup of {name} to finish"));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     let vm = d.vms.get(name)?;
     if vm.template {
         bail!("templates don't migrate (clone them on the other node)");
@@ -279,10 +301,38 @@ async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq
         }
         return Err(e);
     }
-    let r = c.post(format!("{base}/{name}/finish")).json(&json!({"live": live, "start": b.start})).send().await?;
-    if !r.status().is_success() {
-        let v: Value = r.json().await.unwrap_or_default();
-        bail!("finishing on {}: {}", node.name, v["error"].as_str().unwrap_or("?"));
+    // high availability follows the VM: the target owns it (and this node becomes its standby
+    // if the target was) before it starts there, so neither node's HA stops it
+    let ha_before = crate::ha::doc(&d.root).resources.get(name).cloned().filter(|r| r.enabled);
+    if let Some(r) = &ha_before {
+        let (me, to) = (d.cluster.me.clone(), node.name.clone());
+        let n = name.to_string();
+        let r0 = r.clone();
+        crate::ha::update(d, move |doc| {
+            if let Some(x) = doc.resources.get_mut(&n) {
+                x.owner = to.clone();
+                if r0.standby == to {
+                    x.standby = me;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    let fin = c.post(format!("{base}/{name}/finish")).json(&json!({"live": live, "start": b.start})).send().await;
+    let fin_err = match fin {
+        Ok(r) if r.status().is_success() => None,
+        Ok(r) => Some(r.json::<Value>().await.unwrap_or_default()["error"].as_str().unwrap_or("?").to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(e) = fin_err {
+        if let Some(r) = ha_before {
+            let n = name.to_string();
+            let _ = crate::ha::update(d, move |doc| {
+                doc.resources.insert(n, r);
+                Ok(())
+            });
+        }
+        bail!("finishing on {}: {e}", node.name);
     }
     // gone from here: the VM (its QEMU, settings and volumes)
     if live {
@@ -321,7 +371,38 @@ async fn offline_copy(d: &Daemon, t: &crate::tasks::Task, vm: &Vm, host: &str, p
     Ok(())
 }
 
+/// Undo a live copy in the source QEMU: mirror jobs, the target block nodes, a migration.
+fn live_cleanup(d: &Daemon, name: &str, vm: &Vm) {
+    let q = |cmd: &str, a: Value| d.vms.qmp(name, cmd, a);
+    let _ = q("migrate_cancel", json!({}));
+    for x in &vm.disks {
+        let _ = q("block-job-cancel", json!({"device": format!("mirror-{}", x.id), "force": true}));
+    }
+    for _ in 0..40 {
+        let left = q("query-block-jobs", json!({})).ok().and_then(|j| j.as_array().map(|a| a.iter().any(|j| j["device"].as_str().is_some_and(|n| n.starts_with("mirror-"))))).unwrap_or(false);
+        if !left {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for x in &vm.disks {
+        let _ = q("job-dismiss", json!({"id": format!("mirror-{}", x.id)}));
+        let _ = q("blockdev-del", json!({"node-name": format!("tgt-{}", x.id)}));
+    }
+}
+
 async fn live_copy(d: &Daemon, t: &crate::tasks::Task, name: &str, vm: &Vm, host: &str, nbd_port: u64, mig_port: u64, tls: &std::path::Path) -> Result<()> {
+    // whatever an earlier, failed attempt left behind
+    live_cleanup(d, name, vm);
+    let r = live_copy_inner(d, t, name, vm, host, nbd_port, mig_port, tls).await;
+    if r.is_err() {
+        live_cleanup(d, name, vm);
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_copy_inner(d: &Daemon, t: &crate::tasks::Task, name: &str, vm: &Vm, host: &str, nbd_port: u64, mig_port: u64, tls: &std::path::Path) -> Result<()> {
     let q = |cmd: &str, a: Value| d.vms.qmp(name, cmd, a);
     let _ = q("object-del", json!({"id": "ogtls"}));
     q("object-add", json!({"qom-type": "tls-creds-x509", "id": "ogtls", "dir": tls, "endpoint": "client"}))?;
@@ -337,10 +418,13 @@ async fn live_copy(d: &Daemon, t: &crate::tasks::Task, name: &str, vm: &Vm, host
         t.check()?;
         let jobs = q("query-block-jobs", json!({}))?;
         let list = jobs.as_array().cloned().unwrap_or_default();
-        if list.len() < vm.disks.len() {
-            bail!("a disk mirror stopped");
+        let mirrors = list.iter().filter(|j| j["device"].as_str().is_some_and(|n| n.starts_with("mirror-"))).count();
+        if mirrors < vm.disks.len() {
+            // why (the job's error, if QEMU kept it)
+            let why = q("query-jobs", json!({})).ok().and_then(|j| j.as_array().and_then(|a| a.iter().find_map(|j| j["error"].as_str().map(String::from)))).unwrap_or_default();
+            bail!("a disk mirror stopped{}", if why.is_empty() { String::new() } else { format!(": {why}") });
         }
-        if list.iter().all(|j| j["ready"] == true) {
+        if list.iter().filter(|j| j["device"].as_str().is_some_and(|n| n.starts_with("mirror-"))).all(|j| j["ready"] == true) {
             break;
         }
         if last.elapsed() > Duration::from_secs(10) {
