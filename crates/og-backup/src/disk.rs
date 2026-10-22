@@ -244,12 +244,13 @@ impl Repo {
                                 }
                                 continue;
                             }
-                            let data = self.get(&id)?;
+                            let (data, sealed) = self.get_flagged(&id)?;
                             if data.len() != n as usize {
                                 bail!("chunk {} has the wrong size", crate::id_hex(&id));
                             }
                             if blockwise {
-                                sums.lock().unwrap()[i] = Sha256::digest(&data).into();
+                                // get() checked the data against its id: unsealed, the id is its SHA-256
+                                sums.lock().unwrap()[i] = if sealed { Sha256::digest(&data).into() } else { id };
                             }
                             if fresh && is_zero(&data) {
                                 continue;

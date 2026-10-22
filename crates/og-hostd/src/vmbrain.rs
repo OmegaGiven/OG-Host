@@ -12,8 +12,10 @@
 //! applies over QMP.
 //!
 //! Same-page merging (KSM): with two or more VMs running, identical memory pages (the same
-//! guest kernel and libraries, zeroed pages) are kept once. It scans fast for a while after a VM
-//! starts, then slowly in the background, and stops when fewer than two VMs run. `<root>/ksm`
+//! guest kernel and libraries, zeroed pages) are kept once. It waits a minute after a VM starts
+//! (guests boot faster without it), scans faster for two minutes, then slowly in the
+//! background; it pauses while the host's CPUs are busy (merging competes with the VMs), and
+//! stops when fewer than two VMs run. `<root>/ksm`
 //! containing `off` turns it off (VMs of different tenants that mustn't share pages: merging
 //! can leak timing information between them).
 
@@ -94,17 +96,33 @@ pub struct Ksm {
     pub fast: bool,
     /// memory saved by merging, MiB
     pub saved_mib: u64,
+    /// paused because the CPUs are busy
+    pub paused: bool,
     #[serde(skip)]
     vms: usize,
     #[serde(skip)]
-    fast_until: Option<Instant>,
+    fast_from: Option<Instant>,
+    #[serde(skip)]
+    cpu: Option<(u64, u64)>,
 }
 
 const KSM: &str = "/sys/kernel/mm/ksm";
-/// fast: ~400 MB/s scanned (merges a new VM's pages in seconds); slow: ~4 MB/s
-const KSM_FAST: (&str, &str) = ("4000", "20");
-const KSM_SLOW: (&str, &str) = ("200", "200");
+/// fast: ~80 MB/s scanned (a new VM's pages merged within a minute or two); slow: ~2 MB/s
+const KSM_FAST: (&str, &str) = ("1000", "50");
+const KSM_SLOW: (&str, &str) = ("100", "200");
+const KSM_WAIT: Duration = Duration::from_secs(60);
 const KSM_FAST_FOR: Duration = Duration::from_secs(120);
+/// host CPU busier than this (%): merging waits
+const KSM_CPU_BUSY: f64 = 50.0;
+
+/// (busy, total) jiffies of all CPUs
+fn cpu_jiffies() -> Option<(u64, u64)> {
+    let l = std::fs::read_to_string("/proc/stat").ok()?;
+    let v: Vec<u64> = l.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+    let total: u64 = v.iter().take(8).sum();
+    let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
+    Some((total - idle, total))
+}
 
 fn ksm_set(file: &str, v: &str) {
     let _ = std::fs::write(format!("{KSM}/{file}"), v);
@@ -126,12 +144,32 @@ fn ksm_tick(root: &std::path::Path, k: &mut Ksm, running: usize, used_pct: f64) 
         }
         k.vms = running;
         k.saved_mib = 0;
+        k.fast_from = None;
         return;
     }
-    if !k.on || running > k.vms || used_pct > 85.0 {
-        k.fast_until = Some(now + KSM_FAST_FOR);
+    // CPU busy since the last round?
+    let cpu = cpu_jiffies();
+    let busy = match (k.cpu, cpu) {
+        (Some((b0, t0)), Some((b1, t1))) if t1 > t0 => 100.0 * (b1 - b0) as f64 / (t1 - t0) as f64 > KSM_CPU_BUSY,
+        _ => false,
+    };
+    k.cpu = cpu;
+    if running > k.vms || (k.fast_from.is_none() && !k.on) || used_pct > 85.0 {
+        k.fast_from = Some(if used_pct > 85.0 { now } else { now + KSM_WAIT });
     }
-    let fast = k.fast_until.is_some_and(|t| now < t);
+    k.vms = running;
+    let Some(from) = k.fast_from else { return };
+    if now < from || (busy && used_pct < 85.0) {
+        // not yet (guests booting) or the CPUs are busy: merged pages stay merged
+        if k.on {
+            ksm_set("run", "0");
+            k.on = false;
+        }
+        k.paused = busy;
+        return;
+    }
+    k.paused = false;
+    let fast = now < from + KSM_FAST_FOR;
     if !k.on || fast != k.fast {
         let (pages, sleep) = if fast { KSM_FAST } else { KSM_SLOW };
         ksm_set("use_zero_pages", "1");
@@ -141,7 +179,6 @@ fn ksm_tick(root: &std::path::Path, k: &mut Ksm, running: usize, used_pct: f64) 
         k.on = true;
         k.fast = fast;
     }
-    k.vms = running;
     k.saved_mib = std::fs::read_to_string(format!("{KSM}/pages_sharing")).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0) * 4 / 1024;
 }
 

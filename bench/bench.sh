@@ -19,7 +19,7 @@ ctr_create_start() { # N -> prints IP when serving HTTP
     og-hostd run --name c$1 --memory 256m nginx:alpine | sed -n 's/.* ip \([0-9.]*\).*/\1/p'
   fi
 }
-ctr_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd stop c$1 >/dev/null 2>&1; og-hostd rm c$1 >/dev/null 2>&1; fi; }
+ctr_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd rm -f c$1 >/dev/null 2>&1; fi; }
 vm_clone() { # N linked(1/0)
   if [ $P = pve ]; then
     local full=1; [ "$2" = 1 ] && full=0
@@ -56,6 +56,8 @@ diag_host() {
     echo "DIAG qemu $p cmdline $(tr '\0' ' ' < /proc/$p/cmdline | grep -oE -- '-(machine|cpu|m|netdev|device|vga|bios|drive) [^ ]+' | grep -vE 'pflash|smbios' | tr '\n' ' ')"
   done
 }
+# a two-node cluster with the other node off has no quorum (/etc/pve read-only): one vote is enough here
+if [ $P = pve ] && [ -f /etc/pve/corosync.conf ]; then pvecm status 2>/dev/null | grep -q "Quorate:.*Yes" || pvecm expected 1; for i in $(seq 30); do pvecm status 2>/dev/null | grep -q "Quorate:.*Yes" && break; sleep 1; done; fi
 [ $P = pve ] && systemctl stop proxmox-backup-proxy proxmox-backup 2>/dev/null
 [ "${1:-}" = footprint ] || cleanup
 

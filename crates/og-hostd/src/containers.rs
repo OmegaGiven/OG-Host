@@ -628,15 +628,25 @@ impl Node {
         let _ = self.set_desired(id, "stopped");
         let st = self.status(id);
         let Some(pid) = st.pid.filter(|_| st.state == "running") else { return Ok(st) };
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        for _ in 0..timeout_s * 10 {
-            if self.status(id).state != "running" {
+        let gone = |ms: u64| {
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_millis(ms) {
+                if self.status(id).state != "running" {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        };
+        // timeout 0: straight to SIGKILL (docker rm -f)
+        if timeout_s > 0 {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            if gone(timeout_s * 1000) {
                 return Ok(self.status(id));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        gone(3000);
         Ok(self.status(id))
     }
 

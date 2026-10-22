@@ -266,6 +266,11 @@ impl Repo {
     }
 
     pub fn get(&self, id: &Id) -> Result<Vec<u8>> {
+        self.get_flagged(id).map(|(d, _)| d)
+    }
+
+    /// A chunk's data, checked against its id, and whether it was sealed (encrypted).
+    pub fn get_flagged(&self, id: &Id) -> Result<(Vec<u8>, bool)> {
         let raw = std::fs::read(self.chunk_path(id)).with_context(|| format!("chunk {} is missing", id_hex(id)))?;
         if raw.len() < 5 || &raw[..4] != CHUNK_MAGIC {
             bail!("chunk {} is damaged", id_hex(id));
@@ -284,7 +289,7 @@ impl Repo {
         if self.id_of(&data, flags & F_SEALED != 0) != *id {
             bail!("chunk {} is damaged (checksum mismatch)", id_hex(id));
         }
-        Ok(data)
+        Ok((data, flags & F_SEALED != 0))
     }
 
     // ---- raw access, for copying backups between datastores (other sites) ----

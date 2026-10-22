@@ -125,8 +125,13 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         timeout: u64,
     },
-    /// Remove a stopped container.
-    Rm { container: String },
+    /// Remove a stopped container (`-f`: kill it first).
+    Rm {
+        container: String,
+        /// kill it first if it runs (like docker rm -f)
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Create and start every service of a compose project.
     Up {
         #[arg(short = 'f', long = "file", default_value = "docker-compose.yml")]
@@ -521,8 +526,11 @@ async fn main() -> Result<()> {
                 println!("  warning: {w}");
             }
         }
-        Cmd::Rm { container } => {
+        Cmd::Rm { container, force } => {
             let m = node.find(&container)?;
+            if force {
+                node.stop(&m.id, 0)?;
+            }
             node.remove(&m.id)?;
             println!("removed {}", m.name);
         }
