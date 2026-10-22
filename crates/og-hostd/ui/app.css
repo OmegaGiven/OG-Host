@@ -587,3 +587,15 @@ pre.secret { font: 13px/1.6 var(--mono); background: var(--bg-2); border: 1px so
 .task-log { font: 12px/1.55 var(--mono); background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; height: min(420px, 55vh); overflow: auto; white-space: pre-wrap; margin: 0; }
 .br-list { max-height: 50vh; overflow: auto; }
 @media (max-width: 640px) { .form fieldset.keep { grid-template-columns: repeat(3, 1fr); } }
+
+/* VMs */
+.dot-off { background: var(--text-3); }
+.vnc-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.vnc-wrap { background: #000; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; display: grid; place-items: center; }
+.vnc-wrap:fullscreen { border: 0; border-radius: 0; }
+canvas.vnc { display: block; max-width: 100%; max-height: 78vh; width: auto; height: auto; outline: none; cursor: default; image-rendering: auto; }
+.vnc-wrap:fullscreen canvas.vnc { max-height: 100vh; }
+canvas.vnc:focus { box-shadow: 0 0 0 2px var(--accent); }
+.iso-up { display: flex; align-items: center; gap: 10px; }
+.iso-up .ghost-btn { cursor: pointer; }
+.set-card .kv b { font-family: inherit; text-align: right; }

@@ -348,6 +348,7 @@ async fn backup_now(State(d): D, Extension(w): Extension<Who>, Json(b): Json<Bac
         let (path, name) = match t {
             Target::Container(n) => ("containers", n),
             Target::Stack(n) => ("stacks", n),
+            Target::Vm(n) => ("vms", n),
         };
         if !d.access.allowed(&w, &format!("/{path}/{name}"), "Backup.Create") && !d.access.allowed(&w, &format!("/storage/{}", b.store), "Backup.Create") {
             return (StatusCode::FORBIDDEN, Json(json!({"error": format!("permission denied: Backup.Create on /{path}/{name}")}))).into_response();

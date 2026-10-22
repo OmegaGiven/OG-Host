@@ -398,6 +398,13 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["backup", "jobs", ..] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
         ["restore"] => r("/storage".into(), "Backup.Restore"),
         ["tasks", ..] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
+        ["vms"] | ["vms", "host"] => r("/vms".into(), if get { "VM.Audit" } else { "VM.Allocate" }),
+        ["vms", n] => r(format!("/vms/{n}"), match *m { Method::GET | Method::HEAD => "VM.Audit", Method::DELETE => "VM.Allocate", _ => "VM.Config" }),
+        ["vms", n, "vnc" | "console"] => r(format!("/vms/{n}"), "VM.Console"),
+        ["vms", n, "disks", ..] | ["vms", n, "cdrom"] => r(format!("/vms/{n}"), "VM.Config"),
+        ["vms", n, "snapshots", ..] => r(format!("/vms/{n}"), if get { "VM.Audit" } else { "VM.Snapshot" }),
+        ["vms", n, _] => r(format!("/vms/{n}"), "VM.PowerMgmt"),
+        ["iso", ..] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
         _ => r("/".into(), "Sys.Modify"),
     }
 }

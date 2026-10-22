@@ -179,6 +179,8 @@ impl Config {
             "iif lo accept".into(),
             "meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, nd-router-solicit, packet-too-big, destination-unreachable, time-exceeded, parameter-problem } accept".into(),
             "udp dport { 68, 546 } accept comment \"dhcp\"".into(),
+            // VMs asking OG-Host's DHCP for their address
+            "iifname \"og*\" udp dport 67 accept comment \"vm dhcp\"".into(),
         ];
         if self.allow_containers {
             l.push("iifname \"og*\" accept comment \"containers\"".into());

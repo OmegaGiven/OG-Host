@@ -26,6 +26,7 @@ use crate::tasks::Task;
 pub enum Target {
     Container(String),
     Stack(String),
+    Vm(String),
 }
 
 impl Target {
@@ -33,6 +34,7 @@ impl Target {
         match self {
             Target::Container(n) => format!("ct/{n}"),
             Target::Stack(n) => format!("stack/{n}"),
+            Target::Vm(n) => format!("vm/{n}"),
         }
     }
 }
@@ -153,6 +155,9 @@ fn human(b: u64) -> String {
 /// Back up one container or stack. Blocking; run it in a task.
 /// None: there was nothing to back up (a container without volumes).
 pub fn run(d: &Daemon, task: &Task, store: &str, target: &Target, opts: &Opts) -> Result<Option<og_backup::Manifest>> {
+    if let Target::Vm(name) = target {
+        return run_vm(d, task, store, name, opts).map(Some);
+    }
     let t0 = std::time::Instant::now();
     let (_s, repo) = d.storage.repo(store)?;
     let all = d.node.list()?;
@@ -161,6 +166,7 @@ pub fn run(d: &Daemon, task: &Task, store: &str, target: &Target, opts: &Opts) -
             let m = d.node.find(name)?;
             (format!("ct/{}", m.name), vec![m], None)
         }
+        Target::Vm(_) => unreachable!(),
         Target::Stack(name) => {
             let file = crate::stacks::file_of(&d.node, &d.root, name).with_context(|| format!("no compose file known for stack {name}"))?;
             let dir = file.parent().context("compose file has no directory")?.to_path_buf();
@@ -229,8 +235,8 @@ pub fn run(d: &Daemon, task: &Task, store: &str, target: &Target, opts: &Opts) -
         task.log(format!("  not included (bind mount outside the stack): {}", b["source"].as_str().unwrap_or("")));
     }
     let meta = json!({
-        "kind": match target { Target::Container(_) => "container", Target::Stack(_) => "stack" },
-        "name": match target { Target::Container(n) | Target::Stack(n) => n },
+        "kind": match target { Target::Container(_) => "container", Target::Stack(_) => "stack", Target::Vm(_) => "vm" },
+        "name": match target { Target::Container(n) | Target::Stack(n) | Target::Vm(n) => n },
         "mode": opts.mode,
         "containers": metas.iter().map(|m| json!({"name": m.name, "id": m.id, "image": m.image, "service": m.service, "meta": m})).collect::<Vec<_>>(),
         "volumes": vols,
@@ -242,6 +248,62 @@ pub fn run(d: &Daemon, task: &Task, store: &str, target: &Target, opts: &Opts) -
     let new: u64 = m.archives.iter().map(|a| a.new_bytes).sum();
     task.log(format!("done: {} read, {} stored, {:.1} s", human(m.size()), human(new), t0.elapsed().as_secs_f64()));
     Ok(Some(m))
+}
+
+/// A VM: its whole directory (settings, UEFI variables, TPM state, disks) as one archive.
+/// `pause` stops its CPUs while the disks are read; `stop` shuts it down and starts it again.
+fn run_vm(d: &Daemon, task: &Task, store: &str, name: &str, opts: &Opts) -> Result<og_backup::Manifest> {
+    let t0 = std::time::Instant::now();
+    let vm = d.vms.get(name)?;
+    let (_s, repo) = d.storage.repo(store)?;
+    let group = format!("vm/{name}");
+    let outside: Vec<String> = vm.disks.iter().filter(|x| x.file.starts_with('/')).map(|x| x.file.clone()).collect();
+    if !outside.is_empty() {
+        task.warn(format!("disks outside the VM's folder aren't included: {}", outside.join(", ")));
+    }
+    let mut snap = repo.begin(&group, crate::containers::unix_now())?;
+    task.log(format!("backing up {group} to datastore {store}{}", repo.key_fingerprint().map(|f| format!(" (encrypted, key {f})")).unwrap_or_default()));
+    let state = d.vms.status(name).state;
+    let mut resume = false;
+    let mut restart = false;
+    if state == "running" {
+        match opts.mode.as_str() {
+            "pause" => {
+                d.vms.qmp(name, "stop", json!({}))?;
+                resume = true;
+                task.log("paused the VM");
+            }
+            "stop" => {
+                task.log("shutting the VM down");
+                crate::vmrun::stop(d, name, false, 180)?;
+                restart = true;
+            }
+            _ => task.log("live: reading the disks while the VM runs (it may not boot cleanly from this backup)"),
+        }
+    }
+    let r = (|| -> Result<og_backup::ArchiveInfo> {
+        let w = snap.archive("vm")?;
+        let w = og_backup::tar_dir(w, &d.vms.dir(name), "vm", &["console.log".into(), "swtpm.log".into()])?;
+        Ok(w.finish()?)
+    })();
+    if resume {
+        match d.vms.qmp(name, "cont", json!({})) {
+            Ok(_) => task.log("resumed"),
+            Err(e) => task.warn(format!("resuming the VM: {e:#}")),
+        }
+    }
+    if restart {
+        match crate::vmrun::start(d, name) {
+            Ok(()) => task.log("started the VM again"),
+            Err(e) => task.warn(format!("starting the VM again: {e:#}")),
+        }
+    }
+    let a = r?;
+    task.log(format!("  vm: {} ({} new in {} chunks)", human(a.size), human(a.new_bytes), a.new_chunks));
+    let meta = json!({"kind": "vm", "name": name, "mode": opts.mode, "vm": vm, "state": state});
+    let m = snap.commit(&host_name(), meta, &opts.notes, t0.elapsed().as_millis() as u64)?;
+    task.log(format!("done: {} read, {} stored, {:.1} s", human(m.size()), human(a.new_bytes), t0.elapsed().as_secs_f64()));
+    Ok(m)
 }
 
 /// Put a directory archive back at `dest` (replacing what's there), via a temporary
@@ -304,6 +366,23 @@ pub fn restore(d: &Daemon, task: &Task, store: &str, snapshot: &str, o: &Restore
     let kind = m.meta["kind"].as_str().unwrap_or("");
     let name = m.meta["name"].as_str().unwrap_or("").to_string();
     task.log(format!("restoring {} from {}", m.group, og_backup::time_name(m.time)));
+    if kind == "vm" {
+        if !crate::vms::valid_name(&name) {
+            bail!("bad VM name in the backup");
+        }
+        let was = d.vms.get(&name).is_ok() && d.vms.status(&name).state != "stopped";
+        if was {
+            task.log("shutting the VM down");
+            crate::vmrun::stop(d, &name, false, 180)?;
+        }
+        std::fs::create_dir_all(&d.vms.root)?;
+        restore_dir(&repo, &m, "vm", "vm", &d.vms.dir(&name), task)?;
+        if was || o.start {
+            crate::vmrun::start(d, &name)?;
+            task.log("started the VM");
+        }
+        return Ok(());
+    }
     // the containers that exist now, and whether they run
     let now: Vec<(Meta, bool)> = d
         .node
@@ -377,7 +456,8 @@ pub struct Job {
     pub all: bool,
     pub stacks: Vec<String>,
     pub containers: Vec<String>,
-    /// names (stack or container) left out of `all`
+    pub vms: Vec<String>,
+    /// names (stack, container or VM) left out of `all`
     pub exclude: Vec<String>,
     pub opts: Opts,
     pub keep: og_backup::prune::Keep,
@@ -388,7 +468,7 @@ pub struct Job {
 
 impl Default for Job {
     fn default() -> Self {
-        Job { id: String::new(), enabled: true, schedule: "daily 02:00".into(), store: "local".into(), all: true, stacks: vec![], containers: vec![], exclude: vec![], opts: Opts::default(), keep: og_backup::prune::Keep { last: 3, daily: 7, weekly: 4, monthly: 6, ..Default::default() }, notify: "failure".into(), comment: String::new() }
+        Job { id: String::new(), enabled: true, schedule: "daily 02:00".into(), store: "local".into(), all: true, stacks: vec![], containers: vec![], vms: vec![], exclude: vec![], opts: Opts::default(), keep: og_backup::prune::Keep { last: 3, daily: 7, weekly: 4, monthly: 6, ..Default::default() }, notify: "failure".into(), comment: String::new() }
     }
 }
 
@@ -436,7 +516,7 @@ pub fn validate_job(d: &Daemon, j: &mut Job) -> Result<()> {
     if !["failure", "always", "never"].contains(&j.notify.as_str()) {
         bail!("notify is failure, always or never");
     }
-    if !j.all && j.stacks.is_empty() && j.containers.is_empty() {
+    if !j.all && j.stacks.is_empty() && j.containers.is_empty() && j.vms.is_empty() {
         bail!("pick what to back up");
     }
     j.comment = j.comment.chars().take(200).collect();
@@ -459,9 +539,15 @@ pub fn job_targets(d: &Daemon, j: &Job) -> Vec<Target> {
                 out.push(Target::Container(m.name.clone()));
             }
         }
+        for vm in d.vms.list() {
+            if !skip(&vm.name) && vm.labels.get("og.backup").map(String::as_str) != Some("false") {
+                out.push(Target::Vm(vm.name));
+            }
+        }
     } else {
         out.extend(j.stacks.iter().cloned().map(Target::Stack));
         out.extend(j.containers.iter().cloned().map(Target::Container));
+        out.extend(j.vms.iter().cloned().map(Target::Vm));
     }
     out
 }

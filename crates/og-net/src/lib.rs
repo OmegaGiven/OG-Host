@@ -143,6 +143,16 @@ fn ifname(prefix: &str, id: &str) -> String {
     s
 }
 
+/// A VM's tap device name.
+pub fn tap_name(owner: &str) -> String {
+    ifname("ogt", owner)
+}
+
+/// The host's upstream DNS servers (what containers get in resolv.conf).
+pub fn upstream_dns() -> Vec<Ipv4Addr> {
+    container_resolv_conf().lines().filter_map(|l| l.strip_prefix("nameserver ")).filter_map(|ip| ip.trim().parse().ok()).collect()
+}
+
 /// Docker-style locally administered MAC derived from the IP (02:42:a.b.c.d).
 /// Unicast `xx:xx:xx:xx:xx:xx`.
 pub fn valid_mac(m: &str) -> bool {
@@ -152,7 +162,7 @@ pub fn valid_mac(m: &str) -> bool {
         && u8::from_str_radix(parts[0], 16).is_ok_and(|b| b & 1 == 0)
 }
 
-fn mac_for(ip: Ipv4Addr) -> String {
+pub fn mac_for(ip: Ipv4Addr) -> String {
     let o = ip.octets();
     format!("02:42:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
 }
@@ -377,6 +387,46 @@ impl Net {
         })
     }
 
+    /// A VM's tap device on a network's bridge, with an address from the network's IPAM
+    /// (handed to the VM by OG-Host's DHCP) and published ports, like a container's.
+    pub fn attach_tap(&self, owner: &str, network: &str, ports: &[PortMap]) -> Result<Attachment> {
+        let net = self.ensure(network, None)?;
+        let ip = ipam::allocate(&self.ipam_path(&net.name), &net.subnet, owner)?;
+        let tap = tap_name(owner);
+        let result = (|| -> Result<()> {
+            if !Path::new("/sys/class/net").join(&tap).exists() {
+                run(&["ip", "tuntap", "add", "dev", &tap, "mode", "tap", "vnet_hdr"])?;
+            }
+            run(&["ip", "link", "set", &tap, "master", &net.bridge, "up"])?;
+            self.publish(owner, ip, ports)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = self.detach(owner);
+            return Err(e);
+        }
+        Ok(Attachment { owner: owner.to_string(), netns: PathBuf::new(), network: Some(net.name), ip: Some(ip), gateway: Some(net.subnet.gateway()), prefix: Some(net.subnet.prefix), host_veth: Some(tap), ports: ports.to_vec() })
+    }
+
+    /// A macvtap on a host NIC: the VM sits on that LAN with its own MAC and gets its address
+    /// from the LAN's DHCP (no host bridge needed; the host itself can't reach it this way).
+    /// Returns the macvtap's /dev/tapN path.
+    pub fn attach_macvtap(&self, owner: &str, parent: &str, mac: &str) -> Result<PathBuf> {
+        if !valid_mac(mac) {
+            return Err(Error::Invalid(format!("bad MAC address {mac:?}")));
+        }
+        if !parent.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)) || parent.is_empty() || parent.len() > 15 {
+            return Err(Error::Invalid(format!("bad interface name {parent:?}")));
+        }
+        let dev = ifname("ogm", owner);
+        if !Path::new("/sys/class/net").join(&dev).exists() {
+            run(&["ip", "link", "add", "link", parent, "name", &dev, "address", mac, "type", "macvtap", "mode", "bridge"])?;
+        }
+        run(&["ip", "link", "set", &dev, "up"])?;
+        let idx = std::fs::read_to_string(Path::new("/sys/class/net").join(&dev).join("ifindex")).map_err(|e| Error::Invalid(format!("{dev}: {e}")))?;
+        Ok(PathBuf::from(format!("/dev/tap{}", idx.trim())))
+    }
+
     /// Delete the rules tagged for `owner` (used before re-publishing, and on detach).
     fn unpublish(&self, owner: &str) -> Result<()> {
         let tag = format!("og:{owner}");
@@ -430,9 +480,10 @@ impl Net {
     /// Remove everything `owner` had: rules, veth, namespace, address. Safe to call twice.
     pub fn detach(&self, owner: &str) -> Result<()> {
         self.unpublish(owner)?;
-        let veth = ifname("ogv", owner);
-        if Path::new("/sys/class/net").join(&veth).exists() {
-            let _ = run(&["ip", "link", "del", &veth]);
+        for dev in [ifname("ogv", owner), tap_name(owner), ifname("ogm", owner)] {
+            if Path::new("/sys/class/net").join(&dev).exists() {
+                let _ = run(&["ip", "link", "del", &dev]);
+            }
         }
         let ns_name = ifname("og-", owner);
         if Path::new("/run/netns").join(&ns_name).exists() {

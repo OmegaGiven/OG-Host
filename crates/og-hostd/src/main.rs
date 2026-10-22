@@ -9,6 +9,7 @@ mod build;
 mod compose;
 mod containers;
 mod desktop;
+mod dhcp;
 mod dockerapi;
 mod firewall;
 mod idmap;
@@ -21,6 +22,9 @@ mod stats;
 mod storage;
 mod tasks;
 mod tls;
+mod vm_api;
+mod vmrun;
+mod vms;
 mod ui;
 
 use std::path::PathBuf;
