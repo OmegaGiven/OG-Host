@@ -404,6 +404,7 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["ai", "models"] => r("/".into(), "Sys.Modify"),
         ["ai", ..] => None,
         ["update", ..] => r("/system".into(), if get { "Sys.Audit" } else { "Sys.Update" }),
+        ["ha", ..] => r("/nodes".into(), if get { "Cluster.Audit" } else { "Cluster.Modify" }),
         ["cluster", ..] => r("/nodes".into(), if get { "Cluster.Audit" } else { "Cluster.Modify" }),
         // the node that does the work checks the actual route
         ["nodes", ..] => None,

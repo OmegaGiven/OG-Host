@@ -714,7 +714,9 @@ pub fn tar_dir<W: Write>(w: W, src: &Path, prefix: &str, exclude: &[String]) -> 
     let dev = std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?.dev();
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
-        let full = src.join(&rel);
+        // the root itself as given (joining "" would add a trailing slash, which a file
+        // root doesn't survive)
+        let full = if rel.as_os_str().is_empty() { src.to_path_buf() } else { src.join(&rel) };
         let md = match std::fs::symlink_metadata(&full) {
             Ok(m) => m,
             Err(_) => continue, // removed while we walk
@@ -870,6 +872,22 @@ mod tests {
                 assert!(std::io::copy(&mut plain.reader(&m4, "vol-data").unwrap(), &mut std::io::sink()).is_ok());
             }
         }
+    }
+
+    #[test]
+    fn a_single_file_as_the_root() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("disk.qcow2");
+        std::fs::write(&f, vec![7u8; 3_000_000]).unwrap();
+        let repo = Repo::open(&t.path().join("repo"), None).unwrap();
+        let mut s = repo.begin("vm/x", 1).unwrap();
+        let w = s.archive("vol-disk0").unwrap();
+        let a = tar_dir(w, &f, "disk", &[]).unwrap().finish().unwrap();
+        assert!(a.size > 3_000_000, "the file is in the archive");
+        let m = s.commit("t", serde_json::json!({}), "", 0).unwrap();
+        let out = t.path().join("out");
+        untar(repo.reader(&m, "vol-disk0").unwrap(), &out).unwrap();
+        assert_eq!(std::fs::read(out.join("disk")).unwrap().len(), 3_000_000);
     }
 
     #[test]

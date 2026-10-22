@@ -73,6 +73,21 @@ pub fn start(d: &Daemon, name: &str) -> Result<()> {
 /// `incoming`: start paused, waiting for a migration (QMP migrate-incoming) or a disk copy
 /// over NBD; the desired state is left alone.
 pub fn start_with(d: &Daemon, name: &str, incoming: bool) -> Result<()> {
+    // one start at a time per VM
+    static STARTING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut s = STARTING.lock().unwrap();
+        if s.iter().any(|x| x == name) {
+            bail!("{name} is starting already");
+        }
+        s.push(name.to_string());
+    }
+    let r = start_inner(d, name, incoming);
+    STARTING.lock().unwrap().retain(|x| x != name);
+    r
+}
+
+fn start_inner(d: &Daemon, name: &str, incoming: bool) -> Result<()> {
     let vm = d.vms.get(name)?;
     if vm.template {
         bail!("{name} is a template: clone it to make a VM");
@@ -99,6 +114,12 @@ pub fn start_with(d: &Daemon, name: &str, incoming: bool) -> Result<()> {
         }
     }
     let qemu = crate::vms::qemu_binary().context("QEMU isn't installed (qemu-system-x86)")?;
+    if !Path::new("/dev/kvm").exists() {
+        // the module may just not be loaded yet
+        for m in ["kvm_amd", "kvm_intel"] {
+            let _ = Command::new("modprobe").arg(m).status();
+        }
+    }
     if !Path::new("/dev/kvm").exists() {
         bail!("this server has no /dev/kvm (virtualization off in the BIOS, or a VM without nested virtualization)");
     }
@@ -310,7 +331,7 @@ pub async fn supervisor(d: std::sync::Arc<Daemon>) {
                     eprintln!("og-hostd: VM {} stopped", vm.name);
                     cleanup(&d2, &vm);
                     let _ = d2.vms.set_desired(&vm.name, "stopped");
-                } else if st == "stopped" && boot && (vm.autostart || vm.desired == "running") {
+                } else if st == "stopped" && boot && (vm.autostart || vm.desired == "running") && crate::ha::may_run(&d2, &vm.name) {
                     match start(&d2, &vm.name) {
                         Ok(()) => eprintln!("og-hostd: VM {} started", vm.name),
                         Err(e) => eprintln!("og-hostd: VM {} didn't start: {e:#}", vm.name),

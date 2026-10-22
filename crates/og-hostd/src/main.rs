@@ -14,6 +14,7 @@ mod desktop;
 mod dhcp;
 mod dockerapi;
 mod firewall;
+mod ha;
 mod hostnet;
 mod idmap;
 mod labnode;

@@ -447,9 +447,13 @@ impl Cluster {
         self.state().map(|s| s.nodes.into_iter().filter(|n| n.name != self.me).collect()).unwrap_or_default()
     }
 
+    pub async fn push_all_pub(&self) {
+        self.push_all().await
+    }
+
     async fn push_all(&self) {
         let Ok(c) = self.client() else { return };
-        let body = json!({"state": self.state(), "access": self.access_doc()});
+        let body = json!({"state": self.state(), "access": self.access_doc(), "ha": crate::ha::doc(&self.root)});
         for n in self.others() {
             let _ = c.post(format!("https://{}/cluster/v1/sync", n.addr)).json(&body).send().await;
         }
@@ -576,6 +580,7 @@ fn cluster_router(d: Arc<Daemon>) -> Router {
         .route("/cluster/v1/store/{ds}/chunk/{id}", put(remote_chunk))
         .route("/cluster/v1/store/{ds}/snapshot", put(remote_snapshot))
         .route("/cluster/v1/store/{ds}/prune", post(remote_prune))
+        .route("/cluster/v1/ha", get(ha_doc))
         .route("/cluster/v1/vm/prepare", post(vm_prepare))
         .route("/cluster/v1/vm/{name}/finish", post(vm_finish))
         .route("/cluster/v1/vm/{name}/abort", post(vm_abort))
@@ -628,6 +633,9 @@ async fn sync(State(d): D, Extension(p): Extension<Peer>, Json(b): Json<Value>) 
     if let Ok(s) = serde_json::from_value::<ClusterState>(b["state"].clone()) {
         let _ = d.cluster.apply_state(s);
     }
+    if let Some(h) = b.get("ha") {
+        crate::ha::apply_remote(&d.root, h);
+    }
     if let Some(a) = b.get("access") {
         if let Ok(true) = d.cluster.apply_access(a, false) {
             eprintln!("og-hostd: accounts updated from {}", p.0.as_deref().unwrap_or("?"));
@@ -670,6 +678,13 @@ async fn proxied(State(d): D, Extension(p): Extension<Peer>, mut req: Request<Bo
         Ok(r) => r.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
+}
+
+async fn ha_doc(State(d): D, Extension(p): Extension<Peer>) -> Response {
+    if let Err(r) = need_peer(&p) {
+        return r;
+    }
+    Json(json!(crate::ha::doc(&d.root))).into_response()
 }
 
 // ---- VMs arriving from another node (migration) ----
@@ -1114,6 +1129,10 @@ pub fn start_sync(d: &Arc<Daemon>, j: SyncJob, user: &str) -> Result<String> {
         let h = tokio::runtime::Handle::current();
         h.block_on(run_sync(&d2, t, &j))
     })
+}
+
+pub async fn run_sync_pub(d: &Daemon, t: &crate::tasks::Task, j: &SyncJob) -> Result<()> {
+    run_sync(d, t, j).await
 }
 
 async fn run_sync(d: &Daemon, t: &crate::tasks::Task, j: &SyncJob) -> Result<()> {

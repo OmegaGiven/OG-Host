@@ -305,11 +305,18 @@ fn run_vm(d: &Daemon, task: &Task, store: &str, name: &str, opts: &Opts) -> Resu
                     None => (path.clone(), None),
                 };
                 let w = snap.archive(&format!("vol-{}", x.id))?;
+                // what's really there (sparse files are stored without their holes)
+                let want = std::fs::metadata(&src).map(|m| m.len().min(std::os::unix::fs::MetadataExt::blocks(&m) * 512)).unwrap_or(0);
                 let r = og_backup::tar_dir(w, &src, "disk", &[]).and_then(|w| Ok(w.finish()?));
                 if let Some(t) = tmp {
                     let _ = std::fs::remove_file(t);
                 }
-                r?
+                let info = r?;
+                // never a backup without the disk in it
+                if info.size + 64 * 1024 < want / 2 || (want > 0 && info.size <= 1024) {
+                    bail!("{}: only {} of {} bytes were read", x.volume, info.size, want);
+                }
+                info
             } else {
                 let mut f = std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?;
                 let mut w = snap.archive(&format!("raw-{}", x.id))?;
