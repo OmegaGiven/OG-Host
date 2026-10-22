@@ -35,8 +35,11 @@ pub struct Disk {
     pub id: String,
     /// virtio | scsi | sata | nvme
     pub bus: String,
-    /// file name in the VM's directory, or an absolute path (image file or block device)
+    /// file name in the VM's directory, or an absolute path (image file or block device);
+    /// empty when the disk is a pool volume
     pub file: String,
+    /// storage pool volume `pool:name` (new VMs: "pool" alone makes one there)
+    pub volume: String,
     /// none | writeback
     pub cache: String,
     pub discard: bool,
@@ -47,7 +50,7 @@ pub struct Disk {
 
 impl Default for Disk {
     fn default() -> Self {
-        Disk { id: "disk0".into(), bus: "virtio".into(), file: String::new(), cache: "none".into(), discard: true, ssd: true, serial: String::new(), model: String::new() }
+        Disk { id: "disk0".into(), bus: "virtio".into(), file: String::new(), volume: String::new(), cache: "none".into(), discard: true, ssd: true, serial: String::new(), model: String::new() }
     }
 }
 
@@ -122,6 +125,10 @@ pub struct Vm {
     pub boot: Vec<String>,
     /// CPU cap in cores (0 = none)
     pub cpu_limit: f64,
+    /// a template: never started, cloned into new VMs (its disks then stay unchanged)
+    pub template: bool,
+    /// cloud-init settings (a NoCloud seed disc is made at every start)
+    pub cloudinit: Option<CloudInit>,
     /// direct kernel boot (absolute paths on this server; empty = boot from disks/ISO)
     pub kernel: String,
     pub initrd: String,
@@ -157,6 +164,8 @@ impl Default for Vm {
             autostart: false,
             boot: vec![],
             cpu_limit: 0.0,
+            template: false,
+            cloudinit: None,
             kernel: String::new(),
             initrd: String::new(),
             append: String::new(),
@@ -166,6 +175,24 @@ impl Default for Vm {
             created: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CloudInit {
+    pub user: String,
+    /// SHA-512 crypt hash (set from a plain password by the API; never stored in plain)
+    pub password_hash: String,
+    pub ssh_keys: Vec<String>,
+    /// "dhcp" or "static"
+    pub ip: String,
+    /// static: 192.168.1.50/24
+    pub address: String,
+    pub gateway: String,
+    pub dns: Vec<String>,
+    /// extra #cloud-config YAML merged in (packages, runcmd, …)
+    pub extra: String,
+    pub upgrade: bool,
 }
 
 pub fn valid_name(n: &str) -> bool {
@@ -227,6 +254,7 @@ fn realistic_smbios(serial_seed: &str) -> Smbios {
 pub struct Vms {
     pub root: PathBuf,
     run: PathBuf,
+    pub pools: crate::pools::Pools,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,7 +267,7 @@ pub struct Status {
 
 impl Vms {
     pub fn new(root: &Path) -> Vms {
-        Vms { root: root.join("vms"), run: PathBuf::from("/run/og-host/vms") }
+        Vms { root: root.join("vms"), run: PathBuf::from("/run/og-host/vms"), pools: crate::pools::Pools::new(root) }
     }
 
     pub fn dir(&self, name: &str) -> PathBuf {
@@ -277,7 +305,17 @@ impl Vms {
     }
 
     pub fn disk_path(&self, vm: &Vm, d: &Disk) -> PathBuf {
+        if !d.volume.is_empty() {
+            return self.pools.path(&d.volume).unwrap_or_else(|_| PathBuf::from("/nonexistent"));
+        }
         if d.file.starts_with('/') { PathBuf::from(&d.file) } else { self.dir(&vm.name).join(&d.file) }
+    }
+
+    /// A pool volume for a VM's disk (`pool` alone, or empty = the local pool).
+    fn new_volume(&self, vm: &str, d: &Disk) -> String {
+        let pool = if d.volume.is_empty() { "local" } else { d.volume.trim_end_matches(':') };
+        let p = self.pools.get(pool).map(|p| p.kind).unwrap_or_default();
+        format!("{pool}:vm-{vm}-{}{}", d.id, if p == "dir" { ".qcow2" } else { "" })
     }
 
     fn iso_path(&self, iso: &str) -> PathBuf {
@@ -327,8 +365,12 @@ impl Vms {
             if !["none", "writeback"].contains(&d.cache.as_str()) {
                 bail!("disk cache is none or writeback");
             }
-            if d.file.is_empty() || d.file.contains("..") || (!d.file.starts_with('/') && d.file.contains('/')) {
+            if d.volume.is_empty() && (d.file.is_empty() || d.file.contains("..") || (!d.file.starts_with('/') && d.file.contains('/'))) {
                 bail!("disk {}: bad file", d.id);
+            }
+            if !d.volume.is_empty() {
+                self.pools.split(&d.volume)?;
+                d.file.clear();
             }
             if vm.realistic && d.bus == "virtio" {
                 d.bus = "sata".into();
@@ -434,23 +476,29 @@ impl Vms {
         }
         vm.created = crate::containers::unix_now();
         vm.desired = "stopped".into();
+        if !valid_name(&vm.name) {
+            bail!("VM names are lower-case letters, digits and - (up to 40)");
+        }
+        // new disks: a volume in the asked pool (default: local)
+        let mut fresh = vec![];
         for d in &mut vm.disks {
-            if d.file.is_empty() {
-                d.file = format!("{}.qcow2", d.id);
+            if d.file.is_empty() && !d.volume.contains(':') || d.volume.ends_with(':') {
+                d.volume = self.new_volume(&vm.name, d);
+                fresh.push(d.id.clone());
             }
         }
         self.normalize(&mut vm)?;
         let dir = self.dir(&vm.name);
         std::fs::create_dir_all(&dir)?;
+        let mut made: Vec<String> = vec![];
         let r = (|| -> Result<()> {
             for d in &vm.disks {
-                let p = self.disk_path(&vm, d);
-                if !p.exists() {
+                if fresh.contains(&d.id) && !self.pools.exists(&d.volume) {
                     let gib = sizes.get(&d.id).copied().unwrap_or(32);
-                    if gib == 0 || gib > 64 * 1024 {
-                        bail!("disk {}: size 1 GiB to 64 TiB", d.id);
-                    }
-                    qemu_img(&["create", "-q", "-f", "qcow2", "-o", "lazy_refcounts=on,extended_l2=on,cluster_size=128k", &p.to_string_lossy(), &format!("{gib}G")])?;
+                    self.pools.create(&d.volume, gib).with_context(|| format!("disk {}", d.id))?;
+                    made.push(d.volume.clone());
+                } else if !self.disk_path(&vm, d).exists() {
+                    bail!("disk {}: {} doesn't exist", d.id, self.disk_path(&vm, d).display());
                 }
             }
             if vm.firmware == "uefi" {
@@ -461,6 +509,9 @@ impl Vms {
         })();
         if r.is_err() {
             let _ = std::fs::remove_dir_all(&dir);
+            for v in made {
+                let _ = self.pools.delete(&v);
+            }
         }
         r.map(|_| vm)
     }
@@ -502,15 +553,11 @@ impl Vms {
         if self.status(name).state != "stopped" {
             bail!("stop the VM to add a disk");
         }
-        if d.file.is_empty() {
-            d.file = format!("{}.qcow2", d.id);
-        }
-        let p = self.disk_path(&vm, &d);
-        if !p.exists() {
-            if gib == 0 || gib > 64 * 1024 {
-                bail!("size 1 GiB to 64 TiB");
-            }
-            qemu_img(&["create", "-q", "-f", "qcow2", "-o", "lazy_refcounts=on,extended_l2=on,cluster_size=128k", &p.to_string_lossy(), &format!("{gib}G")])?;
+        if d.file.is_empty() && !d.volume.contains(':') || d.volume.ends_with(':') {
+            d.volume = self.new_volume(&vm.name, &d);
+            self.pools.create(&d.volume, gib)?;
+        } else if !self.disk_path(&vm, &d).exists() {
+            bail!("{} doesn't exist", self.disk_path(&vm, &d).display());
         }
         vm.disks.push(d);
         if let Err(e) = self.normalize(&mut vm) {
@@ -527,6 +574,9 @@ impl Vms {
             self.qmp(name, "block_resize", json!({"device": format!("drive-{}", d.id), "size": gib << 30}))?;
             return Ok(());
         }
+        if !d.volume.is_empty() {
+            return self.pools.resize(&d.volume, gib);
+        }
         qemu_img(&["resize", "-q", &self.disk_path(&vm, d).to_string_lossy(), &format!("{gib}G")])
     }
 
@@ -536,8 +586,20 @@ impl Vms {
         if self.status(name).state != "stopped" {
             bail!("stop the VM first");
         }
+        let vm = self.get(name)?;
         let _ = net.detach(&owner(name));
+        for i in 0..vm.nics.len() {
+            let _ = net.detach(&crate::vmrun::nic_owner(name, i));
+        }
         let _ = std::fs::remove_dir_all(self.rundir(name));
+        // its own volumes (vm-<name>-…); volumes it only uses stay
+        for d in &vm.disks {
+            if d.volume.split(':').nth(1).is_some_and(|n| n.starts_with(&format!("vm-{name}-"))) {
+                if let Err(e) = self.pools.delete(&d.volume) {
+                    eprintln!("og-hostd: removing {}: {e:#}", d.volume);
+                }
+            }
+        }
         std::fs::remove_dir_all(self.dir(name))?;
         Ok(())
     }
@@ -668,7 +730,8 @@ impl Vms {
             let fmt = if path.extension().is_some_and(|e| e == "qcow2") { "qcow2" } else { "raw" };
             let cache = if d.cache == "writeback" { "cache.direct=off" } else { "cache.direct=on,aio=native" };
             let discard = if d.discard { ",discard=unmap,detect-zeroes=unmap" } else { "" };
-            push(&["-blockdev", &format!("driver=file,filename={},node-name=file-{id},{cache}{discard}", qv(&path.to_string_lossy()), id = d.id)]);
+            let proto = if std::fs::metadata(&path).is_ok_and(|m| { use std::os::unix::fs::FileTypeExt; m.file_type().is_block_device() }) { "host_device" } else { "file" };
+            push(&["-blockdev", &format!("driver={proto},filename={},node-name=file-{id},{cache}{discard}", qv(&path.to_string_lossy()), id = d.id)]);
             push(&["-blockdev", &format!("driver={fmt},file=file-{id},node-name=drive-{id}{discard}", id = d.id)]);
             let serial = format!(",serial={}", qv(&d.serial));
             let dev = match d.bus.as_str() {
@@ -704,6 +767,18 @@ impl Vms {
                 push(&["-blockdev", &format!("driver=raw,file=file-{id},node-name=drive-{id},read-only=on")]);
                 let model = if vm.realistic { ",model=HL-DT-ST DVDRAM GH24NSD1" } else { "" };
                 push(&["-device", &format!("ide-cd,bus=ide.{port},drive=drive-{id},id={id}{model}{}", bootidx(&id))]);
+            }
+        }
+        if vm.cloudinit.is_some() {
+            let seed = self.dir(&vm.name).join("cloudinit.iso");
+            if seed.exists() {
+                if sata_port > 5 {
+                    bail!("too many SATA devices for the cloud-init disc (6 at most)");
+                }
+                push(&["-blockdev", &format!("driver=file,filename={},node-name=file-cidata,read-only=on", qv(&seed.to_string_lossy()))]);
+                push(&["-blockdev", "driver=raw,file=file-cidata,node-name=drive-cidata,read-only=on"]);
+                push(&["-device", &format!("ide-cd,bus=ide.{sata_port},drive=drive-cidata,id=cidata")]);
+                sata_port += 1;
             }
         }
         if sata_port > 6 {
@@ -771,6 +846,176 @@ impl Vms {
         }
         Ok(a)
     }
+}
+
+impl Vms {
+    /// Write the NoCloud seed disc (user-data, meta-data, network-config) for a VM.
+    pub fn cloudinit_seed(&self, vm: &Vm) -> Result<()> {
+        let Some(c) = &vm.cloudinit else { return Ok(()) };
+        let dir = self.dir(&vm.name);
+        let tmp = dir.join(".cidata");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let yaml_str = |s: &str| serde_json::to_string(s).unwrap_or_default(); // JSON strings are valid YAML
+        let mut ud = String::from("#cloud-config\n");
+        ud.push_str(&format!("hostname: {}\nfqdn: {}\nmanage_etc_hosts: true\n", vm.name, vm.name));
+        if !c.user.is_empty() {
+            ud.push_str(&format!("users:\n  - name: {}\n    groups: [sudo, wheel, adm]\n    shell: /bin/bash\n    sudo: \"ALL=(ALL) NOPASSWD:ALL\"\n    lock_passwd: {}\n", yaml_str(&c.user), c.password_hash.is_empty()));
+            if !c.password_hash.is_empty() {
+                ud.push_str(&format!("    passwd: {}\n", yaml_str(&c.password_hash)));
+            }
+            if !c.ssh_keys.is_empty() {
+                ud.push_str("    ssh_authorized_keys:\n");
+                for k in &c.ssh_keys {
+                    ud.push_str(&format!("      - {}\n", yaml_str(k.trim())));
+                }
+            }
+        }
+        ud.push_str(&format!("ssh_pwauth: {}\n", !c.password_hash.is_empty()));
+        if c.upgrade {
+            ud.push_str("package_update: true\npackage_upgrade: true\n");
+        }
+        if vm.agent {
+            ud.push_str("packages: [qemu-guest-agent]\nruncmd:\n  - [systemctl, enable, --now, qemu-guest-agent]\n");
+        }
+        if !c.extra.trim().is_empty() {
+            ud.push_str("# extra\n");
+            ud.push_str(c.extra.trim_start_matches("#cloud-config").trim());
+            ud.push('\n');
+        }
+        std::fs::write(tmp.join("user-data"), &ud)?;
+        // a new instance id whenever the settings change, so cloud-init applies them again
+        let id = {
+            use sha2::Digest;
+            let h = sha2::Sha256::digest(format!("{}{ud}{:?}{}", vm.uuid, c, vm.nics.iter().map(|n| n.mac.clone()).collect::<Vec<_>>().join(",")));
+            format!("og-{}", hex::encode(&h[..6]))
+        };
+        std::fs::write(tmp.join("meta-data"), format!("instance-id: {id}\nlocal-hostname: {}\n", vm.name))?;
+        let mut net = String::from("version: 2\nethernets:\n");
+        for (i, n) in vm.nics.iter().enumerate() {
+            net.push_str(&format!("  nic{i}:\n    match:\n      macaddress: \"{}\"\n", n.mac));
+            if i == 0 && c.ip == "static" && !c.address.is_empty() {
+                net.push_str(&format!("    addresses: [{}]\n", yaml_str(&c.address)));
+                if !c.gateway.is_empty() {
+                    net.push_str(&format!("    routes:\n      - to: default\n        via: {}\n", yaml_str(&c.gateway)));
+                }
+                if !c.dns.is_empty() {
+                    net.push_str(&format!("    nameservers:\n      addresses: [{}]\n", c.dns.iter().map(|d| yaml_str(d)).collect::<Vec<_>>().join(", ")));
+                }
+            } else {
+                net.push_str("    dhcp4: true\n");
+            }
+        }
+        std::fs::write(tmp.join("network-config"), net)?;
+        let iso = dir.join("cloudinit.iso");
+        let tool = ["genisoimage", "mkisofs", "xorrisofs"].iter().find(|t| which(t)).context("cloud-init needs genisoimage or xorriso installed")?;
+        let mut cmd = Command::new(tool);
+        cmd.args(["-quiet", "-output"]).arg(&iso).args(["-volid", "cidata", "-joliet", "-rock"]).arg(tmp.join("user-data")).arg(tmp.join("meta-data")).arg(tmp.join("network-config"));
+        let out = cmd.output()?;
+        let _ = std::fs::remove_dir_all(&tmp);
+        if !out.status.success() {
+            bail!("making the cloud-init disc: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    /// Turn a (stopped) VM into a template: it can't start, its disks become read-only.
+    pub fn make_template(&self, name: &str) -> Result<Vm> {
+        let mut vm = self.get(name)?;
+        if self.status(name).state != "stopped" {
+            bail!("stop the VM first");
+        }
+        vm.template = true;
+        vm.autostart = false;
+        for d in &vm.disks {
+            let p = self.disk_path(&vm, d);
+            if p.is_file() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444))?;
+            }
+        }
+        self.save(&vm)?;
+        Ok(vm)
+    }
+
+    /// A new VM from an existing one (or template). `linked`: disks share the template's data
+    /// (copy-on-write; only for templates, same pool). New identity: uuid, MACs, serials, TPM.
+    pub fn clone_vm(&self, src: &str, dst: &str, linked: bool, pool: Option<&str>) -> Result<Vm> {
+        let s = self.get(src)?;
+        if !valid_name(dst) {
+            bail!("VM names are lower-case letters, digits and - (up to 40)");
+        }
+        if self.dir(dst).exists() {
+            bail!("a VM named {dst} exists already");
+        }
+        if linked && !s.template {
+            bail!("linked clones need a template (a full clone works from any VM)");
+        }
+        if !s.template && self.status(src).state != "stopped" {
+            bail!("stop {src} first (or make it a template)");
+        }
+        let mut vm = s.clone();
+        vm.name = dst.into();
+        vm.uuid.clear();
+        vm.template = false;
+        vm.desired = "stopped".into();
+        vm.created = crate::containers::unix_now();
+        vm.comment = format!("{} of {src}", if linked { "linked clone" } else { "clone" });
+        for n in &mut vm.nics {
+            n.mac.clear();
+            n.ports.clear();
+        }
+        let dir = self.dir(dst);
+        std::fs::create_dir_all(&dir)?;
+        let mut made = vec![];
+        let r = (|| -> Result<()> {
+            for (i, d) in s.disks.iter().enumerate() {
+                let target_pool = pool.map(String::from).unwrap_or_else(|| d.volume.split(':').next().filter(|p| !p.is_empty()).unwrap_or("local").to_string());
+                let kind = self.pools.get(&target_pool)?.kind;
+                let vol = format!("{target_pool}:vm-{dst}-{}{}", d.id, if kind == "dir" { ".qcow2" } else { "" });
+                let srcvol = if d.volume.is_empty() {
+                    // a disk file of the old kind: import it into the pool
+                    self.pools.import(&self.disk_path(&s, d), &vol, None)?;
+                    made.push(vol.clone());
+                    vm.disks[i].volume = vol;
+                    vm.disks[i].file.clear();
+                    vm.disks[i].serial.clear();
+                    continue;
+                } else {
+                    d.volume.clone()
+                };
+                self.pools.clone_vol(&srcvol, &vol, linked && target_pool == srcvol.split(':').next().unwrap_or(""))?;
+                made.push(vol.clone());
+                vm.disks[i].volume = vol;
+                vm.disks[i].serial.clear();
+            }
+            if s.firmware == "uefi" && self.dir(src).join("efivars.fd").exists() {
+                std::fs::copy(self.dir(src).join("efivars.fd"), dir.join("efivars.fd"))?;
+            }
+            // a fresh TPM (a copy would be the same machine to anything that checks)
+            self.normalize(&mut vm)?;
+            self.save(&vm)
+        })();
+        if r.is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            for v in made {
+                let _ = self.pools.delete(&v);
+            }
+        }
+        r.map(|_| vm)
+    }
+}
+
+fn which(t: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(t).is_file()))
+}
+
+/// SHA-512 crypt of a password for cloud-init.
+pub fn hash_password(pw: &str) -> Result<String> {
+    if pw.chars().count() < 8 {
+        bail!("use at least 8 characters");
+    }
+    sha_crypt::sha512_simple(pw, &sha_crypt::Sha512Params::default()).map_err(|e| anyhow::anyhow!("hashing: {e:?}"))
 }
 
 pub enum NetDev {

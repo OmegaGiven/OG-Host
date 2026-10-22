@@ -40,6 +40,14 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/vms/{name}/snapshots", get(snaps).post(snap_create))
         .route("/v1/vms/{name}/snapshots/{snap}", delete(snap_delete))
         .route("/v1/vms/{name}/snapshots/{snap}/rollback", post(snap_rollback))
+        .route("/v1/vms/{name}/template", post(make_template))
+        .route("/v1/vms/{name}/clone", post(clone_vm))
+        .route("/v1/vms/{name}/cloudinit", post(set_cloudinit))
+        .route("/v1/pools", get(pools).post(pool_put))
+        .route("/v1/pools/{id}", delete(pool_delete))
+        .route("/v1/pools/{id}/volumes", get(pool_volumes))
+        .route("/v1/pools/{id}/volumes/{vol}", delete(volume_delete))
+        .route("/v1/pools/{id}/import", post(pool_import))
         .route("/v1/vms/{name}/vnc", get(vnc))
         .route("/v1/vms/{name}/console", get(console_log))
         .route("/v1/vms/{name}/{action}", post(action))
@@ -511,6 +519,232 @@ async fn iso_delete(State(d): D, Path(file): Path<String>) -> Response {
     }
     match std::fs::remove_file(d.vms.iso_dir().join(&file)) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+// ---- templates, clones, cloud-init ----
+
+async fn make_template(State(d): D, Path(name): Path<String>) -> Response {
+    let d2 = d.clone();
+    match blocking(move || Ok(view(&d2, &d2.vms.make_template(&name)?))).await {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct CloneReq {
+    name: String,
+    #[serde(default)]
+    linked: bool,
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    start: bool,
+}
+
+async fn clone_vm(State(d): D, Extension(w): Extension<Who>, Path(src): Path<String>, Json(b): Json<CloneReq>) -> Response {
+    let d2 = d.clone();
+    let label = format!("{src} -> {}", b.name);
+    match d.tasks.spawn("vm-clone", &label, &w.label(), move |t| {
+        t.log(format!("{} clone of {src} as {}", if b.linked { "linked" } else { "full" }, b.name));
+        let vm = d2.vms.clone_vm(&src, &b.name, b.linked, b.pool.as_deref())?;
+        for x in &vm.disks {
+            t.log(format!("  {} -> {}", x.id, x.volume));
+        }
+        if b.start {
+            crate::vmrun::start(&d2, &vm.name)?;
+            t.log("started");
+        }
+        Ok(())
+    }) {
+        Ok(id) => Json(json!({"task": id})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloudInitReq {
+    /// null turns cloud-init off
+    cloudinit: Option<crate::vms::CloudInit>,
+    /// a new password (hashed here; empty keeps the current one)
+    #[serde(default)]
+    password: String,
+}
+
+async fn set_cloudinit(State(d): D, Path(name): Path<String>, Json(b): Json<CloudInitReq>) -> Response {
+    let d2 = d.clone();
+    match blocking(move || {
+        let mut vm = d2.vms.get(&name)?;
+        let old = vm.cloudinit.clone();
+        vm.cloudinit = match b.cloudinit {
+            None => None,
+            Some(mut c) => {
+                c.password_hash = if b.password.is_empty() { old.map(|o| o.password_hash).unwrap_or_default() } else { crate::vms::hash_password(&b.password)? };
+                if !c.user.is_empty() && !c.user.chars().all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || x == '_' || x == '-') {
+                    anyhow::bail!("user names are lower-case letters, digits, _ and -");
+                }
+                if !["", "dhcp", "static"].contains(&c.ip.as_str()) {
+                    anyhow::bail!("ip is dhcp or static");
+                }
+                c.ssh_keys.retain(|k| !k.trim().is_empty());
+                Some(c)
+            }
+        };
+        // saved directly: allowed while running (applies at the next boot)
+        let p = d2.vms.dir(&name).join("vm.json");
+        std::fs::write(&p, serde_json::to_vec_pretty(&vm)?)?;
+        Ok(view(&d2, &vm))
+    })
+    .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => r,
+    }
+}
+
+// ---- storage pools ----
+
+async fn pools(State(d): D) -> Json<Value> {
+    let d2 = d.clone();
+    Json(tokio::task::spawn_blocking(move || {
+        json!(d2.vms.pools.list().iter().map(|p| {
+            let u = d2.vms.pools.usage(p);
+            json!({"pool": p, "total": u.map(|x| x.0), "used": u.map(|x| x.1)})
+        }).collect::<Vec<_>>())
+    }).await.unwrap_or_default())
+}
+
+async fn pool_put(State(d): D, Json(p): Json<crate::pools::Pool>) -> Response {
+    let d2 = d.clone();
+    match blocking(move || d2.vms.pools.upsert(p)).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn pool_delete(State(d): D, Path(id): Path<String>) -> Response {
+    match d.vms.pools.remove(&id) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+async fn pool_volumes(State(d): D, Path(id): Path<String>) -> Response {
+    let d2 = d.clone();
+    match blocking(move || {
+        let p = d2.vms.pools.get(&id)?;
+        let used: std::collections::HashMap<String, String> = d2.vms.list().into_iter().flat_map(|v| v.disks.iter().map(|x| (x.volume.clone(), v.name.clone())).collect::<Vec<_>>()).collect();
+        Ok(json!(d2.vms.pools.volumes(&p).into_iter().map(|mut v| {
+            v["vm"] = json!(used.get(v["volume"].as_str().unwrap_or("")));
+            v
+        }).collect::<Vec<_>>()))
+    })
+    .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn volume_delete(State(d): D, Path((id, vol)): Path<(String, String)>) -> Response {
+    let d2 = d.clone();
+    match blocking(move || {
+        let full = format!("{id}:{vol}");
+        if let Some(v) = d2.vms.list().into_iter().find(|v| v.disks.iter().any(|x| x.volume == full)) {
+            anyhow::bail!("{full} is a disk of {}", v.name);
+        }
+        d2.vms.pools.delete(&full)
+    })
+    .await
+    {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(r) => r,
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    /// a disk image to download (cloud images: qcow2 / raw / vmdk / vhdx)
+    #[serde(default)]
+    url: String,
+    /// or an uploaded file in the ISO/images folder
+    #[serde(default)]
+    file: String,
+    /// volume name in the pool
+    name: String,
+    /// grow it to this many GiB
+    #[serde(default)]
+    grow: Option<u64>,
+}
+
+async fn pool_import(State(d): D, Extension(w): Extension<Who>, Path(id): Path<String>, Json(b): Json<ImportReq>) -> Response {
+    if !crate::pools::valid_vol(&b.name) {
+        return bad("volume names are letters, digits, . _ -");
+    }
+    if b.url.is_empty() == b.file.is_empty() {
+        return bad("give a url or a file");
+    }
+    if !b.url.is_empty() && !(b.url.starts_with("https://") || b.url.starts_with("http://")) {
+        return bad("the url must be http(s)");
+    }
+    if !b.file.is_empty() && !valid_iso(&b.file) && !b.file.chars().all(|c| c.is_ascii_alphanumeric() || "_.-+".contains(c)) {
+        return bad("bad file name");
+    }
+    let d2 = d.clone();
+    let label = format!("{id}:{}", b.name);
+    match d.tasks.spawn("import", &label, &w.label(), move |t| {
+        let vol = format!("{id}:{}", b.name);
+        let tmp;
+        let src = if !b.url.is_empty() {
+            tmp = d2.vms.iso_dir().join(format!(".import-{}", crate::containers::unix_now()));
+            std::fs::create_dir_all(d2.vms.iso_dir())?;
+            t.log(format!("downloading {}", b.url));
+            let h = tokio::runtime::Handle::current();
+            let n = h.block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let r = reqwest::Client::new().get(&b.url).send().await?.error_for_status()?;
+                let total = r.content_length();
+                let mut f = tokio::fs::File::create(&tmp).await?;
+                let mut s = r.bytes_stream();
+                let (mut n, mut last) = (0u64, 0u64);
+                while let Some(c) = s.next().await {
+                    let c = c?;
+                    f.write_all(&c).await?;
+                    n += c.len() as u64;
+                    if n - last > 64 << 20 {
+                        last = n;
+                        t.log(format!("  {} MiB{}", n >> 20, total.map(|x| format!(" of {}", x >> 20)).unwrap_or_default()));
+                    }
+                    if t.cancelled() {
+                        anyhow::bail!("stopped");
+                    }
+                }
+                f.flush().await?;
+                Ok::<u64, anyhow::Error>(n)
+            });
+            match n {
+                Ok(n) => t.log(format!("downloaded {} MiB", n >> 20)),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+            Some(tmp.clone())
+        } else {
+            None
+        };
+        let path = src.clone().unwrap_or_else(|| d2.vms.iso_dir().join(&b.file));
+        let r = d2.vms.pools.import(&path, &vol, b.grow);
+        if let Some(t) = src {
+            let _ = std::fs::remove_file(t);
+        }
+        let p = r?;
+        t.log(format!("imported as {vol} ({})", p.display()));
+        Ok(())
+    }) {
+        Ok(id) => Json(json!({"task": id})).into_response(),
         Err(e) => bad(e),
     }
 }

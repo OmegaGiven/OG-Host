@@ -281,10 +281,46 @@ fn run_vm(d: &Daemon, task: &Task, store: &str, name: &str, opts: &Opts) -> Resu
             _ => task.log("live: reading the disks while the VM runs (it may not boot cleanly from this backup)"),
         }
     }
+    let mut vols: Vec<Value> = vec![];
     let r = (|| -> Result<og_backup::ArchiveInfo> {
         let w = snap.archive("vm")?;
         let w = og_backup::tar_dir(w, &d.vms.dir(name), "vm", &["console.log".into(), "swtpm.log".into()])?;
-        Ok(w.finish()?)
+        let mut a = w.finish()?;
+        // disks in storage pools: files as files (linked clones flattened first), block devices raw
+        for x in vm.disks.iter().filter(|x| !x.volume.is_empty()) {
+            task.check()?;
+            let path = d.vms.pools.path(&x.volume)?;
+            let size = d.vms.pools.size(&x.volume).unwrap_or(0);
+            let info = if path.is_file() {
+                let backing = std::process::Command::new("qemu-img").args(["info", "-U", "--output=json"]).arg(&path).output().ok().and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok()).and_then(|v| v["backing-filename"].as_str().map(String::from));
+                let (src, tmp) = match backing {
+                    Some(_) => {
+                        let t = path.with_file_name(format!(".backup-{}", path.file_name().unwrap_or_default().to_string_lossy()));
+                        let st = std::process::Command::new("qemu-img").args(["convert", "-U", "-O", "qcow2"]).arg(&path).arg(&t).status()?;
+                        if !st.success() {
+                            bail!("flattening {} failed", x.volume);
+                        }
+                        (t.clone(), Some(t))
+                    }
+                    None => (path.clone(), None),
+                };
+                let w = snap.archive(&format!("vol-{}", x.id))?;
+                let r = og_backup::tar_dir(w, &src, "disk", &[]).and_then(|w| Ok(w.finish()?));
+                if let Some(t) = tmp {
+                    let _ = std::fs::remove_file(t);
+                }
+                r?
+            } else {
+                let mut f = std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?;
+                let mut w = snap.archive(&format!("raw-{}", x.id))?;
+                std::io::copy(&mut f, &mut w)?;
+                w.finish()?
+            };
+            task.log(format!("  {}: {} ({} new)", x.volume, human(info.size), human(info.new_bytes)));
+            vols.push(json!({"disk": x.id, "volume": x.volume, "size": size, "archive": info.name}));
+            a.new_bytes += info.new_bytes;
+        }
+        Ok(a)
     })();
     if resume {
         match d.vms.qmp(name, "cont", json!({})) {
@@ -299,8 +335,8 @@ fn run_vm(d: &Daemon, task: &Task, store: &str, name: &str, opts: &Opts) -> Resu
         }
     }
     let a = r?;
-    task.log(format!("  vm: {} ({} new in {} chunks)", human(a.size), human(a.new_bytes), a.new_chunks));
-    let meta = json!({"kind": "vm", "name": name, "mode": opts.mode, "vm": vm, "state": state});
+    task.log(format!("  vm settings + firmware: done ({} new in total)", human(a.new_bytes)));
+    let meta = json!({"kind": "vm", "name": name, "mode": opts.mode, "vm": vm, "state": state, "volumes": vols});
     let m = snap.commit(&host_name(), meta, &opts.notes, t0.elapsed().as_millis() as u64)?;
     task.log(format!("done: {} read, {} stored, {:.1} s", human(m.size()), human(a.new_bytes), t0.elapsed().as_secs_f64()));
     Ok(m)
@@ -377,6 +413,75 @@ pub fn restore(d: &Daemon, task: &Task, store: &str, snapshot: &str, o: &Restore
         }
         std::fs::create_dir_all(&d.vms.root)?;
         restore_dir(&repo, &m, "vm", "vm", &d.vms.dir(&name), task)?;
+        let mut vm: crate::vms::Vm = serde_json::from_slice(&std::fs::read(d.vms.dir(&name).join("vm.json"))?)?;
+        let mut moved = false;
+        for v in m.meta["volumes"].as_array().into_iter().flatten() {
+            task.check()?;
+            let (Some(disk), Some(volume), Some(archive)) = (v["disk"].as_str(), v["volume"].as_str(), v["archive"].as_str()) else { continue };
+            // the pool may not exist here (another site): then the local pool
+            let mut target = volume.to_string();
+            let pool_ok = d.vms.pools.split(volume).is_ok();
+            if !pool_ok {
+                target = format!("local:vm-{name}-{disk}.{}", if archive.starts_with("raw-") { "raw" } else { "qcow2" });
+                moved = true;
+                task.warn(format!("pool of {volume} isn't on this server: restoring it as {target}"));
+            }
+            let path = d.vms.pools.path(&target)?;
+            if archive.starts_with("vol-") {
+                // a file: unpack next to it, then swap
+                let parent = path.parent().context("bad volume path")?.to_path_buf();
+                std::fs::create_dir_all(&parent)?;
+                let tmp = parent.join(format!(".restore-{disk}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&tmp);
+                og_backup::untar(repo.reader(&m, archive)?, &tmp)?;
+                std::fs::rename(tmp.join("disk"), &path)?;
+                let _ = std::fs::remove_dir_all(&tmp);
+            } else {
+                let size = v["size"].as_u64().unwrap_or(0);
+                let created = !path.exists();
+                if created {
+                    if path.starts_with("/dev/") {
+                        d.vms.pools.create(&target, size.div_ceil(1 << 30).max(1))?;
+                    } else {
+                        std::fs::File::create(&path)?.set_len(size)?;
+                    }
+                }
+                // sparse: zero blocks are skipped (a new volume reads as zeros)
+                let fresh = created;
+                let mut out = std::fs::OpenOptions::new().write(true).open(&path)?;
+                let mut rd = repo.reader(&m, archive)?;
+                let mut buf = vec![0u8; 1 << 20];
+                use std::io::{Read, Seek, Write};
+                loop {
+                    let mut n = 0;
+                    while n < buf.len() {
+                        let k = rd.read(&mut buf[n..])?;
+                        if k == 0 {
+                            break;
+                        }
+                        n += k;
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    for blk in buf[..n].chunks(65536) {
+                        if fresh && blk.iter().all(|b| *b == 0) {
+                            out.seek(std::io::SeekFrom::Current(blk.len() as i64))?;
+                        } else {
+                            out.write_all(blk)?;
+                        }
+                    }
+                }
+                out.sync_all()?;
+            }
+            task.log(format!("  {archive} -> {target}"));
+            if let Some(x) = vm.disks.iter_mut().find(|x| x.id == disk) {
+                x.volume = target;
+            }
+        }
+        if moved {
+            std::fs::write(d.vms.dir(&name).join("vm.json"), serde_json::to_vec_pretty(&vm)?)?;
+        }
         if was || o.start {
             crate::vmrun::start(d, &name)?;
             task.log("started the VM");

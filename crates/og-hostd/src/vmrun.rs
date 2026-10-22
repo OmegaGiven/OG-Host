@@ -68,9 +68,13 @@ fn release_vfio(addr: &str) {
 
 pub fn start(d: &Daemon, name: &str) -> Result<()> {
     let vm = d.vms.get(name)?;
+    if vm.template {
+        bail!("{name} is a template: clone it to make a VM");
+    }
     if d.vms.status(name).state != "stopped" {
         return Ok(());
     }
+    d.vms.cloudinit_seed(&vm)?;
     let qemu = crate::vms::qemu_binary().context("QEMU isn't installed (qemu-system-x86)")?;
     if !Path::new("/dev/kvm").exists() {
         bail!("this server has no /dev/kvm (virtualization off in the BIOS, or a VM without nested virtualization)");
