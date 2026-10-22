@@ -28,6 +28,10 @@ pub struct UnpackOptions {
     pub preserve_owner: bool,
     /// Add this to every uid/gid (user-namespace remapping, e.g. 100000).
     pub id_offset: u32,
+    /// The layer goes into an empty directory of its own, to be stacked with overlayfs:
+    /// whiteouts become overlayfs whiteouts (a 0:0 character device; `trusted.overlay.opaque`
+    /// on directories) instead of deleting files (needs root).
+    pub overlay: bool,
 }
 
 /// Open a layer blob, detecting gzip / zstd / plain tar from its magic bytes.
@@ -117,6 +121,28 @@ fn resolve_in_root(root: &Path, rel: &Path, follow_last: bool) -> Result<PathBuf
     Ok(root.join(current))
 }
 
+fn cstr(p: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
+}
+
+fn set_xattr(p: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    let (c, n) = (cstr(p)?, std::ffi::CString::new(name).unwrap());
+    if unsafe { libc::lsetxattr(c.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// An overlayfs whiteout: a character device 0:0.
+fn mknod_whiteout(p: &Path) -> io::Result<()> {
+    let c = cstr(p)?;
+    if unsafe { libc::mknod(c.as_ptr(), libc::S_IFCHR | 0o000, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn remove_any(p: &Path) -> io::Result<()> {
     match fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => fs::remove_dir_all(p),
@@ -142,6 +168,23 @@ pub fn apply_layer<R: Read>(root: &Path, layer: R, opts: &UnpackOptions) -> Resu
         let parent_rel = rel.parent().unwrap_or(Path::new("")).to_path_buf();
 
         // --- whiteouts ---
+        if file_name == OPAQUE && opts.overlay {
+            let dir = secure_join(root, &parent_rel)?;
+            fs::create_dir_all(&dir)?;
+            set_xattr(&dir, "trusted.overlay.opaque", b"y")?;
+            stats.whiteouts += 1;
+            continue;
+        }
+        if let Some(target) = file_name.strip_prefix(WHITEOUT_PREFIX).filter(|_| opts.overlay) {
+            let at = secure_join(root, &parent_rel.join(target))?;
+            if let Some(p) = at.parent() {
+                fs::create_dir_all(p)?;
+            }
+            remove_any(&at)?;
+            mknod_whiteout(&at)?;
+            stats.whiteouts += 1;
+            continue;
+        }
         if file_name == OPAQUE {
             let dir = secure_join(root, &parent_rel)?;
             if let Ok(rd) = fs::read_dir(&dir) {

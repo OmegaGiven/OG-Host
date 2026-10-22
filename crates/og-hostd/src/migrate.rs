@@ -326,7 +326,8 @@ async fn live_copy(d: &Daemon, t: &crate::tasks::Task, name: &str, vm: &Vm, host
     let _ = q("object-del", json!({"id": "ogtls"}));
     q("object-add", json!({"qom-type": "tls-creds-x509", "id": "ogtls", "dir": tls, "endpoint": "client"}))?;
     for x in &vm.disks {
-        q("blockdev-add", json!({"driver": "nbd", "node-name": format!("tgt-{}", x.id), "server": {"type": "inet", "host": host, "port": nbd_port.to_string()}, "export": x.id, "tls-creds": "ogtls", "tls-hostname": host}))?;
+        // zero blocks (unused space on thin volumes) go over as write-zeroes requests, not data
+        q("blockdev-add", json!({"driver": "nbd", "node-name": format!("tgt-{}", x.id), "server": {"type": "inet", "host": host, "port": nbd_port.to_string()}, "export": x.id, "tls-creds": "ogtls", "tls-hostname": host, "detect-zeroes": "unmap", "discard": "unmap"}))?;
         q("blockdev-mirror", json!({"job-id": format!("mirror-{}", x.id), "device": format!("drive-{}", x.id), "target": format!("tgt-{}", x.id), "sync": "full"}))?;
     }
     t.log("mirroring the disks while the VM runs");

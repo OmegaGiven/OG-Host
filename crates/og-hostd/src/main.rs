@@ -347,7 +347,7 @@ async fn main() -> Result<()> {
             let digest = ensure_pulled(&cli.root, &store, &image, true).await?;
             let manifest: og_oci::registry::Manifest = serde_json::from_slice(&store.read(&digest).await?)?;
             std::fs::create_dir_all(&dest)?;
-            let opts = unpack::UnpackOptions { preserve_owner: owners, id_offset: 0 };
+            let opts = unpack::UnpackOptions { preserve_owner: owners, id_offset: 0, overlay: false };
             let t0 = std::time::Instant::now();
             for layer in &manifest.layers {
                 let path = store.blob_path(&layer.digest)?;

@@ -1411,6 +1411,8 @@ async fn image_delete(State(ctx): State<Ctx>, UrlPath(name): UrlPath<String>) ->
     let r = og_oci::Reference::parse(&name).map_err(|_| DErr(StatusCode::NOT_FOUND, format!("No such image: {name}")))?;
     let p = ctx.d.root.join("refs").join(&r.registry).join(&r.repository).join(r.manifest_ref().replace(':', "_"));
     std::fs::remove_file(&p).map_err(|_| DErr(StatusCode::NOT_FOUND, format!("No such image: {name}")))?;
+    let d = ctx.d.clone();
+    let _ = tokio::task::spawn_blocking(move || d.node.prune_layers()).await;
     Ok(Json(json!([{"Untagged": name}])))
 }
 

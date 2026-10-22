@@ -48,6 +48,8 @@ sed -i 's/^# *\(en_US.UTF-8\)/\1/' "$R/etc/locale.gen"
 chroot "$R" locale-gen >/dev/null
 echo 'LANG=C.UTF-8' > "$R/etc/default/locale"
 ln -sf /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
+# NFS v4 needs no portmapper: rpcbind stays off (port 111); an NFS v3 mount still starts it
+chroot "$R" systemctl disable rpcbind.service rpcbind.socket >/dev/null 2>&1 || true
 chroot "$R" systemctl enable systemd-networkd systemd-resolved systemd-timesyncd ssh og-hostd og-installer og-live-shell >/dev/null 2>&1
 # the install medium's root is locked; the installer sets a password
 chroot "$R" passwd -l root >/dev/null
@@ -55,4 +57,5 @@ chroot "$R" passwd -l root >/dev/null
 : > "$R/etc/machine-id"
 rm -f "$R"/etc/ssh/ssh_host_* "$R/var/lib/dbus/machine-id"
 chroot "$R" update-initramfs -u -k all >/dev/null
+chroot "$R" apt-get clean
 rm -rf "$R"/var/lib/apt/lists/* "$R"/var/cache/apt/*.bin "$R"/tmp/* "$R"/var/log/*.log

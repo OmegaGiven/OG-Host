@@ -116,6 +116,8 @@ pub async fn serve(addr: &str, files: CertFiles, router: axum::Router) -> Result
             }
             c.0.clone()
         };
+        // small responses go out at once (Nagle + delayed ACKs added ~40 ms to every API call)
+        let _ = tcp.set_nodelay(true);
         let router = router.clone();
         tokio::spawn(async move {
             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);

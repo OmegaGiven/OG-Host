@@ -9,7 +9,7 @@ GSSH="ssh -q -i /root/key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
 RUNS=${RUNS:-3}
 
 # ---- platform primitives ----
-pve_wait() { local u; u=$(cat); while pvesh get "/nodes/$NODE/tasks/$u/status" --output-format json | grep -q '"status":"running"'; do sleep 0.2; done; }
+pve_wait() { local u; u=$(grep -o 'UPID:[^ ]*' | tail -1); while pvesh get "/nodes/$NODE/tasks/$u/status" --output-format json | grep -q '"status":"running"'; do sleep 0.2; done; }
 ctr_create_start() { # N -> prints IP when serving HTTP
   if [ $P = pve ]; then
     pct create $((300+$1)) local:vztmpl/nginx_alpine.tar --hostname c$1 --rootfs local-lvm:1 --memory 256 --swap 0 \
@@ -41,7 +41,7 @@ cleanup() { # leftovers of an interrupted run
     for id in $(pct list | awk '$1>=300 && $1<400{print $1}'); do pct stop $id >/dev/null 2>&1; pct destroy $id --purge >/dev/null 2>&1; done
   else
     for v in $(ogapi GET /v1/vms | grep -o '"name":"v[0-9]*"' | cut -d'"' -f4 | sort -u); do ogapi POST /v1/vms/$v/stop >/dev/null; sleep 1; ogapi DELETE /v1/vms/$v >/dev/null; done
-    for c in $(og-hostd ps | awk 'NR>1 && $2 ~ /^c[0-9]+$/ {print $2}'); do og-hostd stop $c >/dev/null 2>&1; og-hostd rm $c >/dev/null 2>&1; done
+    for c in $(og-hostd ps | awk 'NR>1 && $2 ~ /^(c[0-9]+|i[0-9]+|hog|cb-web-1)$/ {print $2}'); do og-hostd stop $c >/dev/null 2>&1; og-hostd rm $c >/dev/null 2>&1; done
     rm -rf /var/lib/og-host/bench-store # an earlier run's backups (they'd count as disk used, and dedup the next backup)
   fi
 }
@@ -56,6 +56,7 @@ diag_host() {
     echo "DIAG qemu $p cmdline $(tr '\0' ' ' < /proc/$p/cmdline | grep -oE -- '-(machine|cpu|m|netdev|device|vga|bios|drive) [^ ]+' | grep -vE 'pflash|smbios' | tr '\n' ' ')"
   done
 }
+[ $P = pve ] && systemctl stop proxmox-backup-proxy proxmox-backup 2>/dev/null
 [ "${1:-}" = footprint ] || cleanup
 
 # ---- sections ----
@@ -76,6 +77,18 @@ s_density() { # 30 nginx containers: time, and memory per container
   for i in $(seq $n); do ip=$(ctr_create_start $((10+i))); waitfor 60 http_up "$ip" || echo "WARN c$((10+i))"; done
   out density_${n}_containers_s "$(since $s)" s
   sleep 20; out density_mem_per_container_mb "$(( ($(memsettled) - m0) / n ))" MB
+  # per container: its cgroup (after dropping clean caches) + the process that supervises it
+  sync; echo 3 > /proc/sys/vm/drop_caches; sleep 2
+  local tot=0 c sup
+  for i in $(seq $n); do
+    if [ $P = pve ]; then
+      c=$(cat /sys/fs/cgroup/lxc/$((310+i))/memory.current); sup=$(pgrep -f "^/usr/bin/lxc-start -F -n $((310+i))\$")
+    else
+      c=$(cat /sys/fs/cgroup/og-host/c$((10+i))/memory.current); sup=$(pgrep -f "og-shim run --id $(og-hostd ps | awk -v n=c$((10+i)) '$2==n{print $1}')")
+    fi
+    tot=$(( tot + c + $(awk '/^Pss:/{print $2*1024}' /proc/$sup/smaps_rollup 2>/dev/null || echo 0) ))
+  done
+  out ctr_mem_cgroup_plus_supervisor_mb "$(awk -v x=$tot -v n=$n 'BEGIN{printf "%.1f", x/n/1048576}')" MB
   s=$(t); for i in $(seq $n); do ctr_rm $((10+i)); done; out density_remove_all_s "$(since $s)" s
 }
 
@@ -176,4 +189,170 @@ s_backup() { # back up a stopped VM with 1 GB of random data written into it, th
   fi
 }
 
-for sec in "${@:-footprint containers density vms vmdisk vmnet backup}"; do for x in $sec; do echo "== $x"; s_$x; done; done
+# ---- more sections ----
+
+s_security() {
+  command -v lynis >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get -qq install -y lynis >/dev/null 2>&1
+  out lynis_hardening_index "$(lynis audit system --quick --no-colors 2>/dev/null | sed -n 's/.*Hardening index : \([0-9]*\).*/\1/p')" /100
+  out tcp_ports_list "$(ss -Htln | awk '{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un | tr '\n' ',')"
+  out suid_files "$(find / -xdev -perm -4000 -type f 2>/dev/null | wc -l)"
+  out kernel_lockdown "$(cat /sys/kernel/security/lockdown 2>/dev/null | tr -d '[]' | tr ' ' '/' )"
+}
+
+api_get() { # one "list the VMs" call over HTTPS with an API token
+  if [ $P = pve ]; then curl -sk -o /dev/null -H "Authorization: PVEAPIToken=$PVETOKEN" "https://127.0.0.1:8006/api2/json/nodes/$NODE/qemu"
+  else curl -sk -o /dev/null -H "Authorization: Bearer $(cat /var/lib/og-host/api-token)" https://127.0.0.1:8006/v1/vms; fi
+}
+s_api() {
+  if [ $P = pve ]; then
+    pveum user token remove root@pam bench >/dev/null 2>&1
+    PVETOKEN="root@pam!bench=$(pveum user token add root@pam bench --privsep 0 --output-format json | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')"
+  fi
+  local v=(); for i in $(seq 50); do local s; s=$(t); api_get; v+=("$(since $s)"); done
+  out api_list_vms_ms "$(printf '%s\n' "${v[@]}" | median | awk '{printf "%.1f", $1*1000}')" ms
+  out api_list_vms_max_ms "$(printf '%s\n' "${v[@]}" | sort -n | tail -1 | awk '{printf "%.1f", $1*1000}')" ms
+}
+
+# an iperf3 server container N; prints its IP
+iperf_ctr() {
+  if [ $P = pve ]; then
+    [ -f /var/lib/vz/template/cache/iperf3_latest.tar ] || pvesh create /nodes/$NODE/storage/local/oci-registry-pull --reference docker.io/networkstatic/iperf3:latest | pve_wait
+    pct create $((300+$1)) local:vztmpl/iperf3_latest.tar --hostname i$1 --rootfs local-lvm:1 --memory 512 --swap 0 \
+      --net0 name=eth0,bridge=vmbr0,ip=10.0.2.$((100+$1))/24,gw=10.0.2.2 --unprivileged 1 >/dev/null 2>&1
+    pct set $((300+$1)) --entrypoint 'iperf3 -s' >/dev/null 2>&1
+    pct start $((300+$1)); echo 10.0.2.$((100+$1))
+  else
+    og-hostd run --name i$1 networkstatic/iperf3 -- -s | sed -n 's/.* ip \([0-9.]*\).*/\1/p'
+  fi
+}
+iperf_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd stop i$1 >/dev/null 2>&1; og-hostd rm i$1 >/dev/null 2>&1; fi; }
+ctr_iperf_client() { # N SERVER-IP: iperf3 from inside container N, Gbit/s
+  if [ $P = pve ]; then pct exec $((300+$1)) -- iperf3 -c "$2" -t 8 -P 2 -J
+  else
+    local id; id=$(og-hostd ps | awk -v n=i$1 '$2==n{print $1}')
+    local e; e=$(curl -s --unix-socket /run/og-host/docker.sock -H content-type:application/json -d "{\"AttachStdout\":true,\"Cmd\":[\"sh\",\"-c\",\"iperf3 -c $2 -t 8 -P 2 -J > /tmp/r.json\"]}" http://x/containers/$id/exec | sed -n 's/.*"Id":"\([^"]*\)".*/\1/p')
+    curl -s --unix-socket /run/og-host/docker.sock -H content-type:application/json -d '{"Detach":false}' http://x/exec/$e/start >/dev/null
+    curl -s --unix-socket /run/og-host/docker.sock -H content-type:application/json -d '{"AttachStdout":true,"Cmd":["cat","/tmp/r.json"]}' http://x/containers/$id/exec | sed -n 's/.*"Id":"\([^"]*\)".*/\1/p' | { read -r e2; curl -s --unix-socket /run/og-host/docker.sock -H content-type:application/json -d '{"Detach":false}' http://x/exec/$e2/start | tr -d '\000-\010'; }
+  fi | grep -A8 '"sum_received"' | grep bits_per_second | head -1 | tr -dc '0-9.' | awk '{printf "%.2f", $1/1e9}'
+}
+s_ctrnet() {
+  local a b; a=$(iperf_ctr 61); b=$(iperf_ctr 62); waitfor 30 bash -c "timeout 1 bash -c '</dev/tcp/$a/5201'" ; waitfor 30 bash -c "timeout 1 bash -c '</dev/tcp/$b/5201'"
+  local g=() h=()
+  for i in $(seq $RUNS); do g+=("$(ctr_iperf_client 62 "$a")"); sleep 1; done
+  out ctr_to_ctr_gbit "$(printf '%s\n' "${g[@]}" | median)" Gbit/s
+  for i in $(seq $RUNS); do h+=("$(iperf3 -c "$a" -t 8 -P 2 -J | grep -A8 '"sum_received"' | grep bits_per_second | head -1 | tr -dc '0-9.' | awk '{printf "%.2f", $1/1e9}')"); sleep 1; done
+  out host_to_ctr_gbit "$(printf '%s\n' "${h[@]}" | median)" Gbit/s
+  iperf_rm 61; iperf_rm 62
+}
+
+s_ctrbackup() { # a running web container with 500 MB of data: back up, remove, restore, serving again
+  local ip s tk snap
+  if [ $P = pve ]; then
+    ip=$(ctr_create_start 71); waitfor 60 http_up "$ip"
+    pct exec 371 -- sh -c 'head -c 524288000 /dev/urandom > /data.bin; sync'
+    s=$(t); vzdump 371 --storage local --mode snapshot --compress zstd >/dev/null 2>&1; out ctr_backup_s "$(since $s)" s
+    local f; f=$(ls -t /var/lib/vz/dump/vzdump-lxc-371-*.tar.zst | head -1); out ctr_backup_size_mb "$(( $(stat -c %s "$f") / 1048576 ))" MB
+    s=$(t); vzdump 371 --storage local --mode snapshot --compress zstd >/dev/null 2>&1; out ctr_backup_again_s "$(since $s)" s
+    ctr_rm 71; s=$(t); pct restore 371 "$f" --storage local-lvm >/dev/null 2>&1; pct start 371; waitfor 60 http_up "$ip" || echo "WARN restored ct not serving"; out ctr_restore_to_http_s "$(since $s)" s
+    rm -f /var/lib/vz/dump/vzdump-lxc-371-*; ctr_rm 71
+  else
+    mkdir -p /root/cb && printf 'services:\n  web:\n    image: nginx:alpine\n    volumes:\n      - data:/data\nvolumes:\n  data: {}\n' > /root/cb/compose.yml
+    og-hostd up -f /root/cb/compose.yml -p cb >/dev/null; ip=$(og-hostd ps | awk '$2=="cb-web-1"{print $5}'); waitfor 60 http_up "$ip"
+    head -c 500M /dev/urandom > /var/lib/og-host/volumes/cb_data/data.bin; sync
+    ogapi GET /v1/storage | grep -q '"id":"bench"' || ogapi POST /v1/storage '{"id":"bench","type":"dir","path":"/var/lib/og-host/bench-store"}' >/dev/null
+    s=$(t); tk=$(ogapi POST /v1/backup '{"store":"bench","targets":[{"kind":"stack","name":"cb"}]}' | sed -n 's/.*"task":"\([^"]*\)".*/\1/p'); ogtask "$tk" >/dev/null; out ctr_backup_s "$(since $s)" s
+    out ctr_backup_size_mb "$(( $(du -sb /var/lib/og-host/bench-store | cut -f1) / 1048576 ))" MB
+    s=$(t); tk=$(ogapi POST /v1/backup '{"store":"bench","targets":[{"kind":"stack","name":"cb"}]}' | sed -n 's/.*"task":"\([^"]*\)".*/\1/p'); ogtask "$tk" >/dev/null; out ctr_backup_again_s "$(since $s)" s
+    snap=$(ogapi GET /v1/storage/bench/backups | grep -o '"id":"stack/cb/[^"]*"' | head -1 | cut -d'"' -f4)
+    og-hostd down -f /root/cb/compose.yml -p cb --volumes >/dev/null
+    s=$(t); tk=$(ogapi POST /v1/restore "{\"store\":\"bench\",\"snapshot\":\"$snap\",\"start\":true}" | sed -n 's/.*"task":"\([^"]*\)".*/\1/p'); ogtask "$tk" >/dev/null
+    ip=$(og-hostd ps | awk '$2=="cb-web-1"{print $5}'); waitfor 60 http_up "$ip" || echo "WARN restored ct not serving"; out ctr_restore_to_http_s "$(since $s)" s
+    [ -s /var/lib/og-host/volumes/cb_data/data.bin ] || echo "WARN restored volume empty"
+    og-hostd down -f /root/cb/compose.yml -p cb --volumes >/dev/null
+    rm -rf /var/lib/og-host/bench-store; ogapi DELETE /v1/storage/bench >/dev/null
+  fi
+}
+
+# a container that eats 10 GB (4 x 2.5 GB, more than the host has) ($2 = memory limit in MB, 0 = the platform default)
+hog_start() {
+  if [ $P = pve ]; then
+    [ -f /var/lib/vz/template/cache/stress_latest.tar ] || pvesh create /nodes/$NODE/storage/local/oci-registry-pull --reference docker.io/polinux/stress:latest | pve_wait
+    local mem=""; [ "$2" != 0 ] && mem="--memory $2"
+    pct create $((300+$1)) local:vztmpl/stress_latest.tar --hostname hog --rootfs local-lvm:1 $mem --net0 name=eth0,bridge=vmbr0,ip=10.0.2.$((100+$1))/24 --unprivileged 1 >/dev/null 2>&1
+    pct set $((300+$1)) --entrypoint 'stress --vm 4 --vm-bytes 2500M --vm-keep' >/dev/null 2>&1
+    pct start $((300+$1))
+  else
+    local mem=""; [ "$2" != 0 ] && mem="--memory ${2}m"
+    og-hostd run --name hog $mem --entrypoint stress polinux/stress -- --vm 4 --vm-bytes 2500M --vm-keep >/dev/null
+  fi
+}
+hog_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd stop hog >/dev/null 2>&1; og-hostd rm hog >/dev/null 2>&1; fi; }
+s_pressure() { # a protected web service while another container eats memory: defaults, then a 16 GB limit
+  local ip; ip=$(ctr_create_start 81); waitfor 60 http_up "$ip"
+  for lim in 0 16384; do
+    local before; before=$(dmesg | grep -c "Killed process")
+    hog_start 82 $lim
+    local fails=0 max=0 lat
+    for i in $(seq 300); do # 60 s
+      lat=$(curl -s -o /dev/null -w '%{time_total}' --max-time 2 "http://$ip/" || echo fail)
+      if [ "$lat" = fail ]; then fails=$((fails+1)); else max=$(awk -v a=$max -v b=$lat 'BEGIN{print (b>a)?b:a}'); fi
+      sleep 0.2
+    done
+    local tag=default; [ $lim != 0 ] && tag=16g
+    out pressure_${tag}_web_failures "$fails" "/300"
+    out pressure_${tag}_web_max_latency_ms "$(awk -v x=$max 'BEGIN{printf "%.0f", x*1000}')" ms
+    out pressure_${tag}_killed "$(dmesg | grep "Killed process" | tail -n +$((before+1)) | sed -n 's/.*Killed process [0-9]* (\([^)]*\)).*/\1/p' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')"
+    hog_rm 82; sleep 5
+  done
+  ctr_rm 81
+}
+
+s_vmdensity() { # 1 GB guests started until one doesn't come up within 3 minutes, or 16
+  local n=0 s; s=$(t)
+  for i in $(seq 61 76); do
+    vm_clone $i 1; vm_start $i
+    if waitfor 180 vm_ready $i; then n=$((n+1)); else echo "WARN v$i not ready"; break; fi
+  done
+  out vm_density_1g_guests "$n" "(max 16)"
+  out vm_density_host_used_mb "$(memsettled)" MB
+  out vm_density_ksm_saved_mb "$(( $(cat /sys/kernel/mm/ksm/pages_sharing) * 4 / 1024 ))" MB
+  for i in $(seq 61 76); do vm_rm $i; done
+}
+
+s_pbs() { # Proxmox only: the same VM backup into Proxmox Backup Server (deduplicated, incremental)
+  [ $P = pve ] || return 0
+  systemctl start proxmox-backup proxmox-backup-proxy; sleep 3
+  vm_clone 52 0; vm_start 52; waitfor 180 vm_ready 52
+  $GSSH bench@"$(vm_ip 52)" 'sudo dd if=/dev/urandom of=/var/tmp/blob bs=1M count=1024 status=none; sync'
+  qm shutdown 152 --timeout 60 >/dev/null 2>&1; sleep 2
+  local s; s=$(t); vzdump 152 --storage pbs --mode stop >/dev/null 2>&1; out pbs_backup_vm_s "$(since $s)" s
+  out pbs_store_mb "$(( $(du -sb /var/lib/pbs-store | cut -f1) / 1048576 ))" MB
+  s=$(t); vzdump 152 --storage pbs --mode stop >/dev/null 2>&1; out pbs_backup_vm_again_s "$(since $s)" s
+  local vol; vol=$(pvesm list pbs --vmid 152 | awk 'NR>1{print $1}' | tail -1)
+  qm destroy 152 --purge >/dev/null 2>&1
+  s=$(t); qmrestore "$vol" 152 --storage local-lvm >/dev/null 2>&1; out pbs_restore_vm_s "$(since $s)" s
+  qm destroy 152 --purge >/dev/null 2>&1
+  for v in $(pvesm list pbs | awk 'NR>1{print $1}'); do pvesm free "$v" >/dev/null 2>&1; done
+  proxmox-backup-manager garbage-collection start store >/dev/null 2>&1
+  systemctl stop proxmox-backup-proxy proxmox-backup
+}
+
+s_dockerlxc() { # Proxmox only: Docker inside a Debian LXC container (privileges: nesting, keyctl)
+  [ $P = pve ] || return 0
+  if ! pct status 250 >/dev/null 2>&1; then
+    ls /var/lib/vz/template/cache/debian-13-standard_* >/dev/null 2>&1 || pveam download local debian-13-standard_13.6-1_amd64.tar.zst >/dev/null
+    pct create 250 local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst --hostname dockerhost --cores 4 --memory 6144 --swap 0 \
+      --rootfs local-lvm:16 --net0 name=eth0,bridge=vmbr0,ip=10.0.2.250/24,gw=10.0.2.2 --nameserver 10.0.2.3 \
+      --unprivileged 1 --features nesting=1,keyctl=1 >/dev/null
+    pct start 250; sleep 5
+    pct exec 250 -- sh -c 'apt-get -qq update >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -qq install -y docker.io curl >/dev/null 2>&1'
+  fi
+  pct status 250 | grep -q running || { pct start 250; sleep 5; }
+  pct push 250 "$(dirname "$0")/dockerlxc.sh" /root/dockerlxc.sh
+  sleep 10; sync; echo 3 > /proc/sys/vm/drop_caches; sleep 2
+  out dockerlxc_platform_mem_mb "$(( $(cat /sys/fs/cgroup/lxc/250/memory.current) / 1048576 ))" MB
+  pct exec 250 -- env RUNS=$RUNS DENSITY=${DENSITY:-30} sh /root/dockerlxc.sh | sed 's/^RESULT /RESULT dockerlxc_/'
+  pct stop 250
+}
+
+for sec in "${@:-footprint security api containers density ctrnet ctrbackup pressure dockerlxc vms vmdensity vmdisk vmnet backup pbs}"; do for x in $sec; do echo "== $x"; s_$x; done; done

@@ -541,6 +541,7 @@ pub async fn listen(d: Arc<Daemon>) -> Result<()> {
     tokio::spawn(async move {
         loop {
             let Ok((tcp, peer_addr)) = listener.accept().await else { continue };
+            let _ = tcp.set_nodelay(true);
             let cfg = cfg.clone();
             let router = router.clone();
             let d = d.clone();
@@ -577,8 +578,9 @@ fn cluster_router(d: Arc<Daemon>) -> Router {
         .route("/cluster/v1/proxy/{*rest}", any(proxied))
         .route("/cluster/v1/store/{ds}/snapshots", get(remote_snaps))
         .route("/cluster/v1/store/{ds}/missing", post(remote_missing))
-        .route("/cluster/v1/store/{ds}/chunk/{id}", put(remote_chunk))
-        .route("/cluster/v1/store/{ds}/snapshot", put(remote_snapshot))
+        // a chunk is up to 8 MiB (more with its header); a big disk's index is many MiB
+        .route("/cluster/v1/store/{ds}/chunk/{id}", put(remote_chunk).layer(axum::extract::DefaultBodyLimit::max(og_backup::chunker::MAX + (1 << 20))))
+        .route("/cluster/v1/store/{ds}/snapshot", put(remote_snapshot).layer(axum::extract::DefaultBodyLimit::max(256 << 20)))
         .route("/cluster/v1/store/{ds}/prune", post(remote_prune))
         .route("/cluster/v1/ha", get(ha_doc))
         .route("/cluster/v1/vm/prepare", post(vm_prepare))

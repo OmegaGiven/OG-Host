@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 
 use crate::serve::Daemon;
 
-pub const TAKEOVER_AFTER: Duration = Duration::from_secs(180);
+// the owner fences itself at FENCE_AFTER; a minute later the standby may take over
+pub const TAKEOVER_AFTER: Duration = Duration::from_secs(120);
 pub const FENCE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

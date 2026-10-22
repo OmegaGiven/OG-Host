@@ -247,7 +247,7 @@ pub fn install(root: &Path, task: &crate::tasks::Task, a: &Available) -> Result<
     std::fs::create_dir_all(&prev)?;
     for (name, path) in targets() {
         if path.exists() {
-            std::fs::copy(&path, prev.join(name))?;
+            durable_copy(&path, &prev.join(name))?;
         }
     }
     for (name, path) in targets() {
@@ -256,8 +256,9 @@ pub fn install(root: &Path, task: &crate::tasks::Task, a: &Available) -> Result<
             continue;
         }
         let tmp = path.with_extension("og-new");
-        std::fs::copy(&src, &tmp)?;
+        durable_copy(&src, &tmp)?;
         std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
+        sync_dir(&path);
         task.log(format!("installed {}", path.display()));
     }
     // where to put things back: the guard runs from elsewhere, so it can't go by its own path
@@ -295,8 +296,9 @@ fn install_guard(root: &Path, task: &crate::tasks::Task) {
     let r = (|| -> Result<()> {
         let g = updates_dir(root).join("guard");
         std::fs::create_dir_all(&g)?;
-        std::fs::copy(updates_dir(root).join("previous/og-hostd"), g.join("og-hostd.tmp"))?;
+        durable_copy(&updates_dir(root).join("previous/og-hostd"), &g.join("og-hostd.tmp"))?;
         std::fs::rename(g.join("og-hostd.tmp"), g.join("og-hostd"))?;
+        sync_dir(&g.join("og-hostd"));
         let dropin = Path::new("/etc/systemd/system/og-hostd.service.d");
         std::fs::create_dir_all(dropin)?;
         std::fs::write(dropin.join("update-guard.conf"), format!("# OG-Host update guard: rolls back a new version that keeps failing to start\n[Service]\nExecStartPre=-{} --root {} update-guard\n", g.join("og-hostd").display(), root.display()))?;
@@ -334,8 +336,9 @@ fn rollback(root: &Path, v: &mut Value) {
         let src = prev.join(name);
         if src.exists() {
             let tmp = path.with_extension("og-new");
-            if std::fs::copy(&src, &tmp).is_ok() {
+            if durable_copy(&src, &tmp).is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
+                sync_dir(&path);
             }
         }
     }
@@ -617,5 +620,20 @@ pub async fn auto(d: Arc<Daemon>) {
             }
         }
         Err(e) => eprintln!("og-hostd: update check: {e:#}"),
+    }
+}
+
+/// Copy and flush to disk: a power cut right after an update must leave the old binary or
+/// the new one, never a half-written file.
+fn durable_copy(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::copy(src, dst)?;
+    std::fs::File::open(dst)?.sync_all()?;
+    Ok(())
+}
+
+/// Flush a directory entry change (a rename) to disk.
+fn sync_dir(file: &Path) {
+    if let Some(d) = file.parent() {
+        let _ = std::fs::File::open(d).and_then(|f| f.sync_all());
     }
 }

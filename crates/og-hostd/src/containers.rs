@@ -2,14 +2,16 @@
 //!
 //! Layout under the state root:
 //!   containers/<id>/meta.json     what was asked for (image, name, options)
-//!   containers/<id>/rootfs/       private root filesystem (owned by the userns range)
+//!   containers/<id>/rootfs/       root filesystem: overlay of layers/ + upper/ (or a private copy)
+//!   containers/<id>/upper/        its own changes (overlayfs upper layer)
+//!   layers/<digest>-<offset>/     image layers unpacked once, shared by containers
 //!   containers/<id>/bundle/       OCI bundle (config.json)
 //!   containers/<id>/log           stdout + stderr
 //!   containers/<id>/status.json   written by og-shim: running / exited / failed
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -56,6 +58,10 @@ pub struct Meta {
     /// CDI devices (GPUs) it was given.
     #[serde(default)]
     pub gpus: Vec<String>,
+    /// Shared unpacked image layers (bottom first) its rootfs stacks with overlayfs; empty =
+    /// a private unpacked rootfs (older containers, or no overlayfs).
+    #[serde(default)]
+    pub lowers: Vec<PathBuf>,
     /// Remove the container once it exits (docker run --rm).
     #[serde(default)]
     pub auto_remove: bool,
@@ -207,14 +213,22 @@ impl Node {
         let rootfs = dir.join("rootfs");
         std::fs::create_dir_all(&rootfs)?;
 
-        // image config + layers -> private rootfs, ownership shifted into the userns range
+        // image config + layers -> rootfs, ownership shifted into the userns range: the image's
+        // layers unpacked once and shared, stacked with overlayfs (a private writable layer per
+        // container); a private unpacked copy when that's not possible
         let manifest: og_oci::registry::Manifest = serde_json::from_slice(&std::fs::read(self.store.blob_path(manifest_digest)?)?)?;
         let image_cfg: ImageConfig = serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.config.digest)?)?)?;
         let map = IdMap::default();
-        let unpack_opts = unpack::UnpackOptions { preserve_owner: true, id_offset: map.host_start };
-        for layer in &manifest.layers {
-            let path = self.store.blob_path(&layer.digest)?;
-            unpack::apply_layer(&rootfs, unpack::open_layer(&path)?, &unpack_opts).with_context(|| format!("layer {}", layer.digest))?;
+        let mut lowers = self.layered_rootfs(&dir, &manifest, map.host_start).unwrap_or_else(|e| {
+            eprintln!("og-hostd: {name}: no shared layers ({e:#}); unpacking a private copy");
+            vec![]
+        });
+        if lowers.is_empty() {
+            let unpack_opts = unpack::UnpackOptions { preserve_owner: true, id_offset: map.host_start, overlay: false };
+            for layer in &manifest.layers {
+                let path = self.store.blob_path(&layer.digest)?;
+                unpack::apply_layer(&rootfs, unpack::open_layer(&path)?, &unpack_opts).with_context(|| format!("layer {}", layer.digest))?;
+            }
         }
         std::os::unix::fs::lchown(&rootfs, Some(map.host_start), Some(map.host_start))?;
 
@@ -289,12 +303,20 @@ impl Node {
         };
         if opts.userns.is_none() {
             // without a user namespace, files keep their image ownership
-            let _ = std::fs::remove_dir_all(&rootfs);
-            std::fs::create_dir_all(&rootfs)?;
-            let plain = unpack::UnpackOptions { preserve_owner: true, id_offset: 0 };
-            for layer in &manifest.layers {
-                let path = self.store.blob_path(&layer.digest)?;
-                unpack::apply_layer(&rootfs, unpack::open_layer(&path)?, &plain)?;
+            if !lowers.is_empty() {
+                umount(&rootfs);
+                let _ = std::fs::remove_dir_all(dir.join("upper"));
+                let _ = std::fs::remove_dir_all(dir.join("work"));
+                lowers = self.layered_rootfs(&dir, &manifest, 0).unwrap_or_default();
+            }
+            if lowers.is_empty() {
+                let _ = std::fs::remove_dir_all(&rootfs);
+                std::fs::create_dir_all(&rootfs)?;
+                let plain = unpack::UnpackOptions { preserve_owner: true, id_offset: 0, overlay: false };
+                for layer in &manifest.layers {
+                    let path = self.store.blob_path(&layer.digest)?;
+                    unpack::apply_layer(&rootfs, unpack::open_layer(&path)?, &plain)?;
+                }
             }
         }
 
@@ -401,6 +423,7 @@ impl Node {
             gpus: opts.cdi_devices.clone(),
             volumes: extra.volumes.clone(),
             saved_resources: None,
+            lowers,
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         if extra.no_start {
@@ -561,6 +584,12 @@ impl Node {
 
     fn spawn_shim(&self, id: &str) -> Result<()> {
         let dir = self.dir(id);
+        // the overlay goes away with a reboot
+        if let Ok(meta) = self.find(id) {
+            if !meta.lowers.is_empty() && !mounted_paths().contains(&dir.join("rootfs")) {
+                mount_overlay(&dir, &meta.lowers)?;
+            }
+        }
         let shim = std::env::current_exe()?.with_file_name("og-shim");
         if !shim.exists() {
             bail!("og-shim not found next to og-hostd ({})", shim.display());
@@ -638,8 +667,73 @@ impl Node {
         self.net.detach(id)?;
         crate::idmap::cleanup(&PathBuf::from("/run/og-host/idmap").join(id));
         self.destroy_sandbox(id);
+        umount(&dir.join("rootfs"));
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    /// Delete unpacked layers that no container uses and no tagged image needs.
+    pub fn prune_layers(&self) {
+        let mut keep: std::collections::HashSet<PathBuf> = self.list().unwrap_or_default().into_iter().flat_map(|(m, _)| m.lowers).collect();
+        let mut keep_hex = std::collections::HashSet::new();
+        fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() { walk(&p, out) } else { out.push(p) }
+            }
+        }
+        let mut refs = vec![];
+        walk(&self.root.join("refs"), &mut refs);
+        for r in refs {
+            let Ok(digest) = std::fs::read_to_string(&r) else { continue };
+            let Ok(blob) = self.store.blob_path(digest.trim()) else { continue };
+            if let Some(m) = std::fs::read(blob).ok().and_then(|b| serde_json::from_slice::<og_oci::registry::Manifest>(&b).ok()) {
+                keep_hex.extend(m.layers.iter().map(|l| l.digest.split(':').next_back().unwrap_or_default().to_string()));
+            }
+        }
+        for e in std::fs::read_dir(self.root.join("layers")).into_iter().flatten().flatten() {
+            let (p, n) = (e.path(), e.file_name().to_string_lossy().into_owned());
+            let hex = n.trim_start_matches('.').split(['-', '.']).next().unwrap_or_default().to_string();
+            if keep.remove(&p) || keep_hex.contains(&hex) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// The image's layers, each unpacked once into `<root>/layers/<digest>-<id offset>/`
+    /// (overlayfs whiteouts), stacked under `dir/upper` and mounted at `dir/rootfs`.
+    fn layered_rootfs(&self, dir: &Path, manifest: &og_oci::registry::Manifest, offset: u32) -> Result<Vec<PathBuf>> {
+        let mut lowers = vec![];
+        for layer in &manifest.layers {
+            let hex = layer.digest.split(':').next_back().unwrap_or_default();
+            if hex.len() < 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                bail!("odd layer digest {}", layer.digest);
+            }
+            let ld = self.root.join("layers").join(format!("{hex}-{offset}"));
+            if !ld.exists() {
+                // unpacked beside it, then renamed: a half-unpacked layer never shows, and two
+                // containers making the same layer at once don't clash
+                let tmp = self.root.join("layers").join(format!(".{hex}-{offset}.{}", new_id()?));
+                std::fs::create_dir_all(&tmp)?;
+                let o = unpack::UnpackOptions { preserve_owner: true, id_offset: offset, overlay: true };
+                let r = unpack::apply_layer(&tmp, unpack::open_layer(&self.store.blob_path(&layer.digest)?)?, &o).with_context(|| format!("layer {}", layer.digest));
+                if let Err(e) = r {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return Err(e);
+                }
+                std::os::unix::fs::lchown(&tmp, Some(offset), Some(offset))?;
+                if std::fs::rename(&tmp, &ld).is_err() {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                }
+            }
+            lowers.push(ld);
+        }
+        if lowers.is_empty() {
+            bail!("an image without layers");
+        }
+        mount_overlay(dir, &lowers)?;
+        Ok(lowers)
     }
 
     /// Rewrite a container's /etc/hosts in place (same inode, so the bind mount sees it).
@@ -747,6 +841,31 @@ pub fn parse_bind(s: &str) -> Result<og_runtime::BindMount> {
 }
 
 /// Paths that are currently mount points (from /proc/self/mountinfo).
+/// Mount `dir/rootfs` as overlayfs: `lowers` (bottom first) under `dir/upper`.
+fn mount_overlay(dir: &Path, lowers: &[PathBuf]) -> Result<()> {
+    let (rootfs, upper, work) = (dir.join("rootfs"), dir.join("upper"), dir.join("work"));
+    for d in [&rootfs, &upper, &work] {
+        std::fs::create_dir_all(d)?;
+    }
+    let lower = lowers.iter().rev().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join(":");
+    let data = format!("lowerdir={lower},upperdir={},workdir={},index=off,xino=off", upper.display(), work.display());
+    if data.len() > 4000 {
+        bail!("too many layers for one overlay mount");
+    }
+    let c = |s: &str| std::ffi::CString::new(s).map_err(|_| anyhow::anyhow!("NUL in a path"));
+    let (src, target, fstype, opts) = (c("overlay")?, c(&rootfs.to_string_lossy())?, c("overlay")?, c(&data)?);
+    if unsafe { libc::mount(src.as_ptr(), target.as_ptr(), fstype.as_ptr(), 0, opts.as_ptr().cast()) } != 0 {
+        bail!("overlay mount: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn umount(p: &Path) {
+    if let Ok(c) = std::ffi::CString::new(p.to_string_lossy().as_bytes()) {
+        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
 pub fn mounted_paths() -> std::collections::HashSet<PathBuf> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .unwrap_or_default()
