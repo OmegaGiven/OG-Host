@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -30,6 +30,8 @@ pub struct Daemon {
     restarts: Mutex<HashMap<String, Backoff>>,
     health: Mutex<HashMap<String, Health>>,
     pub brain: Mutex<crate::brain::Brain>,
+    pub hub: crate::stats::Hub,
+    pub sessions: crate::ui::Sessions,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +107,7 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
 
 pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>) -> Result<()> {
     let token = if listen.is_some() { Some(load_or_create_token(&root)?) } else { None };
-    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()) });
+    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::ui::Sessions::load(&root) });
 
     // supervisor + health loop
     {
@@ -135,8 +137,32 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         });
     }
 
+    // live stats for the UI every 2 s
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                let a = app.clone();
+                let _ = tokio::task::spawn_blocking(move || a.sample()).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+
     let router = Router::new()
         .route("/v1/version", get(version))
+        .route("/v1/info", get(info))
+        .route("/v1/events", get(events))
+        .route("/v1/metrics", get(metrics))
+        .route("/v1/containers/{id}/restart", post(restart))
+        .route("/v1/containers/{id}/kill", post(kill))
+        .route("/v1/containers/{id}/logs/stream", get(logs_stream))
+        .route("/v1/stacks", get(stacks_list))
+        .route("/v1/stacks/{name}", get(stack_get).put(stack_put).delete(stack_delete))
+        .route("/v1/stacks/{name}/{action}", post(stack_action))
+        .route("/v1/ui/login", post(crate::ui::login))
+        .route("/v1/ui/logout", post(crate::ui::logout))
+        .route("/v1/ui/me", get(crate::ui::me))
         .route("/v1/brain", get(brain_status))
         .route("/v1/containers/{id}/wake", post(start))
         .route("/v1/containers/{id}/resources", get(resources_get).post(resources_set))
@@ -148,7 +174,10 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/containers/{id}/logs", get(logs))
         .route("/v1/stacks/up", post(stack_up))
         .route("/v1/stacks/down", post(stack_down))
-        .with_state(app.clone());
+        .with_state(app.clone())
+        // the Docker Engine API too (images, networks, volumes, exec, ...), for the UI
+        .nest("/v1/docker", crate::dockerapi::router(crate::dockerapi::Ctx { d: app.clone(), scope: None }))
+        .fallback(crate::ui::asset);
 
     // unix socket, root-only
     let sock = PathBuf::from("/run/og-host/api.sock");
@@ -184,27 +213,31 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
 
     if let Some(addr) = listen {
         let tcp = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
-        eprintln!("og-hostd: API on http://{addr} (bearer token in {})", root.join("api-token").display());
-        let authed = router.layer(axum::middleware::from_fn_with_state(app.clone(), require_token));
-        axum::serve(tcp, authed).await?;
+        eprintln!("og-hostd: web UI and API on http://{addr} (bearer token in {}; UI accounts: og-hostd passwd <user>)", root.join("api-token").display());
+        let authed = router.layer(axum::middleware::from_fn_with_state(app.clone(), crate::ui::guard));
+        axum::serve(tcp, authed.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     }
     unix_task.await??;
     Ok(())
 }
 
-async fn require_token(State(app): State<App>, headers: HeaderMap, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let want = app.token.as_deref().unwrap_or("");
-    let got = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-    // constant-time compare
-    let ok = !want.is_empty() && got.len() == want.len() && got.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-    if !ok {
-        return ApiError(StatusCode::UNAUTHORIZED, "missing or wrong bearer token".into()).into_response();
-    }
-    next.run(req).await
-}
-
 impl Daemon {
     /// Restart policy enforcement.
+    /// Stats sample for the UI; also republishes the container list when it changed.
+    fn sample(&self) {
+        let list = self.node.list().unwrap_or_default();
+        let running: Vec<(String, String, Option<String>)> = list
+            .iter()
+            .filter(|(_, st)| st.state == "running")
+            .map(|(m, _)| (m.id.clone(), m.name.clone(), m.net.as_ref().and_then(|a| a.host_veth.clone())))
+            .collect();
+        let snap = self.hub.sample(&running);
+        let gpus = self.brain.lock().unwrap().last_gpus.clone();
+        self.hub.publish("stats", json!({ "stats": snap, "gpus": gpus }).to_string());
+        let containers: Vec<serde_json::Value> = list.iter().filter_map(|(m, _)| self.container_json(&m.id)).collect();
+        self.hub.publish_if_changed("containers", serde_json::to_string(&containers).unwrap_or_default());
+    }
+
     fn think(&self) {
         use crate::brain;
         let node = brain::read_node();
@@ -222,6 +255,7 @@ impl Daemon {
             a
         };
         brain::apply(&self.node, &self.brain, actions);
+        self.hub.publish_if_changed("brain", brain_json(self).to_string());
     }
 
     fn supervise(&self) {
@@ -334,7 +368,9 @@ impl Daemon {
             "pid": st.pid, "error": st.error, "created_at": m.created_at, "project": m.project, "service": m.service,
             "restart": m.restart, "desired": m.desired, "network_mode": m.network_mode,
             "ip": m.net.as_ref().and_then(|a| a.ip), "ports": m.net.as_ref().map(|a| a.ports.clone()).unwrap_or_default(),
-            "health": health,
+            "health": health, "started_at": st.started_at, "finished_at": st.finished_at, "oom_killed": st.oom_killed,
+            "labels": m.labels, "class": crate::brain::Class::from_labels(&m.labels),
+            "desktop": crate::desktop::is_desktop(&m.labels), "gpus": m.gpus, "minimized": m.saved_resources.is_some(),
         }))
     }
 }
@@ -358,6 +394,10 @@ async fn resources_set(State(app): State<App>, UrlPath(id): UrlPath<String>, Jso
 }
 
 async fn brain_status(State(app): State<App>) -> Json<serde_json::Value> {
+    Json(brain_json(&app))
+}
+
+fn brain_json(app: &Daemon) -> serde_json::Value {
     let b = app.brain.lock().unwrap();
     let n = &b.last_node;
     let containers: Vec<_> = b
@@ -373,13 +413,202 @@ async fn brain_status(State(app): State<App>) -> Json<serde_json::Value> {
         })
         .collect();
     let sessions: u32 = b.last_gpus.iter().map(|g| g.encoder_sessions).sum();
-    Json(json!({
+    json!({
         "node": { "mem_total": n.mem_total, "mem_available": n.mem_available, "psi_memory": n.psi, "psi_memory_host_services": n.host_psi },
         "containers": containers,
         "gpus": b.last_gpus,
         "nvenc": { "sessions": sessions, "limit": crate::brain::NVENC_LIMIT },
         "log": b.log.iter().rev().take(50).map(|(t, m)| json!({ "at": t, "message": m })).collect::<Vec<_>>(),
+    })
+}
+
+// ---- UI support ---------------------------------------------------------------------------
+
+async fn info(State(app): State<App>) -> Json<serde_json::Value> {
+    Json(crate::stats::node_info(&app.root))
+}
+
+fn sse_event(name: &str, data: &str) -> axum::response::sse::Event {
+    axum::response::sse::Event::default().event(name).data(data)
+}
+
+/// Server-Sent Events: node info, recent history and the latest of everything first, then
+/// `stats` every 2 s and `containers` / `brain` whenever they change.
+async fn events(State(app): State<App>) -> axum::response::sse::Sse<impl futures_util::Stream<Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>>> {
+    let rx = app.hub.tx.subscribe();
+    let mut first = vec![sse_event("info", &crate::stats::node_info(&app.root).to_string())];
+    {
+        let h = app.hub.history.lock().unwrap();
+        first.push(sse_event("history", &json!({ "node": h.node(3600), "containers": h.containers() }).to_string()));
+    }
+    for (k, v) in app.hub.latest.read().unwrap().iter() {
+        first.push(sse_event(k, v));
+    }
+    use futures_util::StreamExt;
+    let live = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok((name, data)) => return Some((Ok(sse_event(name, &data)), rx)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    });
+    let stream = futures_util::stream::iter(first.into_iter().map(Ok)).chain(live);
+    axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct MetricsQ {
+    range: Option<u64>,
+}
+
+/// Node history, column-wise: {t: [...], cpu: [...], mem, rx, tx, dr, dw}.
+async fn metrics(State(app): State<App>, Query(q): Query<MetricsQ>) -> Json<serde_json::Value> {
+    let pts = app.hub.history.lock().unwrap().node(q.range.unwrap_or(3600).clamp(60, 86400));
+    Json(json!({
+        "t": pts.iter().map(|p| p.t).collect::<Vec<_>>(), "cpu": pts.iter().map(|p| p.cpu).collect::<Vec<_>>(),
+        "mem": pts.iter().map(|p| p.mem).collect::<Vec<_>>(), "rx": pts.iter().map(|p| p.rx).collect::<Vec<_>>(),
+        "tx": pts.iter().map(|p| p.tx).collect::<Vec<_>>(), "dr": pts.iter().map(|p| p.dr).collect::<Vec<_>>(),
+        "dw": pts.iter().map(|p| p.dw).collect::<Vec<_>>(),
     }))
+}
+
+async fn restart(State(app): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult<Json<serde_json::Value>> {
+    let m = app.node.find(&id)?;
+    let a = app.clone();
+    let mid = m.id.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        a.node.stop(&mid, 10)?;
+        a.node.start(&mid)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    app.restarts.lock().unwrap().remove(&m.id);
+    Ok(Json(app.container_json(&m.id).unwrap_or_default()))
+}
+
+async fn kill(State(app): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult<StatusCode> {
+    let m = app.node.find(&id)?;
+    let _ = app.node.set_desired(&m.id, "stopped");
+    app.node.kill(&m.id, libc::SIGKILL)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct StreamQ {
+    tail: Option<usize>,
+}
+
+/// A container's log: the last `tail` lines (default 300), then new output as it comes.
+async fn logs_stream(
+    State(app): State<App>,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<StreamQ>,
+) -> ApiResult<axum::response::sse::Sse<impl futures_util::Stream<Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>>>> {
+    let m = app.node.find(&id)?;
+    let path = app.node.log_path(&m.id);
+    let text = std::fs::read(&path).unwrap_or_default();
+    let offset = text.len() as u64;
+    let tail = q.tail.unwrap_or(300).min(5000);
+    let text = String::from_utf8_lossy(&text);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    let first = lines[start..].join("\n");
+    let stream = futures_util::stream::unfold((Some(first), offset, path), |(first, mut offset, path)| async move {
+        if let Some(f) = first {
+            return Some((Ok(sse_event("log", &serde_json::to_string(&f).unwrap_or_default())), (None, offset, path)));
+        }
+        loop {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if len < offset {
+                offset = 0; // truncated
+            }
+            if len > offset {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut buf = Vec::new();
+                if let Ok(mut f) = std::fs::File::open(&path) {
+                    let _ = f.seek(SeekFrom::Start(offset));
+                    let _ = f.take(1 << 20).read_to_end(&mut buf);
+                }
+                offset += buf.len() as u64;
+                let chunk = String::from_utf8_lossy(&buf).into_owned();
+                return Some((Ok(sse_event("log", &serde_json::to_string(&chunk).unwrap_or_default())), (None, offset, path)));
+            }
+        }
+    });
+    Ok(axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
+}
+
+async fn stacks_list(State(app): State<App>) -> Json<serde_json::Value> {
+    let a = app.clone();
+    let v = tokio::task::spawn_blocking(move || crate::stacks::list(&a.node, &a.root)).await.unwrap_or_default();
+    Json(json!(v))
+}
+
+async fn stack_get(State(app): State<App>, UrlPath(name): UrlPath<String>) -> ApiResult<Json<serde_json::Value>> {
+    let (file, content) = crate::stacks::read_file(&app.node, &app.root, &name)?;
+    Ok(Json(json!({ "name": name, "file": file, "content": content })))
+}
+
+#[derive(Deserialize)]
+struct StackPut {
+    content: String,
+}
+
+async fn stack_put(State(app): State<App>, UrlPath(name): UrlPath<String>, Json(b): Json<StackPut>) -> ApiResult<Json<serde_json::Value>> {
+    let file = crate::stacks::write_file(&app.node, &app.root, &name, &b.content)?;
+    Ok(Json(json!({ "name": name, "file": file })))
+}
+
+#[derive(Deserialize)]
+struct StackDeleteQ {
+    volumes: Option<bool>,
+}
+
+async fn stack_delete(State(app): State<App>, UrlPath(name): UrlPath<String>, Query(q): Query<StackDeleteQ>) -> ApiResult<StatusCode> {
+    let p = crate::stacks::load(&app.node, &app.root, &name)?;
+    let a = app.clone();
+    let volumes = q.volumes.unwrap_or(false);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::compose::down(&a.node, &a.root, &p, volumes)?;
+        crate::stacks::delete_managed(&a.root, &p.name)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// up | down | restart | pull (fresh images, then up) | build (rebuild, then up).
+async fn stack_action(State(app): State<App>, UrlPath((name, action)): UrlPath<(String, String)>) -> ApiResult<Json<serde_json::Value>> {
+    let p = crate::stacks::load(&app.node, &app.root, &name)?;
+    let warnings = p.warnings.clone();
+    let t0 = std::time::Instant::now();
+    match action.as_str() {
+        "up" => crate::compose::up(&app.node, &app.root, &app.node.store, &p, false).await?,
+        "build" => crate::compose::up(&app.node, &app.root, &app.node.store, &p, true).await?,
+        "pull" => {
+            for svc in p.services.iter().filter(|s| s.build.is_none()) {
+                let Some(img) = &svc.image else { continue };
+                if let Ok(r) = og_oci::Reference::parse(img) {
+                    let _ = std::fs::remove_file(app.root.join("refs").join(&r.registry).join(&r.repository).join(r.manifest_ref().replace(':', "_")));
+                }
+                crate::ensure_pulled(&app.root, &app.node.store, img, true).await?;
+            }
+            crate::compose::up(&app.node, &app.root, &app.node.store, &p, false).await?
+        }
+        "down" | "restart" => {
+            let a = app.clone();
+            let p2 = p.clone();
+            tokio::task::spawn_blocking(move || crate::compose::down(&a.node, &a.root, &p2, false)).await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+            if action == "restart" {
+                crate::compose::up(&app.node, &app.root, &app.node.store, &p, false).await?;
+            }
+        }
+        _ => return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown action {action:?} (up, down, restart, pull, build)"))),
+    }
+    Ok(Json(json!({ "name": p.name, "action": action, "seconds": t0.elapsed().as_secs_f64(), "warnings": warnings })))
 }
 
 async fn version() -> Json<serde_json::Value> {

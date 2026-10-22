@@ -202,6 +202,25 @@ the bundle so they survive restarts.
   Frontend stays plain HTML/JS served by the daemon (no build step, fast).
 - Approval queue for changes proposed by the AI assistant, as today.
 - CLI `og` talks to the same API.
+- Implemented (first cut): og-hostd serves the UI itself on its `--listen` address — no CDN,
+  fonts or third-party JS; assets compiled into the binary, gzipped once, ETag-cached
+  (about 35 KB over the wire). Pages: Overview (live CPU/memory/network/disk, history
+  15 m/1 h/24 h, GPUs with VRAM/NVENC, busiest containers, brain activity), Containers
+  (live stats, start/stop/restart/kill/remove, minimize/restore, detail drawer with live
+  logs, resource sliders, inspect; new-container form with priority, GPU and desktop
+  profile), Stacks (managed in `<root>/stacks/<name>/compose.yaml` or discovered by label;
+  editor with diff, rollback on invalid compose; up/down/restart/pull), Images, Storage
+  (disks, volumes, networks), Logs, Ctrl-K palette; phone layout with a bottom tab bar.
+- Live data: one sampler every 2 s → one serialized message → Server-Sent Events to every
+  browser (`/v1/events`); history in memory (1 h at 2 s, 24 h at 1 min).
+- Sign-in: `og-hostd passwd <user>` (argon2id). HttpOnly SameSite=Strict session cookie;
+  sessions stored hashed and survive restarts; a password change or account removal ends
+  existing sessions; changes need `X-OG-UI: 1` and a same-origin Origin; 5 failed sign-ins
+  lock a client out for 10 minutes. Strict CSP. TLS: put `tailscale serve` (or another
+  proxy) in front for now; built-in TLS is planned.
+- The Docker Engine API is also mounted at `/v1/docker/` for signed-in clients.
+- Not ported from OmegaEnv yet: multi-host Monitor (omega-agent), Watches, OpenClaw drawer
+  and approval queue, the cross-host log store, app tiles/catalog.
 
 ## 5. Security model
 - **Two privilege levels inside og-hostd**: the API and UI layer runs unprivileged and

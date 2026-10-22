@@ -160,6 +160,10 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
                 let mut l = s.labels.clone();
                 l.insert("com.docker.compose.project".into(), p.name.clone());
                 l.insert("com.docker.compose.service".into(), s.name.clone());
+                l.insert("com.docker.compose.project.working_dir".into(), p.dir.display().to_string());
+                if let Some(f) = &p.file {
+                    l.insert("com.docker.compose.project.config_files".into(), f.display().to_string());
+                }
                 l
             },
             auto_remove: false,

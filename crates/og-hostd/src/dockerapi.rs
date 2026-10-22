@@ -218,6 +218,29 @@ fn status_text(st: &Status, created: u64) -> String {
     }
 }
 
+/// Bind mounts and named volumes (a bind of `<root>/volumes/<name>/_data` is volume `<name>`).
+fn mounts_json(ctx: &Ctx, m: &Meta) -> Vec<Value> {
+    let vols = ctx.d.root.join("volumes");
+    m.binds
+        .iter()
+        .map(|(src, dst, ro)| {
+            let name = src.strip_prefix(&vols).ok().and_then(|r| {
+                let mut c = r.components();
+                let n = c.next()?.as_os_str().to_string_lossy().to_string();
+                (c.next()?.as_os_str() == "_data").then_some(n)
+            });
+            match name {
+                Some(n) => json!({"Type": "volume", "Name": n, "Source": src, "Destination": dst, "Driver": "local", "Mode": "z", "RW": !ro, "Propagation": ""}),
+                None => json!({"Type": "bind", "Source": src, "Destination": dst, "Mode": "", "RW": !ro, "Propagation": "rprivate"}),
+            }
+        })
+        .chain(m.volumes.iter().map(|(dir, dst, ro)| {
+            let n = dir.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            json!({"Type": "volume", "Name": n, "Source": dir.join("_data"), "Destination": dst, "Driver": "local", "Mode": "z", "RW": !ro, "Propagation": ""})
+        }))
+        .collect()
+}
+
 fn net_display(m: &Meta) -> String {
     match m.network_mode.as_str() {
         "default" => "bridge".into(),
@@ -356,7 +379,7 @@ async fn containers_list(State(ctx): State<Ctx>, Query(q): Query<ListQ>) -> R<Js
             "Id": m.id, "Names": [format!("/{}", m.name)], "Image": m.image, "ImageID": image_id(&ctx, &m),
             "Command": m.args.join(" "), "Created": m.created_at, "Ports": ports_json(&m), "Labels": m.labels,
             "State": docker_state(&st), "Status": status_text(&st, m.created_at),
-            "HostConfig": {"NetworkMode": net_display(&m)}, "NetworkSettings": {"Networks": networks_json(&m)}, "Mounts": [],
+            "HostConfig": {"NetworkMode": net_display(&m)}, "NetworkSettings": {"Networks": networks_json(&m)}, "Mounts": mounts_json(&ctx, &m),
         }));
     }
     Ok(Json(out))
@@ -411,7 +434,7 @@ async fn container_inspect(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>)
             }).unwrap_or(json!({})),
             "Networks": networks_json(&m),
         },
-        "Mounts": m.binds.iter().map(|(s, t, ro)| json!({"Type": "bind", "Source": s, "Destination": t, "RW": !ro})).collect::<Vec<_>>(),
+        "Mounts": mounts_json(&ctx, &m),
     })))
 }
 

@@ -120,6 +120,8 @@ pub struct Service {
 pub struct Project {
     pub name: String,
     pub dir: PathBuf,
+    /// The compose file it was loaded from.
+    pub file: Option<PathBuf>,
     /// Services in start order (dependencies first).
     pub services: Vec<Service>,
     /// name -> external?
@@ -591,7 +593,8 @@ pub fn load(file: &Path, project_name: Option<&str>, env: &interp::Vars) -> Resu
         services.push(svc);
     }
     let services = start_order(services)?;
-    Ok(Project { name, dir, services, networks, volumes, warnings })
+    let file = std::fs::canonicalize(file).ok();
+    Ok(Project { name, dir, file, services, networks, volumes, warnings })
 }
 
 /// Topological order by depends_on (and `network_mode: service:x`), stable by name otherwise.

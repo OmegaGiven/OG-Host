@@ -47,6 +47,9 @@ pub struct Meta {
     pub healthcheck: Option<og_compose::Healthcheck>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// Named volumes: (volume dir, target, read-only).
+    #[serde(default)]
+    pub volumes: Vec<(PathBuf, String, bool)>,
     /// Resources before a `minimal` preset, for `restore`.
     #[serde(default)]
     pub saved_resources: Option<crate::resources::Resources>,
@@ -396,6 +399,7 @@ impl Node {
             auto_remove: extra.auto_remove,
             aliases: extra.aliases,
             gpus: opts.cdi_devices.clone(),
+            volumes: extra.volumes.clone(),
             saved_resources: None,
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;

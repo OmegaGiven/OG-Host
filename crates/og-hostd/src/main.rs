@@ -9,6 +9,9 @@ mod dockerapi;
 mod idmap;
 mod resources;
 mod serve;
+mod stacks;
+mod stats;
+mod ui;
 
 use std::path::PathBuf;
 
@@ -113,6 +116,13 @@ enum Cmd {
         project: Option<String>,
         #[arg(long)]
         volumes: bool,
+    },
+    /// Create a web UI account or change its password (read from the terminal, or one line
+    /// on stdin). `--remove` deletes the account.
+    Passwd {
+        user: String,
+        #[arg(long)]
+        remove: bool,
     },
     /// Run the node daemon: API, restart policies, health monitoring.
     Serve {
@@ -273,6 +283,19 @@ async fn main() -> Result<()> {
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || compose::down(&node, &root, &p, volumes)).await??;
         }
+        Cmd::Passwd { user, remove } => {
+            if remove {
+                let had = ui::remove_user(&cli.root, &user)?;
+                println!("{}", if had { format!("removed {user}") } else { format!("no account {user}") });
+            } else {
+                let pw = read_password("New password: ")?;
+                if std::io::IsTerminal::is_terminal(&std::io::stdin()) && read_password("Again: ")? != pw {
+                    anyhow::bail!("the passwords don't match");
+                }
+                ui::set_password(&cli.root, &user, &pw)?;
+                println!("account {user} saved; sign in on the web UI");
+            }
+        }
         Cmd::Serve { listen, docker_scope, scope_label } => {
             serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label).await?;
         }
@@ -316,4 +339,28 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A password from the terminal without echo, or one line from stdin when not a terminal.
+fn read_password(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(0, &mut t) };
+    let old = t;
+    t.c_lflag &= !libc::ECHO;
+    unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+    let mut line = String::new();
+    let r = stdin.lock().read_line(&mut line);
+    unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+    eprintln!();
+    r?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }

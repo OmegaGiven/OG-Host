@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OG-Host</title>
+<meta name="theme-color" content="#0b0d12">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" type="module"></script>
+</head>
+<body>
+<!-- sign in -->
+<section id="login" class="login" hidden>
+  <form class="login-card" id="loginForm">
+    <div class="brand big"><span class="brand-mark"><b>OG</b><small>HOST</small></span><span>OG-Host</span></div>
+    <p class="muted" id="loginHost">Sign in to manage this server.</p>
+    <label>User<input id="loginUser" autocomplete="username" required></label>
+    <label>Password<input id="loginPass" type="password" autocomplete="current-password" required></label>
+    <p class="err" id="loginErr"></p>
+    <button class="primary-btn">Sign in</button>
+    <p class="muted small" id="loginSetup" hidden>No accounts yet. On the server run <code>og-hostd passwd admin</code>, then sign in here.</p>
+  </form>
+</section>
+
+<div id="app" hidden>
+<header class="topbar">
+  <a class="brand" href="#overview" aria-label="OG-Host overview">
+    <span class="brand-mark"><b>OG</b><small>HOST</small></span><span class="brand-name">OG-Host</span><span class="host-chip" id="hostChip"></span>
+  </a>
+  <nav class="tabs" id="tabs">
+    <a href="#overview" data-tab="overview" class="tab" data-icon="grid"><span>Overview</span></a>
+    <a href="#containers" data-tab="containers" class="tab" data-icon="box"><span>Containers</span><b class="tab-badge" id="ctBadge" hidden></b></a>
+    <a href="#stacks" data-tab="stacks" class="tab" data-icon="layers"><span>Stacks</span></a>
+    <a href="#images" data-tab="images" class="tab" data-icon="disc"><span>Images</span></a>
+    <a href="#storage" data-tab="storage" class="tab" data-icon="drive"><span>Storage</span></a>
+    <a href="#logs" data-tab="logs" class="tab" data-icon="logs"><span>Logs</span></a>
+    <a href="#vms" data-tab="vms" class="tab" data-icon="monitor"><span>VMs</span></a>
+  </nav>
+  <div class="top-actions">
+    <button class="search-trigger" id="searchBtn" title="Search (Ctrl K)"><i data-icon="search"></i><span>Search</span><kbd>Ctrl K</kbd></button>
+    <span class="live" id="live" title="Live connection"><span class="live-dot"></span></span>
+    <button class="icon-btn" id="userBtn" title="Account" data-icon="user"></button>
+  </div>
+</header>
+
+<main>
+  <!-- OVERVIEW -->
+  <section id="view-overview" class="view">
+    <div class="hero">
+      <div>
+        <h1 id="ovTitle">Overview</h1>
+        <p class="hero-sub" id="ovSub"></p>
+      </div>
+      <div class="status-pill" id="ovStatus"></div>
+    </div>
+    <div class="widgets" id="ovWidgets"></div>
+    <div class="section-head"><h2>History</h2><span class="sp"></span>
+      <div class="seg seg-sm" id="histSeries"><button data-s="cpu" class="on">CPU</button><button data-s="mem">Memory</button><button data-s="net">Network</button><button data-s="disk">Disk</button></div>
+      <div class="seg seg-sm" id="histRange"><button data-r="900" class="on">15 m</button><button data-r="3600">1 h</button><button data-r="86400">24 h</button></div>
+    </div>
+    <div class="panel chart-panel"><canvas id="histChart" height="220"></canvas><div class="chart-tip" id="histTip" hidden></div></div>
+    <div id="gpuWrap" hidden>
+      <div class="section-head"><h2>GPUs</h2><span class="muted" id="gpuMeta"></span></div>
+      <div class="gpu-grid" id="gpuGrid"></div>
+    </div>
+    <div class="two-col">
+      <div>
+        <div class="section-head"><h2>Busiest containers</h2><span class="muted">CPU · memory</span></div>
+        <div class="panel" id="ovTop"></div>
+      </div>
+      <div>
+        <div class="section-head"><h2>Resource brain</h2><span class="muted" id="brainMeta"></span></div>
+        <div class="panel" id="ovBrain"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONTAINERS -->
+  <section id="view-containers" class="view" hidden>
+    <div class="toolbar">
+      <div class="q"><i data-icon="search"></i><input id="ctQ" placeholder="Find a container…" autocomplete="off"></div>
+      <div class="seg seg-sm" id="ctFilter"><button data-f="all" class="on">All</button><button data-f="running">Running</button><button data-f="stopped">Stopped</button></div>
+      <label class="chk"><input type="checkbox" id="ctGroup"> Group by stack</label>
+      <span class="sp"></span>
+      <button class="primary-btn" id="ctNew"><i data-icon="plus"></i> New container</button>
+    </div>
+    <div class="panel table-wrap"><table class="table" id="ctTable">
+      <thead><tr><th></th><th data-sort="name">Name</th><th data-sort="image" class="hide-xs">Image</th><th data-sort="cpu" class="num">CPU</th><th data-sort="mem" class="num">Memory</th><th class="num hide-sm">Net ↓ / ↑</th><th class="hide-sm">Address</th><th data-sort="up" class="hide-sm">Up</th><th class="hide-xs"></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p class="empty" id="ctEmpty" hidden>No containers yet. Create one, or start a stack.</p>
+  </section>
+
+  <!-- STACKS -->
+  <section id="view-stacks" class="view" hidden>
+    <div class="toolbar">
+      <h1 class="inline">Stacks</h1>
+      <span class="muted">Compose projects on this server</span>
+      <span class="sp"></span>
+      <button class="primary-btn" id="stNew"><i data-icon="plus"></i> New stack</button>
+    </div>
+    <div id="stacks" class="stacks"></div>
+  </section>
+
+  <!-- IMAGES -->
+  <section id="view-images" class="view" hidden>
+    <div class="toolbar">
+      <h1 class="inline">Images</h1><span class="muted" id="imgMeta"></span>
+      <span class="sp"></span>
+      <form class="q wide" id="pullForm"><i data-icon="download"></i><input id="pullRef" placeholder="Pull an image, e.g. nginx:1.29-alpine" autocomplete="off"><button class="link-btn">Pull</button></form>
+    </div>
+    <div class="panel table-wrap"><table class="table" id="imgTable">
+      <thead><tr><th>Image</th><th>ID</th><th class="num">Size</th><th>Used by</th><th></th></tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
+  <!-- STORAGE -->
+  <section id="view-storage" class="view" hidden>
+    <div class="section-head first"><h2>Disks</h2><span class="muted">filesystems on this server</span></div>
+    <div class="panel" id="fsList"></div>
+    <div class="two-col">
+      <div>
+        <div class="section-head"><h2>Volumes</h2><span class="sp"></span><button class="link-btn" id="volNew"><i data-icon="plus"></i> New volume</button></div>
+        <div class="panel table-wrap"><table class="table" id="volTable"><thead><tr><th>Name</th><th>Used by</th><th></th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div>
+        <div class="section-head"><h2>Networks</h2><span class="sp"></span><button class="link-btn" id="netNew"><i data-icon="plus"></i> New network</button></div>
+        <div class="panel table-wrap"><table class="table" id="netTable"><thead><tr><th>Name</th><th>Subnet</th><th>Containers</th><th></th></tr></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOGS -->
+  <section id="view-logs" class="view" hidden>
+    <div class="logs-layout">
+      <aside class="log-side">
+        <div class="log-side-search"><i data-icon="search"></i><input id="logSrcQ" placeholder="Filter containers…" autocomplete="off"></div>
+        <div id="logSources" class="log-sources"></div>
+      </aside>
+      <div class="log-main">
+        <div class="log-toolbar">
+          <div class="log-title" id="logTitle">Pick a container</div>
+          <div class="seg seg-sm" id="logLevel"><button data-lv="all" class="on">All</button><button data-lv="warn">Warnings+</button><button data-lv="error">Errors</button></div>
+          <div class="q"><i data-icon="filter"></i><input id="logQ" placeholder="Find text…" autocomplete="off"></div>
+          <button class="chip-btn on" id="logFollow" title="Follow new lines"><span class="live-dot"></span>Follow</button>
+          <button class="chip-btn" id="logWrap" title="Wrap long lines">Wrap</button>
+        </div>
+        <div class="log-lines" id="logLines"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- VMS -->
+  <section id="view-vms" class="view" hidden>
+    <div class="soon">
+      <i data-icon="monitor"></i>
+      <h1>Virtual machines</h1>
+      <p class="muted">Coming next in the roadmap: Linux and Windows VMs (Cloud Hypervisor and QEMU) with a browser console, snapshots, and a “looks like a real PC” option for game VMs — managed right here next to your containers.</p>
+    </div>
+  </section>
+</main>
+
+<!-- container drawer -->
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="drawer-title"><span class="dot" id="drDot"></span><div><b id="drName"></b><small id="drSub"></small></div></div>
+    <div class="drawer-actions" id="drActions"></div>
+  </div>
+  <div class="seg seg-sm drawer-tabs" id="drTabs"><button data-dt="info" class="on">Overview</button><button data-dt="logs">Logs</button><button data-dt="res">Resources</button><button data-dt="inspect">Inspect</button></div>
+  <div class="drawer-body" id="drBody"></div>
+</aside>
+
+<!-- modal -->
+<div class="backdrop" id="modal" hidden><div class="modal" id="modalBox"></div></div>
+
+<!-- palette -->
+<div class="backdrop top" id="palette" hidden>
+  <div class="palette" role="dialog" aria-label="Search">
+    <div class="palette-input"><i data-icon="search"></i><input id="paletteQ" placeholder="Jump to a container, stack or page…" autocomplete="off"></div>
+    <ul id="paletteList"></ul>
+  </div>
+</div>
+
+<div class="menu" id="menu" hidden></div>
+<div class="toast" id="toast" hidden></div>
+</div>
+</body>
+</html>
