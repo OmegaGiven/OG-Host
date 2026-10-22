@@ -1,0 +1,17 @@
+[package]
+name = "og-access"
+description = "OG-Host accounts and permissions: realms (local, PAM), users, groups, roles, path ACLs, API tokens, TOTP two-factor, audit log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+argon2 = "0.5"
+hmac = "0.12"
+sha1 = "0.10"
+libc = "0.2"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }

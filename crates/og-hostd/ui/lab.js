@@ -1,4 +1,4 @@
-// OG-Host lab UI: OmegaEnv's Home, Monitor, Explore, Watch, Apps, Logs and OpenClaw,
+// OG-Host lab UI: OmegaEnv's Home, Monitor, Explore, Watch, Apps, Logs and AI,
 // on top of app.js's shell (helpers come in through init()). No third-party code.
 
 let H, $, $$, esc, ic, api, toast, bytes, rate, S;
@@ -41,7 +41,7 @@ export function init(h) {
   H.onContainers = () => {};
   H.onStats = () => {};
   H.paletteItems = paletteItems;
-  $('#clawBtn').hidden = false;
+  $('#clawBtn').hidden = !H.can('AI.Use', '/lab');
   $('#demoBtn').hidden = false;
   bindHome(); bindMonitor(); bindExplore(); bindWatch(); bindApps(); bindLogs(); bindClaw(); bindDemo();
   loadDemoCfg().then(() => { applyDemoChrome(); refresh(true); refreshStation(); });
@@ -137,7 +137,7 @@ function renderWidgets() {
     w.push(`<div class="widget"><div class="widget-head">${ic('gpu')}station GPU<span class="sp"></span>${s.error ? '<span class="dot dot-crit"></span>' : s.wolf_session ? '<span class="chip good">in game</span>' : ''}</div>
       <div class="seg mode-seg"><button class="${s.mode === 'ai' ? 'on ai' : ''}" data-mode="ai">${ic('sparkle')}AI mode</button><button class="${s.mode === 'gaming' ? 'on gaming' : ''}" data-mode="gaming">${ic('game')}Gaming</button></div>
       ${s.error ? '<div class="kv"><span>Mode control unreachable</span></div>' : `<div class="kv"><span>VRAM free</span><b>${s.vram_free_mib != null ? (s.vram_free_mib / 1024).toFixed(1) + ' GB' : '—'}</b></div>
-      <div class="kv"><span>OpenClaw brain</span><b>${s.llama_server ? 'loaded' : 'off'}</b></div>`}</div>`);
+      <div class="kv"><span>AI model</span><b>${s.llama_server ? 'loaded' : 'off'}</b></div>`}</div>`);
   }
   const online = L.hosts.filter((x) => x.online);
   w.push(`<div class="widget"><div class="widget-head">${ic('servers')}Machines<span class="sp"></span><a class="muted" href="#monitor">${online.length}/${L.hosts.length} online</a></div>
@@ -199,7 +199,7 @@ function renderTiles() {
       return `<section class="${isClosed ? 'closed' : ''}" data-group="${esc(g)}">
         <div class="group-head ${editing ? '' : 'collapsible'} ${isClosed ? 'closed' : ''}" ${editing ? '' : `data-hc="${esc(g)}"`}>${ic(editing ? 'folder' : 'chevron', 'chev')}<h2>${esc(g)}</h2><span class="count">${list.length}</span>${isClosed && down ? `<span class="down-count">${down} down</span>` : ''}${controls}</div>
         <div class="app-grid" ${editing && !virtual ? `data-drop="${esc(g)}"` : ''}>${isClosed ? '' : list.map(tile).join('')}${editing && !virtual && !list.length ? '<div class="drop-hint">Drop apps here</div>' : ''}</div></section>`;
-    }).join('') || '<p class="empty">No app tiles yet. Ask OpenClaw to add one, or import from Homepage.</p>';
+    }).join('') || '<p class="empty">No app tiles yet. Ask the AI to add one, or import from Homepage.</p>';
   if (editing) $$('#appGroups [data-drop] .tile').forEach((t) => { t.draggable = true; });
   const wc = closed.has('__widgets');
   $('#homeWidgets').hidden = wc;
@@ -323,7 +323,7 @@ function bindHome() {
         ['sleep', a.onDemand ? 'Always-on app (alert when down)' : 'Starts on demand (no alert when asleep)', () => patchApp(a, { onDemand: !a.onDemand })],
         [a.sensitive ? 'eye' : 'eyeoff', a.sensitive ? 'Show in demo mode' : 'Hide in demo mode', () => patchApp(a, { sensitive: !a.sensitive })],
         ['folder', 'Move to group…', () => setTimeout(() => H.showMenu(m, [...(L.groups || []).filter((g) => g !== a.group).map((g) => ['folder', g, () => placeApp(a.id, g, 9999)]), ['plus', 'New group…', async () => { const n = (await ask('New group', 'Name'))?.trim(); if (n) { if (!(L.groups || []).includes(n)) await layoutCall('/api/layout/groups', { name: n }); placeApp(a.id, n, 9999); } }]]))],
-        ['sparkle', 'Ask OpenClaw about it', () => openClaw(`Tell me about ${a.name} (${a.href}) in my lab: what it does, its health, and anything I should tune.`)],
+        ['sparkle', 'Ask AI about it', () => openClaw(`Tell me about ${a.name} (${a.href}) in my lab: what it does, its health, and anything I should tune.`)],
       ]);
       return;
     }
@@ -732,7 +732,7 @@ function renderWatches() {
       ${tr ? `<div class="w-trend">${tr.samples > 1 ? `30d <b>$${tr.low30.toFixed(2)}–$${tr.high30.toFixed(2)}</b> · 1y low <b>$${tr.low365.toFixed(2)}</b>${tr.change7d != null ? ` · 7d <b class="${tr.change7d < 0 ? 'down' : tr.change7d > 0 ? 'up' : ''}">${tr.change7d > 0 ? '+' : ''}${tr.change7d}%</b>` : ''}` : `tracking since ${new Date(tr.first).toLocaleDateString([], { month: 'short', day: 'numeric' })}`}</div>` : ''}
       ${l?.summary ? `<p class="w-sum">${esc(l.summary)}</p>` : ''}
       ${hist ? `<div class="w-hist">${hist}</div>` : ''}
-      <div class="w-meta"><a href="${esc(w.url)}" target="_blank" rel="noopener">${esc(host(w.url))}</a>${w.notify === false ? `<span class="chip">${ic('belloff')} tracking only</span>` : ''}<span>every ${w.everyMin >= 60 ? w.everyMin / 60 + ' h' : w.everyMin + ' min'}</span>${l ? `<span>checked ${msAgo(l.at)}</span>` : ''}${w.createdBy === 'openclaw' ? '<span>added by OpenClaw</span>' : ''}</div>
+      <div class="w-meta"><a href="${esc(w.url)}" target="_blank" rel="noopener">${esc(host(w.url))}</a>${w.notify === false ? `<span class="chip">${ic('belloff')} tracking only</span>` : ''}<span>every ${w.everyMin >= 60 ? w.everyMin / 60 + ' h' : w.everyMin + ' min'}</span>${l ? `<span>checked ${msAgo(l.at)}</span>` : ''}${w.createdBy === 'openclaw' ? '<span>added by AI</span>' : ''}</div>
       <div class="stack-actions">
         <button data-wcheck="${w.id}" ${w.running ? 'disabled class="busy"' : ''}>${ic('refresh')}Check now</button>
         <button data-wtoggle="${w.id}">${ic(w.enabled ? 'pause' : 'play')}${w.enabled ? 'Pause' : 'Resume'}</button>
@@ -741,7 +741,7 @@ function renderWatches() {
         ${lastOk?.price != null ? `<button data-whist="${w.id}">${ic('chart')}Price history</button>` : ''}
         <button data-wdel="${w.id}" title="Delete">${ic('trash')}</button>
       </div></div>`;
-  }).join('') || '<p class="empty" style="grid-column:1/-1">Nothing watched yet. Add a page — or ask OpenClaw: “watch this product for a restock”.</p>';
+  }).join('') || '<p class="empty" style="grid-column:1/-1">Nothing watched yet. Add a page — or ask AI: “watch this product for a restock”.</p>';
 }
 function watchForm(w) {
   const { box, close } = H.modal(`<h3>${ic('eye')}${w ? 'Edit watch' : 'New watch'}</h3>
@@ -751,7 +751,7 @@ function watchForm(w) {
       <div class="row2"><label>Look for<select name="kind"><option value="restock">Restock + price</option><option value="price">Price only</option><option value="change">Any important change</option></select></label>
       <label>Check<select name="everyMin"><option value="15">every 15 min</option><option value="30">every 30 min</option><option value="60">every hour</option><option value="180">every 3 h</option><option value="360">every 6 h</option><option value="720">every 12 h</option><option value="1440">daily</option></select></label></div>
       <label><span>Target price <span class="hint">optional, $</span></span><input name="targetPrice" inputmode="decimal" value="${w?.targetPrice ?? ''}"></label>
-      <label><span>Question <span class="hint">optional — what should OpenClaw look for?</span></span><textarea name="question" rows="2">${esc(w?.question || '')}</textarea></label>
+      <label><span>Question <span class="hint">optional — what should the AI look for?</span></span><textarea name="question" rows="2">${esc(w?.question || '')}</textarea></label>
       <label class="chk"><input type="checkbox" name="notify" ${!w || w.notify !== false ? 'checked' : ''}> Message me on Signal (off = just track the price)</label>
       <p class="err" id="wErr"></p>
       <div class="modal-actions"><button type="button" class="ghost-btn" data-x>Cancel</button><button class="primary-btn">${w ? 'Save changes' : 'Save watch'}</button></div>
@@ -778,7 +778,7 @@ function bindWatch() {
     if (d.whist) { location.hash = `explore/q/watches/watch_price/${w.id}`; return; }
     if (d.wedit) return watchForm(w);
     try {
-      if (d.wcheck) { await api(`/api/watches/${w.id}/check`, { method: 'POST' }); toast('Queued — OpenClaw checks it next (a minute or two)'); }
+      if (d.wcheck) { await api(`/api/watches/${w.id}/check`, { method: 'POST' }); toast('Queued — the AI checks it next (a minute or two)'); }
       if (d.wtoggle) await api('/api/watches/' + w.id, { method: 'PATCH', body: { enabled: !w.enabled } });
       if (d.wbell) { await api('/api/watches/' + w.id, { method: 'PATCH', body: { notify: w.notify === false } }); toast(w.notify === false ? 'Alerts on' : 'Alerts off — still tracking the price'); }
       if (d.wdel) { if (!(await H.confirmBox(`Stop watching “${w.name}”?`, 'Its history is kept in Explore.', 'Delete'))) return; await api('/api/watches/' + w.id, { method: 'DELETE' }); }
@@ -1058,13 +1058,13 @@ function bindLogs() {
   };
 }
 
-// ---------------------------------------------------------------- OpenClaw
+// ---------------------------------------------------------------- AI
 let chat = store.get('chat', []);
 let thread = store.get('thread', '') || (() => { const t = 'oghost-' + Math.random().toString(36).slice(2, 10); store.set('thread', t); return t; })();
 const SUGGEST = ['Why is my storage filling up?', 'What uses the most RAM right now?', 'Set up Uptime Kuma', 'Which apps are slow today?'];
 let sending = false, chatAbort = null;
 function openClaw(prefill, send = false) {
-  if (L.demoOn) return toast('OpenClaw is off in demo mode');
+  if (L.demoOn) return toast('AI is off in demo mode');
   $('#claw').classList.add('open'); $('#claw').setAttribute('aria-hidden', 'false');
   renderChat();
   if (prefill) { $('#chatText').value = prefill; autosize(); }
@@ -1077,7 +1077,7 @@ const secs = (ms) => { const t = Math.max(0, Math.round(ms / 1000)); return t < 
 function progressHtml(m) {
   const p = m.progress; if (!p) return '';
   const steps = p.steps.map((st) => `<li class="step ${st.status}">${ic(st.status === 'running' ? 'refresh' : st.status === 'failed' ? 'x' : 'check', st.status === 'running' ? 'spin' : '')}<span>${esc(st.title)}</span>${st.note ? `<small>${esc(st.note)}</small>` : ''}</li>`).join('');
-  const appr = p.approvals.map((a) => `<div class="approval" data-appr="${esc(a.id)}"><b>${ic('shield')} OpenClaw wants to run</b><pre>${esc(a.command)}</pre><div><button data-dec="allow-once">Allow once</button><button data-dec="allow-always" class="ghost">Always allow</button><button data-dec="deny" class="ghost">Deny</button></div></div>`).join('');
+  const appr = p.approvals.map((a) => `<div class="approval" data-appr="${esc(a.id)}"><b>${ic('shield')} The AI wants to run</b><pre>${esc(a.command)}</pre><div><button data-dec="allow-once">Allow once</button><button data-dec="allow-always" class="ghost">Always allow</button><button data-dec="deny" class="ghost">Deny</button></div></div>`).join('');
   if (!m.typing) return steps ? `<details class="steps-done"><summary>${p.steps.length} step${p.steps.length === 1 ? '' : 's'} · ${secs(p.endedAt - p.startedAt)}</summary><ul class="steps">${steps}</ul></details>` : '';
   const thinking = !m.content && p.thinking ? `<div class="thinking">${esc(p.thinking.slice(-220))}</div>` : '';
   return `<div class="progress"><div class="status-line">${ic('refresh', 'spin')}<span>${esc(p.label)}</span><small data-since="${p.startedAt}">${secs(Date.now() - p.startedAt)}</small></div>${steps ? `<ul class="steps">${steps}</ul>` : ''}${thinking}${appr}</div>`;
@@ -1085,14 +1085,14 @@ function progressHtml(m) {
 function renderChat() {
   renderClawState();
   $('#chat').innerHTML = chat.length ? chat.map((m) => `<div class="msg ${m.role}${m.typing && m.content ? ' typing' : ''}">${m.role === 'assistant' ? progressHtml(m) : ''}${md(m.content)}</div>`).join('')
-    : '<div class="msg sys">OpenClaw runs on your own GPU and can see this lab’s machines and apps.<br>It can draft installs and automations; you approve anything that changes the lab.</div>';
+    : '<div class="msg sys">AI runs on your own GPU and can see this lab’s machines and apps.<br>It can draft installs and automations; you approve anything that changes the lab.</div>';
   $('#chatSuggest').innerHTML = chat.length ? '' : SUGGEST.map((q) => `<button>${esc(q)}</button>`).join('');
   $('#chat').scrollTop = 1e9;
 }
 function onClawEvent(reply, ev) {
   const p = reply.progress;
   switch (ev.type) {
-    case 'hello': if (!ev.gateway) p.label = 'Waiting for OpenClaw…'; break;
+    case 'hello': if (!ev.gateway) p.label = 'Waiting for the AI…'; break;
     case 'phase': p.label = ev.phase === 'memory-start' ? 'Checking memory…' : ev.phase === 'finishing' ? 'Wrapping up…' : 'Thinking…'; break;
     case 'thinking': p.thinking = ev.text; if (!p.steps.some((s) => s.status === 'running')) p.label = 'Thinking…'; break;
     case 'tool': {
@@ -1143,7 +1143,7 @@ async function sendChat() {
     await readSSE(r, (d) => { if (d === '[DONE]') return; try { reply.content += JSON.parse(d).choices?.[0]?.delta?.content || ''; renderChat(); } catch { /* keepalive */ } });
     if (!reply.content) reply.content = '(no reply)';
   } catch (e) {
-    reply.content = e.name === 'AbortError' ? (reply.content ? reply.content + '\n\n' : '') + '(stopped)' : `Couldn't reach OpenClaw: ${e.message}${L.station?.llama_server === false ? '\nstation is in Gaming mode, so its model is unloaded. Switch to AI mode on Home.' : ''}`;
+    reply.content = e.name === 'AbortError' ? (reply.content ? reply.content + '\n\n' : '') + '(stopped)' : `Couldn't reach the AI: ${e.message}${L.station?.llama_server === false ? '\nstation is in Gaming mode, so its model is unloaded. Switch to AI mode on Home.' : ''}`;
     reply.error = true;
   }
   follow.abort(); chatAbort = null;
@@ -1219,6 +1219,6 @@ function bindDemo() {
 function paletteItems(q) {
   const apps = L.apps.filter((a) => !a.hidden).map((a) => ({ icon: 'external', label: a.name, hint: a.group || 'app', go: () => window.open(a.href, '_blank', 'noopener') }));
   const hosts = L.hosts.map((h) => ({ icon: 'server', label: h.name, hint: 'machine', go: () => { L.openHosts.add(h.name); location.hash = 'monitor'; } }));
-  const claw = q && !L.demoOn ? [{ icon: 'sparkle', label: `Ask OpenClaw: “${q}”`, hint: 'assistant', always: true, go: () => openClaw(q, true) }] : [];
+  const claw = q && !L.demoOn ? [{ icon: 'sparkle', label: `Ask AI: “${q}”`, hint: 'assistant', always: true, go: () => openClaw(q, true) }] : [];
   return [...apps, ...hosts, ...claw];
 }

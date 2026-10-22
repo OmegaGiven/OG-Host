@@ -1,5 +1,7 @@
 //! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
 
+mod access_api;
+mod auth;
 mod brain;
 mod build;
 mod compose;
@@ -138,9 +140,13 @@ enum Cmd {
     /// Create a web UI account or change its password (read from the terminal, or one line
     /// on stdin). `--remove` deletes the account.
     Passwd {
+        /// name@local (default realm) or name@pam
         user: String,
         #[arg(long)]
         remove: bool,
+        /// turn off the account's two-factor sign-in (lost phone)
+        #[arg(long)]
+        reset_tfa: bool,
     },
     /// Lab control plane maintenance.
     Lab {
@@ -318,17 +324,35 @@ async fn main() -> Result<()> {
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || compose::down(&node, &root, &p, volumes)).await??;
         }
-        Cmd::Passwd { user, remove } => {
+        Cmd::Passwd { user, remove, reset_tfa } => {
+            let id = if user.contains('@') { user.clone() } else { format!("{user}@local") };
+            og_access::parse_userid(&id)?;
+            let access = og_access::Access::open(&cli.root);
             if remove {
-                let had = ui::remove_user(&cli.root, &user)?;
-                println!("{}", if had { format!("removed {user}") } else { format!("no account {user}") });
+                access.delete_user(&id)?;
+                access.audit("system", "cli", "remove user", &id, true);
+                println!("removed {id}");
+            } else if reset_tfa {
+                access.tfa_disable(&id)?;
+                access.audit("system", "cli", "tfa reset", &id, true);
+                println!("two-factor turned off for {id}");
             } else {
-                let pw = read_password("New password: ")?;
-                if std::io::IsTerminal::is_terminal(&std::io::stdin()) && read_password("Again: ")? != pw {
-                    anyhow::bail!("the passwords don't match");
+                let first = !access.has_users();
+                if id.ends_with("@pam") {
+                    access.upsert_user(&id, &serde_json::json!({}), None)?;
+                } else {
+                    let pw = read_password("New password: ")?;
+                    if std::io::IsTerminal::is_terminal(&std::io::stdin()) && read_password("Again: ")? != pw {
+                        anyhow::bail!("the passwords don't match");
+                    }
+                    access.upsert_user(&id, &serde_json::json!({}), Some(&pw))?;
                 }
-                ui::set_password(&cli.root, &user, &pw)?;
-                println!("account {user} saved; sign in on the web UI");
+                if first {
+                    access.set_acl(og_access::AclEntry { path: "/".into(), ugid: id.clone(), role: "Administrator".into(), propagate: true }, false)?;
+                    println!("{id} is the first account: Administrator on /");
+                }
+                access.audit("system", "cli", "passwd", &id, true);
+                println!("account {id} saved; sign in on the web UI");
             }
         }
         Cmd::Lab { cmd } => match cmd {

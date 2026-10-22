@@ -11,6 +11,7 @@ og-runtime = { path = "../og-runtime" }
 og-net = { path = "../og-net" }
 og-compose = { path = "../og-compose" }
 og-lab = { path = "../og-lab" }
+og-access = { path = "../og-access" }
 serde.workspace = true
 libc = "0.2"
 flate2.workspace = true

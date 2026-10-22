@@ -301,17 +301,17 @@ async fn run_one(lab: &Arc<Lab>, w: Watch) {
     }
     let skipped = !crate::claw::station_ready(lab).await;
     if skipped {
-        send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "skipped".into(), summary: "station is in Gaming mode — OpenClaw's model is unloaded".into(), ..Default::default() }));
+        send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "skipped".into(), summary: "station is in Gaming mode — the AI's model is unloaded".into(), ..Default::default() }));
     } else {
         let agent = if lab.cfg.watch_agent.is_empty() { "openclaw/watcher" } else { lab.cfg.watch_agent.as_str() };
         match crate::claw::run_once(lab, agent, &prompt(&w, &token), &format!("omegaenv-watch-{}-{}", w.id, now_ms())).await {
             Ok(_) => {
                 let unreported = lab.watches.running.lock().unwrap().get(&w.id).is_some_and(|(_, t)| t.as_deref() == Some(token.as_str()));
                 if unreported {
-                    send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "error".into(), summary: "OpenClaw finished without reporting a result".into(), ..Default::default() }));
+                    send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "error".into(), summary: "AI finished without reporting a result".into(), ..Default::default() }));
                 }
             }
-            Err(e) => send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "error".into(), summary: format!("OpenClaw: {e}").chars().take(200).collect(), ..Default::default() })),
+            Err(e) => send_all(lab, record(lab, &w.id, Check { at: now_ms(), status: "error".into(), summary: format!("AI: {e}").chars().take(200).collect(), ..Default::default() })),
         }
     }
     lab.watches.running.lock().unwrap().remove(&w.id);

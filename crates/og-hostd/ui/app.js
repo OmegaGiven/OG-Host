@@ -162,23 +162,42 @@ async function boot() {
   }
 }
 
+let tfaTicket = null;
+function loginStep(two) {
+  tfaTicket = two ? tfaTicket : null;
+  $('#loginStep1').hidden = two; $('#loginStep2').hidden = !two; $('#loginBack').hidden = !two;
+  $('#loginUser').required = !two; $('#loginPass').required = !two;
+  $('#loginBtn').textContent = two ? 'Verify' : 'Sign in';
+  (two ? $('#loginCode') : $('#loginUser')).focus();
+}
 function showLogin(setup = false) {
   if (S.es) { S.es.close(); S.es = null; }
   $('#app').hidden = true;
   $('#login').hidden = false;
   $('#loginSetup').hidden = !setup;
-  $('#loginUser').focus();
+  try { $('#loginRealm').value = localStorage.getItem('og.realm') || 'local'; } catch { /* private window */ }
+  loginStep(false);
 }
+$('#loginBack').addEventListener('click', () => { $('#loginErr').textContent = ''; loginStep(false); });
 
 $('#loginForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const btn = $('#loginForm button'); btn.disabled = true; $('#loginErr').textContent = '';
+  const btn = $('#loginBtn'); btn.disabled = true; $('#loginErr').textContent = '';
   try {
-    await api('/v1/ui/login', { method: 'POST', body: { user: $('#loginUser').value.trim(), password: $('#loginPass').value } });
-    $('#loginPass').value = '';
+    if (tfaTicket) {
+      await api('/v1/ui/tfa', { method: 'POST', body: { ticket: tfaTicket, code: $('#loginCode').value.trim() } });
+    } else {
+      const realm = $('#loginRealm').value;
+      try { localStorage.setItem('og.realm', realm); } catch { /* private window */ }
+      const r = await api('/v1/ui/login', { method: 'POST', body: { user: $('#loginUser').value.trim(), password: $('#loginPass').value, realm } });
+      $('#loginPass').value = '';
+      if (r && r.tfa_required) { tfaTicket = r.ticket; $('#loginCode').value = ''; loginStep(true); return; }
+    }
+    $('#loginCode').value = ''; tfaTicket = null;
     startApp();
   } catch (e) {
     $('#loginErr').textContent = e.message;
+    if (tfaTicket && e.status === 401 && /expired/.test(e.message)) loginStep(false);
   } finally { btn.disabled = false; }
 });
 
@@ -187,8 +206,11 @@ async function startApp() {
   $('#login').hidden = true;
   $('#app').hidden = false;
   connect();
-  if (started) return;
+  const again = started;
   started = true;
+  if (again) { try { S.me = await api('/v1/ui/me'); } catch { S.me = null; } setNav(NAV_ALL, SUB_ALL); route(); return; }
+  try { S.me = await api('/v1/ui/me'); } catch { S.me = null; }
+  try { (await import('./access.js')).init(H); } catch (e) { console.error(e); }
   try {
     const info = await api('/v1/info');
     S.info = S.info || info;
@@ -284,8 +306,14 @@ const ROUTES = {
 };
 const SERVER_TABS = [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['logs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs']];
 let NAV = SERVER_TABS;
-function defaultView() { return S.lab ? 'home' : 'overview'; }
+function defaultView() { const v = S.lab ? 'home' : 'overview'; return allowedTab([v]) ? v : (NAV[0] ? NAV[0][0] : 'settings'); }
+// what a page needs (held anywhere): pages the caller can't use are left out
+const NEEDS = { overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
+let NAV_ALL = SERVER_TABS, SUB_ALL = [];
+const allowedTab = ([id]) => !S.me || !NEEDS[id] || can(NEEDS[id], '*') || (id === 'logs' && (can('Lab.Audit', '*') || can('Container.Audit', '*')));
 function setNav(tabs, sub) {
+  NAV_ALL = tabs; SUB_ALL = sub || [];
+  tabs = tabs.filter(allowedTab); sub = (sub || []).filter(allowedTab);
   NAV = tabs;
   $('#tabs').innerHTML = tabs.map(([id, icon, label]) => `<a href="#${id}" data-tab="${id}" class="tab">${ic(icon)}<span>${esc(label)}</span>${id === 'containers' || id === 'server' ? '<b class="tab-badge" id="ctBadge" hidden></b>' : ''}${id === 'monitor' ? '<b class="tab-badge" id="alertBadge" hidden></b>' : ''}${id === 'apps' ? '<b class="tab-badge info" id="queueBadge" hidden></b>' : ''}</a>`).join('');
   $('#subnav').innerHTML = (sub || []).map(([id, icon, label]) => `<a href="#${id}" data-sub="${id}">${ic(icon)}<span>${esc(label)}</span></a>`).join('');
@@ -1167,13 +1195,27 @@ async function signOut() {
   showLogin();
 }
 $('#userBtn').addEventListener('click', (e) => {
-  api('/v1/ui/me').then((m) => showMenu(e.currentTarget, [['user', `Signed in as ${m.user}`, () => {}], null, ['logout', 'Sign out', signOut]])).catch(() => {});
+  const a = e.currentTarget;
+  api('/v1/ui/me').then((m) => {
+    S.me = m;
+    const items = [['user', `Signed in as ${m.user}`, () => (location.hash = '#settings/account')], ['shield', 'Account & security', () => (location.hash = '#settings/account')]];
+    if (can('Access.Audit', '/access')) items.push(['user', 'Users & permissions', () => (location.hash = '#settings/users')]);
+    items.push(null, ['logout', 'Sign out', signOut]);
+    showMenu(a, items);
+  }).catch(() => {});
 });
+
+/** Does the signed-in caller hold `priv` on `area` (one of the areas /v1/ui/me reports)? */
+function can(priv, area = '/') {
+  const m = S.me; if (!m) return false;
+  if (area === '*') return (m.anywhere || []).includes(priv);
+  return ((m.privileges || {})[area] || []).includes(priv);
+}
 
 // ---------------------------------------------------------------- shared with lab.js
 const H = {
   $, $$, esc, clamp, bytes, rate, pct, dur, now, ago, clock, parseSize, ic, ICONS, hydrateIcons, toast, api, S, ROUTES, SERVER_TABS,
-  setNav, route, modal, confirmBox, showMenu, spark, sparkPath, segOn, openDrawer, stateOf, lineDiff,
+  setNav, route, modal, confirmBox, can, showMenu, spark, sparkPath, segOn, openDrawer, stateOf, lineDiff,
   containerLogsHash: (c) => (S.lab ? `#logs/${encodeURIComponent(S.labHost)}/container/${encodeURIComponent(c.name)}` : `#logs/${c.id}`),
 };
 

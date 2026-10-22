@@ -34,7 +34,7 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
 pub fn context(lab: &Lab) -> String {
     let hosts: Vec<String> = lab.fleet.view().iter().map(|h| format!("{}{}", h["name"].as_str().unwrap_or(""), if h["online"] == true { "" } else { " (offline)" })).collect();
     format!(
-        "You are OpenClaw, working inside OG-Host — the homelab control panel at {url}.
+        "You are the AI assistant working inside OG-Host — the homelab control panel at {url}.
 Call dashboard_guide before changing the dashboard. To watch a web page for restocks, prices or changes use add_watch (OG-Host re-checks it on schedule and messages the user on Signal); list_watches shows results. For \"what happened / when did X start\" questions use query_metrics (history up to 1 year) together with search_logs. Use the \"omegaenv\" MCP tools (list_metrics, query_metrics, dashboard_guide, update_app_tile, remove_app_tile, list_stacks, lab_overview, get_host, list_apps, used_ports, search_logs, tail_logs, noisy_logs, search_catalog, submit_install, install_status, add_app_tile) and follow the \"omegaenv\" skill.
 To install an app: check used_ports on the target host, draft a docker compose file, then call submit_install. It lands as \"pending\" and the human approves it in OG-Host → Apps before anything runs. Never claim an install happened until install_status says \"done\".
 Keep answers short and concrete; this chat is shown in a narrow side panel.
@@ -46,7 +46,7 @@ Current hosts: {hosts}.",
 
 async fn relay(lab: &Lab, path: &str, body: Option<Value>, timeout: Duration) -> Result<reqwest::Response, String> {
     if lab.cfg.openclaw_relay_url.is_empty() {
-        return Err("OpenClaw relay is not configured".into());
+        return Err("AI relay is not configured".into());
     }
     let url = format!("{}{path}", lab.cfg.openclaw_relay_url.trim_end_matches('/'));
     let mut rq = if body.is_some() { lab.http.post(&url) } else { lab.http.get(&url) };
@@ -105,7 +105,7 @@ pub fn urlencode(s: &str) -> String {
 /// browser goes away the run finishes anyway (its answer lands in the OpenClaw session).
 pub async fn chat(lab: Arc<Lab>, body: Value) -> Response {
     if lab.cfg.openclaw_url.is_empty() || lab.cfg.openclaw_password.is_empty() {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "OpenClaw is not configured");
+        return err(StatusCode::SERVICE_UNAVAILABLE, "AI is not configured");
     }
     let thread = body["thread"].as_str().unwrap_or("omegaenv").to_string();
     let prev = lab.claw.runs.lock().unwrap().remove(&thread);
@@ -123,12 +123,12 @@ pub async fn chat(lab: Arc<Lab>, body: Value) -> Response {
     let url = format!("{}/v1/chat/completions", lab.cfg.openclaw_url.trim_end_matches('/'));
     let resp = match lab.http.post(&url).bearer_auth(&lab.cfg.openclaw_password).json(&payload).timeout(Duration::from_secs(20 * 60)).send().await {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("OpenClaw unreachable ({e})")),
+        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("AI unreachable ({e})")),
     };
     if !resp.status().is_success() {
         let code = resp.status();
         let t: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
-        return err(StatusCode::BAD_GATEWAY, format!("OpenClaw HTTP {code}: {t}"));
+        return err(StatusCode::BAD_GATEWAY, format!("AI HTTP {code}: {t}"));
     }
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes_v::Bytes, std::io::Error>>(64);
     let l = lab.clone();
@@ -173,7 +173,7 @@ pub mod bytes_v {
 /// One non-streaming run (watches): long timeout, browser + local model.
 pub async fn run_once(lab: &Lab, agent: &str, message: &str, user: &str) -> Result<String, String> {
     if lab.cfg.openclaw_url.is_empty() || lab.cfg.openclaw_password.is_empty() {
-        return Err("OpenClaw not configured".into());
+        return Err("AI not configured".into());
     }
     let url = format!("{}/v1/chat/completions", lab.cfg.openclaw_url.trim_end_matches('/'));
     let r = lab

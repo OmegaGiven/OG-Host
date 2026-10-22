@@ -15,11 +15,19 @@
   <form class="login-card" id="loginForm">
     <div class="brand big"><span class="brand-mark"><b>OG</b><small>HOST</small></span><span>OG-Host</span></div>
     <p class="muted" id="loginHost">Sign in to manage this server.</p>
-    <label>User<input id="loginUser" autocomplete="username" required></label>
-    <label>Password<input id="loginPass" type="password" autocomplete="current-password" required></label>
+    <div id="loginStep1">
+      <label>User<input id="loginUser" autocomplete="username" required></label>
+      <label>Password<input id="loginPass" type="password" autocomplete="current-password" required></label>
+      <label>Realm<select id="loginRealm"><option value="local">OG-Host accounts</option><option value="pam">Linux system accounts (PAM)</option></select></label>
+    </div>
+    <div id="loginStep2" hidden>
+      <label>Two-factor code<input id="loginCode" inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or a recovery code" maxlength="12"></label>
+      <p class="muted small">Open your authenticator app, or use one of your recovery codes.</p>
+    </div>
     <p class="err" id="loginErr"></p>
-    <button class="primary-btn">Sign in</button>
-    <p class="muted small" id="loginSetup" hidden>No accounts yet. On the server run <code>og-hostd passwd admin</code>, then sign in here.</p>
+    <button class="primary-btn" id="loginBtn">Sign in</button>
+    <button type="button" class="link-btn" id="loginBack" hidden>Back</button>
+    <p class="muted small" id="loginSetup" hidden>No accounts yet. On the server run <code>og-hostd passwd admin</code> (or sign in as root with the PAM realm), then sign in here.</p>
   </form>
 </section>
 
@@ -33,7 +41,7 @@
     <button class="search-trigger" id="searchBtn" title="Search (Ctrl K)"><i data-icon="search"></i><span>Search</span><kbd>Ctrl K</kbd></button>
     <button class="icon-btn demo-btn" id="demoBtn" title="Demo mode" hidden data-icon="eye"><span class="demo-label">DEMO</span></button>
     <span class="live" id="live" title="Live connection"><span class="live-dot"></span></span>
-    <button class="claw-btn" id="clawBtn" title="Ask OpenClaw" hidden><span class="claw-ico" data-icon="sparkle"></span><span>OpenClaw</span></button>
+    <button class="claw-btn" id="clawBtn" title="Ask AI" hidden><span class="claw-ico" data-icon="sparkle"></span><span>AI</span></button>
     <button class="icon-btn" id="userBtn" title="Account" data-icon="user"></button>
   </div>
 </header>
@@ -83,7 +91,7 @@
 
   <!-- WATCH (lab) -->
   <section id="view-watch" class="view" hidden>
-    <div class="toolbar"><div><h1 class="inline">Watches</h1><p class="muted small" style="margin:4px 0 0;max-width:640px">OpenClaw opens each page in a real browser on schedule, answers your question, and OG-Host messages you on Signal when it matters — back in stock, a price drop, or a real change.</p></div><span class="sp"></span><button class="primary-btn" id="wNewBtn" data-icon="plus"> New watch</button></div>
+    <div class="toolbar"><div><h1 class="inline">Watches</h1><p class="muted small" style="margin:4px 0 0;max-width:640px">The AI opens each page in a real browser on schedule, answers your question, and OG-Host messages you on Signal when it matters — back in stock, a price drop, or a real change.</p></div><span class="sp"></span><button class="primary-btn" id="wNewBtn" data-icon="plus"> New watch</button></div>
     <div id="watches" class="watches"></div>
   </section>
 
@@ -99,7 +107,7 @@
     <div id="queue" class="queue"></div>
     <div id="sub-installed"><div id="projects" class="projects"></div><details class="activity"><summary>Recent activity</summary><div id="activity"></div></details></div>
     <div id="sub-add" hidden>
-      <p class="muted" style="margin:6px 0 0">Community containers from linuxserver.io. OpenClaw drafts the setup; nothing runs until you approve it.</p>
+      <p class="muted" style="margin:6px 0 0">Community containers from linuxserver.io. The AI drafts the setup; nothing runs until you approve it.</p>
       <div class="catalog-search"><span data-icon="search"></span><input id="catalogQ" placeholder="Search: photos, books, dns, vpn, wiki…" autocomplete="off"></div>
       <div id="catalog" class="catalog"></div>
     </div>
@@ -121,7 +129,7 @@
           <div class="q"><span data-icon="filter"></span><input id="llQ" placeholder="Find text…" autocomplete="off"></div>
           <select id="llHours" title="Look back"><option value="1">1 h</option><option value="6" selected>6 h</option><option value="24">24 h</option><option value="72">3 days</option><option value="168">7 days</option><option value="336">14 days</option></select>
           <button class="chip-btn on" id="llLive" title="Follow new lines"><span class="live-dot"></span>Live</button>
-          <button class="chip-btn" id="llAsk" title="Ask OpenClaw about these lines" data-icon="sparkle"> Ask</button>
+          <button class="chip-btn" id="llAsk" title="Ask AI about these lines" data-icon="sparkle"> Ask</button>
         </div>
         <div class="log-lines wrap" id="llLines"></div>
       </div>
@@ -198,6 +206,13 @@
     </table></div>
   </section>
 
+  <!-- SETTINGS: account + access control -->
+  <section id="view-settings" class="view" hidden>
+    <div class="toolbar"><h1 class="inline">Settings</h1><span class="muted" id="setMeta"></span></div>
+    <div class="seg seg-sm set-tabs" id="setTabs"></div>
+    <div id="setBody" class="set-body"></div>
+  </section>
+
   <!-- STORAGE -->
   <section id="view-storage" class="view" hidden>
     <div class="section-head first"><h2>Disks</h2><span class="muted">filesystems on this server</span></div>
@@ -254,15 +269,15 @@
   <div class="drawer-body" id="drBody"></div>
 </aside>
 
-<!-- OpenClaw drawer -->
+<!-- AI drawer -->
 <aside class="drawer chat-drawer" id="claw" aria-hidden="true">
   <div class="drawer-head">
-    <div class="drawer-title"><span class="claw-avatar" data-icon="sparkle"></span><div><b>OpenClaw</b><small id="clawState">local agent on station</small></div></div>
+    <div class="drawer-title"><span class="claw-avatar" data-icon="sparkle"></span><div><b>AI</b><small id="clawState">local agent on station</small></div></div>
     <div class="drawer-actions"><button class="icon-btn" id="clawNew" title="New conversation" data-icon="restart"></button><button class="icon-btn" id="clawClose" title="Close" data-icon="x"></button></div>
   </div>
   <div class="chat" id="chat"></div>
   <div class="chat-suggest" id="chatSuggest"></div>
-  <form class="chat-input" id="chatForm"><textarea id="chatText" rows="1" placeholder="Ask OpenClaw to install, explain or automate something…"></textarea><button type="submit" class="send" title="Send" data-icon="send"></button></form>
+  <form class="chat-input" id="chatForm"><textarea id="chatText" rows="1" placeholder="Ask the AI to install, explain or automate something…"></textarea><button type="submit" class="send" title="Send" data-icon="send"></button></form>
 </aside>
 
 <!-- modal -->
