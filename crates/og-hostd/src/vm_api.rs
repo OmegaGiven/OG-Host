@@ -135,7 +135,13 @@ async fn create(State(d): D, Json(b): Json<CreateReq>) -> Response {
 async fn update(State(d): D, Path(name): Path<String>, Json(mut vm): Json<Vm>) -> Response {
     vm.name = name;
     let d2 = d.clone();
-    match blocking(move || Ok(view(&d2, &d2.vms.update(vm)?))).await {
+    match blocking(move || {
+        let v = d2.vms.update(vm)?;
+        crate::vmrun::refresh_firewall(&d2);
+        Ok(view(&d2, &v))
+    })
+    .await
+    {
         Ok(v) => Json(v).into_response(),
         Err(r) => r,
     }

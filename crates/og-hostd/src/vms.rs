@@ -60,8 +60,10 @@ pub struct Nic {
     pub id: String,
     /// virtio | e1000e | rtl8139
     pub model: String,
-    /// og-net network name, or `lan:<host nic>`
+    /// og-net network name, `bridge:<host bridge>` or `lan:<host nic>` (macvtap)
     pub network: String,
+    /// VLAN tag on a VLAN-aware host bridge
+    pub vlan: Option<u16>,
     pub mac: String,
     /// published ports `host:guest[/udp]` (og-net networks only)
     pub ports: Vec<String>,
@@ -69,7 +71,7 @@ pub struct Nic {
 
 impl Default for Nic {
     fn default() -> Self {
-        Nic { id: "net0".into(), model: "virtio".into(), network: og_net::DEFAULT_NETWORK.into(), mac: String::new(), ports: vec![] }
+        Nic { id: "net0".into(), model: "virtio".into(), network: og_net::DEFAULT_NETWORK.into(), vlan: None, mac: String::new(), ports: vec![] }
     }
 }
 
@@ -127,6 +129,8 @@ pub struct Vm {
     pub cpu_limit: f64,
     /// a template: never started, cloned into new VMs (its disks then stay unchanged)
     pub template: bool,
+    /// what may reach the VM (tap NICs: OG-Host networks and host bridges)
+    pub firewall: crate::vmfw::VmFirewall,
     /// cloud-init settings (a NoCloud seed disc is made at every start)
     pub cloudinit: Option<CloudInit>,
     /// direct kernel boot (absolute paths on this server; empty = boot from disks/ISO)
@@ -165,6 +169,7 @@ impl Default for Vm {
             boot: vec![],
             cpu_limit: 0.0,
             template: false,
+            firewall: Default::default(),
             cloudinit: None,
             kernel: String::new(),
             initrd: String::new(),
@@ -405,6 +410,19 @@ impl Vms {
             if !og_net::valid_mac(&n.mac) {
                 bail!("bad MAC {}", n.mac);
             }
+            if let Some(br) = n.network.strip_prefix("bridge:") {
+                if br.is_empty() || !Path::new("/sys/class/net").join(br).join("bridge").exists() {
+                    bail!("no bridge {br:?} on this server (Network → Bridges)");
+                }
+                if !n.ports.is_empty() {
+                    bail!("published ports only work on OG-Host networks (on a bridge the VM has its own LAN address)");
+                }
+            } else if n.vlan.is_some() {
+                bail!("VLAN tags need a host bridge (bridge:<name>)");
+            }
+            if n.vlan.is_some_and(|v| v == 0 || v > 4094) {
+                bail!("VLAN ids are 1-4094");
+            }
             if let Some(nic) = n.network.strip_prefix("lan:") {
                 if nic.is_empty() || !Path::new("/sys/class/net").join(nic).exists() {
                     bail!("no network interface {nic:?} on this server");
@@ -462,6 +480,7 @@ impl Vms {
             bail!("an initrd needs a kernel");
         }
         vm.append = plain(&vm.append, 1000);
+        vm.firewall.validate()?;
         vm.comment = plain(&vm.comment, 300);
         if vm.cpu_limit < 0.0 || vm.cpu_limit > vm.cores as f64 {
             vm.cpu_limit = 0.0;
@@ -528,6 +547,7 @@ impl Vms {
             let mut v = v.clone();
             v.comment.clear();
             v.labels.clear();
+            v.firewall = Default::default();
             v.autostart = false;
             v.desired.clear();
             v

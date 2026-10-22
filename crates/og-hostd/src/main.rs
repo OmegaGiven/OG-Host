@@ -14,6 +14,7 @@ mod desktop;
 mod dhcp;
 mod dockerapi;
 mod firewall;
+mod hostnet;
 mod idmap;
 mod labnode;
 mod pools;
@@ -29,6 +30,7 @@ mod tls;
 mod update;
 mod vm_api;
 mod vmrun;
+mod vmfw;
 mod vms;
 mod ui;
 

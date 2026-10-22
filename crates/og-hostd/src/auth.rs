@@ -382,6 +382,7 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["docker", ..] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
         ["access", "me", ..] => None,
         ["access", ..] => r("/access".into(), if get { "Access.Audit" } else { "Access.Modify" }),
+        ["network", ..] => r("/system".into(), if get { "Sys.Audit" } else { "Network.Modify" }),
         ["firewall", ..] => r("/system".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
         ["storage"] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
         ["storage", id] => r(format!("/storage/{id}"), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),

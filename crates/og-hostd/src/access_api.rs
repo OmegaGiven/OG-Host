@@ -433,3 +433,50 @@ async fn fw_rollback(State(d): D) -> Response {
         Err(e) => bad(e),
     }
 }
+
+// ---- host networking (bridges, bonds, VLANs) ----
+
+pub fn network_router(d: Arc<Daemon>) -> Router {
+    Router::new()
+        .route("/v1/network", get(net_get).put(net_put))
+        .route("/v1/network/confirm", post(net_confirm))
+        .route("/v1/network/rollback", post(net_rollback))
+        .with_state(d)
+}
+
+async fn net_get(State(d): D) -> Json<Value> {
+    let d2 = d.clone();
+    Json(tokio::task::spawn_blocking(move || d2.hostnet.status()).await.unwrap_or_default())
+}
+
+async fn net_put(State(d): D, Extension(w): Extension<Who>, Json(c): Json<crate::hostnet::Config>) -> Response {
+    let d2 = d.clone();
+    match tokio::task::spawn_blocking(move || d2.hostnet.apply(c)).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+        Ok(generation) => {
+            let d3 = d.clone();
+            let who = w.label();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(crate::hostnet::CONFIRM_SECS)).await;
+                let d4 = d3.clone();
+                if let Ok(Ok(true)) = tokio::task::spawn_blocking(move || d4.hostnet.rollback(Some(generation))).await {
+                    d3.access.audit("system", "", "network change rolled back (not confirmed)", &who, true);
+                    eprintln!("og-hostd: network change not confirmed in time: rolled back");
+                }
+            });
+            Json(json!({"ok": true, "confirm_within": crate::hostnet::CONFIRM_SECS})).into_response()
+        }
+        Err(e) => bad(format!("{e:#}")),
+    }
+}
+
+async fn net_confirm(State(d): D) -> Response {
+    done(d.hostnet.confirm())
+}
+
+async fn net_rollback(State(d): D) -> Response {
+    let d2 = d.clone();
+    match tokio::task::spawn_blocking(move || d2.hostnet.rollback(None)).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+        Ok(r) => Json(json!({"ok": true, "rolled_back": r})).into_response(),
+        Err(e) => bad(e),
+    }
+}

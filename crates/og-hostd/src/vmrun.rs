@@ -90,7 +90,11 @@ pub fn start(d: &Daemon, name: &str) -> Result<()> {
     let mut fds = vec![];
     for (i, nic) in vm.nics.iter().enumerate() {
         let owner = nic_owner(name, i);
-        if let Some(parent) = nic.network.strip_prefix("lan:") {
+        if let Some(br) = nic.network.strip_prefix("bridge:") {
+            let tap = og_net::tap_name(&owner);
+            crate::hostnet::attach_tap(&tap, br, nic.vlan)?;
+            devs.push((nic.id.clone(), NetDev::Tap(tap)));
+        } else if let Some(parent) = nic.network.strip_prefix("lan:") {
             let path = d.node.net.attach_macvtap(&owner, parent, &nic.mac)?;
             let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("opening {}", path.display()))?;
             let target = 10 + fds.len() as i32;
@@ -167,7 +171,26 @@ pub fn start(d: &Daemon, name: &str) -> Result<()> {
         return Err(e);
     }
     d.vms.set_desired(name, "running")?;
+    refresh_firewall(d);
     Ok(())
+}
+
+/// Rebuild the VM firewall table from the running VMs.
+pub fn refresh_firewall(d: &Daemon) {
+    let mut v = vec![];
+    for vm in d.vms.list() {
+        if d.vms.status(&vm.name).state == "stopped" {
+            continue;
+        }
+        for (i, n) in vm.nics.iter().enumerate() {
+            if !n.network.starts_with("lan:") {
+                v.push((og_net::tap_name(&nic_owner(&vm.name, i)), vm.firewall.clone()));
+            }
+        }
+    }
+    if let Err(e) = crate::vmfw::apply(&v) {
+        eprintln!("og-hostd: {e:#}");
+    }
 }
 
 /// After QEMU is gone: stop swtpm, give PCI devices back, drop the cgroup and DHCP leases.
@@ -182,11 +205,12 @@ pub fn cleanup(d: &Daemon, vm: &Vm) {
         release_vfio(p);
     }
     for (i, nic) in vm.nics.iter().enumerate() {
-        if nic.network.starts_with("lan:") {
+        if nic.network.starts_with("lan:") || nic.network.starts_with("bridge:") {
             let _ = d.node.net.detach(&nic_owner(&vm.name, i));
         }
         d.dhcp.remove(&nic.mac);
     }
+    refresh_firewall(d);
     let _ = std::fs::remove_dir(cgroup(&vm.name));
     let _ = std::fs::remove_file(run.join("qemu.pid"));
 }
@@ -264,6 +288,7 @@ pub async fn supervisor(d: std::sync::Arc<Daemon>) {
                         Err(e) => eprintln!("og-hostd: VM {} didn't start: {e:#}", vm.name),
                     }
                 } else if st != "stopped" && boot {
+                    refresh_firewall(&d2);
                     // og-hostd restarted while it ran: give the DHCP server its leases back
                     for (i, nic) in vm.nics.iter().enumerate().filter(|(_, n)| !n.network.starts_with("lan:")) {
                         let ports: Vec<og_net::PortMap> = nic.ports.iter().filter_map(|p| og_net::PortMap::parse(p).ok()).collect();
