@@ -283,6 +283,93 @@ impl Repo {
         Ok(data)
     }
 
+    // ---- raw access, for copying backups between datastores (other sites) ----
+
+    pub fn has_chunk(&self, id: &Id) -> bool {
+        self.chunk_path(id).exists()
+    }
+
+    /// A chunk file as stored (compressed, sealed if encrypted).
+    pub fn raw_chunk(&self, id: &Id) -> Result<Vec<u8>> {
+        std::fs::read(self.chunk_path(id)).with_context(|| format!("chunk {} is missing", id_hex(id)))
+    }
+
+    /// Store a chunk file copied from another datastore (it can't always be checked here:
+    /// sealed chunks need the key; `verify` checks them where the key is).
+    pub fn put_raw(&self, id: &Id, raw: &[u8]) -> Result<()> {
+        if raw.len() < 5 || &raw[..4] != CHUNK_MAGIC || raw.len() > chunker::MAX + 4096 {
+            bail!("not a chunk");
+        }
+        let p = self.chunk_path(id);
+        if p.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(tmp, p)?;
+        Ok(())
+    }
+
+    /// Every chunk id a snapshot uses.
+    pub fn chunk_ids(&self, m: &Manifest) -> Result<Vec<Id>> {
+        let mut out = vec![];
+        for a in &m.archives {
+            out.extend(self.index(m, &a.name)?.into_iter().map(|(id, _)| id));
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// A snapshot's index files, as bytes (to copy it elsewhere).
+    pub fn index_files(&self, m: &Manifest) -> Result<Vec<(String, Vec<u8>)>> {
+        m.archives.iter().map(|a| Ok((a.name.clone(), std::fs::read(self.snap_dir(&m.group, m.time).join(format!("{}.idx", a.name)))?))).collect()
+    }
+
+    pub fn has_snapshot(&self, group: &str, time: u64) -> bool {
+        self.snap_dir(group, time).join("manifest.json").exists()
+    }
+
+    /// Add a snapshot copied from another datastore; all its chunks must be here already.
+    pub fn import_snapshot(&self, m: &Manifest, indexes: &[(String, Vec<u8>)]) -> Result<()> {
+        if !valid_group(&m.group) || m.archives.iter().any(|a| !valid_archive(&a.name)) {
+            bail!("bad snapshot");
+        }
+        let _lock = self.lock(false)?;
+        let fin = self.snap_dir(&m.group, m.time);
+        if fin.join("manifest.json").exists() {
+            return Ok(());
+        }
+        let tmp = fin.with_file_name(format!(".tmp-{}", time_name(m.time)));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)?;
+        let r = (|| -> Result<()> {
+            for a in &m.archives {
+                let (_, b) = indexes.iter().find(|(n, _)| n == &a.name).with_context(|| format!("index {} missing", a.name))?;
+                if b.len() < 12 || &b[..4] != INDEX_MAGIC {
+                    bail!("index {} is damaged", a.name);
+                }
+                for e in b[12..].chunks_exact(36) {
+                    let id: Id = e[..32].try_into().unwrap();
+                    if !self.has_chunk(&id) {
+                        bail!("chunk {} hasn't arrived", id_hex(&id));
+                    }
+                }
+                std::fs::write(tmp.join(format!("{}.idx", a.name)), b)?;
+            }
+            let mut m = m.clone();
+            m.verified = None;
+            std::fs::write(tmp.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
+            std::fs::rename(&tmp, &fin)?;
+            Ok(())
+        })();
+        if r.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+        r
+    }
+
     // ---- snapshots ----
 
     fn snap_dir(&self, group: &str, time: u64) -> PathBuf {

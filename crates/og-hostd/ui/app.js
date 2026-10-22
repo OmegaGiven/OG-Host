@@ -122,10 +122,16 @@ function toast(msg, bad = false) {
   toastTimer = setTimeout(() => (t.hidden = true), bad ? 6000 : 3000);
 }
 
+/** A server-page path on the node being managed (cluster): /v1/nodes/<node>/v1/... */
+function apiPath(path) {
+  if (S.node && path.startsWith('/v1/') && !/^\/v1\/(ui|cluster|nodes|access)\b/.test(path)) return `/v1/nodes/${encodeURIComponent(S.node)}${path}`;
+  return path;
+}
+
 async function api(path, { method = 'GET', body, raw = false } = {}) {
   const opts = { method, headers: { 'X-OG-UI': '1' } };
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const r = await fetch(path, opts);
+  const r = await fetch(apiPath(path), opts);
   if (r.status === 401 && !path.startsWith('/v1/ui/')) { showLogin(); throw new Error('signed out'); }
   const text = await r.text();
   let data = text;
@@ -219,6 +225,7 @@ async function startApp() {
   } catch { S.lab = false; }
   try { (await import('./backups.js')).init(H); } catch (e) { console.error(e); }
   try { (await import('./vms.js')).init(H); } catch (e) { console.error(e); }
+  try { (await import('./cluster.js')).init(H); } catch (e) { console.error(e); }
   if (S.lab) {
     try { (await import('./lab.js')).init(H); }
     catch (e) { console.error(e); S.lab = false; toast(`Lab UI failed to load: ${e.message}`, true); }
@@ -230,7 +237,7 @@ async function startApp() {
 // ---------------------------------------------------------------- live connection
 function connect() {
   if (S.es) S.es.close();
-  const es = new EventSource('/v1/events');
+  const es = new EventSource(apiPath('/v1/events'));
   S.es = es;
   const live = $('#live');
   es.onopen = () => { live.className = 'live on'; live.title = 'Live'; };
@@ -269,6 +276,7 @@ function connect() {
 function paintInfo() {
   const i = S.info;
   $('#hostChip').textContent = i.hostname;
+  $('#hostChip').classList.toggle('remote', !!S.node);
   document.title = `${i.hostname} · OG-Host`;
   if (S.view === 'overview') paintOverviewHead();
 }
@@ -306,11 +314,11 @@ const ROUTES = {
   logs: { el: 'logs', tab: 'logs', run: (arg) => { paintLogSources(); if (arg) openLog(arg); else if (S.log.id) openLog(S.log.id); } },
   vms: { el: 'vms', tab: 'vms', run: () => {} },
 };
-const SERVER_TABS = [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['backups', 'shield', 'Backups'], ['logs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs']];
+const SERVER_TABS = [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['backups', 'shield', 'Backups'], ['logs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs'], ['cluster', 'servers', 'Cluster']];
 let NAV = SERVER_TABS;
 function defaultView() { const v = S.lab ? 'home' : 'overview'; return allowedTab([v]) ? v : (NAV[0] ? NAV[0][0] : 'settings'); }
 // what a page needs (held anywhere): pages the caller can't use are left out
-const NEEDS = { backups: 'Datastore.Audit', vms: 'VM.Audit', overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
+const NEEDS = { cluster: 'Cluster.Audit', backups: 'Datastore.Audit', vms: 'VM.Audit', overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
 let NAV_ALL = SERVER_TABS, SUB_ALL = [];
 const allowedTab = ([id]) => !S.me || !NEEDS[id] || can(NEEDS[id], '*') || (id === 'logs' && (can('Lab.Audit', '*') || can('Container.Audit', '*')));
 function setNav(tabs, sub) {
@@ -1214,10 +1222,22 @@ function can(priv, area = '/') {
   return ((m.privileges || {})[area] || []).includes(priv);
 }
 
+/** Manage another cluster node from this UI (null = this server). */
+function switchNode(name) {
+  S.node = name && name !== S.selfNode ? name : null;
+  try { if (S.node) sessionStorage.setItem('og.node', S.node); else sessionStorage.removeItem('og.node'); } catch { /* private window */ }
+  S.info = null; S.containers = []; S.byId = new Map(); S.hist = []; S.chist = {}; S.stats = null;
+  connect();
+  api('/v1/info').then((i) => { S.info = i; paintInfo(); }).catch(() => {});
+  toast(S.node ? `Managing ${S.node}` : 'Managing this server');
+  route();
+}
+try { S.node = sessionStorage.getItem('og.node') || null; } catch { S.node = null; }
+
 // ---------------------------------------------------------------- shared with lab.js
 const H = {
   $, $$, esc, clamp, bytes, rate, pct, dur, now, ago, clock, parseSize, ic, ICONS, hydrateIcons, toast, api, S, ROUTES, SERVER_TABS,
-  setNav, route, modal, confirmBox, can, showMenu, spark, sparkPath, segOn, openDrawer, stateOf, lineDiff,
+  setNav, route, modal, confirmBox, can, apiPath, switchNode, showMenu, spark, sparkPath, segOn, openDrawer, stateOf, lineDiff,
   containerLogsHash: (c) => (S.lab ? `#logs/${encodeURIComponent(S.labHost)}/container/${encodeURIComponent(c.name)}` : `#logs/${c.id}`),
 };
 

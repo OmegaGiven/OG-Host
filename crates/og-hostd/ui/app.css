@@ -599,3 +599,12 @@ canvas.vnc:focus { box-shadow: 0 0 0 2px var(--accent); }
 .iso-up { display: flex; align-items: center; gap: 10px; }
 .iso-up .ghost-btn { cursor: pointer; }
 .set-card .kv b { font-family: inherit; text-align: right; }
+
+/* cluster */
+.node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 4px; }
+.node-card.offline { opacity: .7; }
+.node-card.sel { border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); }
+.node-card .ghost-btn { justify-self: start; }
+.host-chip.switch { cursor: pointer; }
+.host-chip.switch::after { content: " ▾"; color: var(--text-3); }
+.host-chip.remote { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }

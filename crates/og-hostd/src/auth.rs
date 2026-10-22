@@ -398,6 +398,9 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["backup", "jobs", ..] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
         ["restore"] => r("/storage".into(), "Backup.Restore"),
         ["tasks", ..] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
+        ["cluster", ..] => r("/nodes".into(), if get { "Cluster.Audit" } else { "Cluster.Modify" }),
+        // the node that does the work checks the actual route
+        ["nodes", ..] => None,
         ["vms"] | ["vms", "host"] => r("/vms".into(), if get { "VM.Audit" } else { "VM.Allocate" }),
         ["vms", n] => r(format!("/vms/{n}"), match *m { Method::GET | Method::HEAD => "VM.Audit", Method::DELETE => "VM.Allocate", _ => "VM.Config" }),
         ["vms", n, "vnc" | "console"] => r(format!("/vms/{n}"), "VM.Console"),
@@ -422,7 +425,9 @@ pub async fn guard(State(d): State<Arc<Daemon>>, mut req: Request<Body>, next: a
         return next.run(req).await;
     }
     let method = req.method().clone();
-    let w = match who(&d, req.headers(), &method) {
+    // from another cluster node (it checked the user, and its certificate was checked here)
+    let via_cluster = req.extensions().get::<crate::cluster::ClusterUser>().map(|c| c.0.clone());
+    let w = match via_cluster.map(|w| Ok(Some(w))).unwrap_or_else(|| who(&d, req.headers(), &method)) {
         Ok(w) => w,
         Err(msg) => return deny(if msg.starts_with("bad") { StatusCode::UNAUTHORIZED } else { StatusCode::FORBIDDEN }, msg),
     };

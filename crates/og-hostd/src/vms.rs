@@ -660,7 +660,9 @@ impl Vms {
         // boot order
         let bootidx = |id: &str| vm.boot.iter().position(|b| b == id).map(|i| format!(",bootindex={}", i + 1)).unwrap_or_default();
         let mut sata_port = 0;
-        let mut need_scsi = false;
+        if vm.disks.iter().any(|d| d.bus == "scsi") {
+            push(&["-device", "virtio-scsi-pci,id=scsi0"]);
+        }
         for d in &vm.disks {
             let path = self.disk_path(vm, d);
             let fmt = if path.extension().is_some_and(|e| e == "qcow2") { "qcow2" } else { "raw" };
@@ -673,7 +675,6 @@ impl Vms {
                 "virtio" => format!("virtio-blk-pci,drive=drive-{id},id={id}{serial}{}", bootidx(&d.id), id = d.id),
                 "nvme" => format!("nvme,drive=drive-{id},id={id}{serial}{}", bootidx(&d.id), id = d.id),
                 "scsi" => {
-                    need_scsi = true;
                     format!("scsi-hd,bus=scsi0.0,drive=drive-{id},id={id}{serial}{}{}", if d.ssd { ",rotation_rate=1" } else { "" }, bootidx(&d.id), id = d.id)
                 }
                 _ => {
@@ -684,9 +685,6 @@ impl Vms {
                 }
             };
             push(&["-device", &dev]);
-        }
-        if need_scsi {
-            push(&["-device", "virtio-scsi-pci,id=scsi0"]);
         }
         for (i, iso) in vm.cdroms.iter().enumerate() {
             let port = sata_port;

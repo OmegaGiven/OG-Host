@@ -140,7 +140,7 @@ async function tabSummary() {
 
 async function loadSerial() {
   try {
-    const r = await fetch(`/v1/vms/${encodeURIComponent(V.cur)}/console?bytes=20000`, { headers: { 'X-OG-UI': '1' } });
+    const r = await fetch(H.apiPath(`/v1/vms/${encodeURIComponent(V.cur)}/console?bytes=20000`), { headers: { 'X-OG-UI': '1' } });
     const t = await r.text();
     const el = $('#vmLog'); if (!el) return;
     el.textContent = t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '') || '(nothing yet)';
@@ -152,6 +152,13 @@ async function tabConsole() {
   const v = cur();
   if (v.state === 'stopped') {
     $('#vmBody').innerHTML = `<div class="empty">${ic('monitor')} The VM is off.${can('VM.PowerMgmt', V.cur) ? ` <button class="primary-btn" data-vact="start" data-n="${esc(V.cur)}">${ic('play')}Start</button>` : ''}</div>`;
+    H.hydrateIcons($('#vmBody'));
+    return;
+  }
+  if (S.node) {
+    const n = (await api('/v1/cluster').catch(() => ({ nodes: [] }))).nodes.find((x) => x.name === S.node);
+    const host = n && n.addr ? n.addr.replace(/:\d+$/, '') : S.node;
+    $('#vmBody').innerHTML = `<div class="empty">${ic('monitor')} The console opens on the node itself: <a href="https://${esc(host)}:8006/#vms/${encodeURIComponent(V.cur)}" target="_blank" rel="noopener">open ${esc(S.node)}'s console</a></div>`;
     H.hydrateIcons($('#vmBody'));
     return;
   }
@@ -279,7 +286,7 @@ async function uploadIso(file, box, f) {
   // XHR for upload progress (fetch has none)
   await new Promise((res) => {
     const x = new XMLHttpRequest();
-    x.open('PUT', `/v1/iso/${encodeURIComponent(name)}`);
+    x.open('PUT', H.apiPath(`/v1/iso/${encodeURIComponent(name)}`));
     x.setRequestHeader('X-OG-UI', '1');
     x.upload.onprogress = (e) => { if (e.lengthComputable) prog.textContent = `uploading ${name}: ${Math.round((e.loaded / e.total) * 100)}%`; };
     x.onload = () => {

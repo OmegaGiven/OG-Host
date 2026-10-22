@@ -640,6 +640,13 @@ pub async fn scheduler(d: Arc<Daemon>) {
                 }
             }
         }
+        for j in crate::cluster::sync_jobs_list(&d.root).into_iter().filter(|j| j.enabled) {
+            if due(&j.schedule) {
+                if let Err(e) = crate::cluster::start_sync(&d, j.clone(), "system") {
+                    eprintln!("og-hostd: sync job {}: {e:#}", j.id);
+                }
+            }
+        }
         for s in d.storage.list().into_iter().filter(|s| s.enabled && !s.gc_schedule.is_empty()) {
             if due(&s.gc_schedule) && !d.tasks.busy("gc", &s.id) {
                 let d2 = d.clone();

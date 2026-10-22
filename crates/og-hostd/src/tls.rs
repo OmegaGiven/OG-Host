@@ -53,7 +53,7 @@ pub fn cert_files(root: &Path, cert: Option<PathBuf>, key: Option<PathBuf>) -> R
     Ok(files)
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
     unsafe { libc::uname(&mut uts) };
     unsafe { std::ffi::CStr::from_ptr(uts.nodename.as_ptr()) }.to_string_lossy().into_owned()

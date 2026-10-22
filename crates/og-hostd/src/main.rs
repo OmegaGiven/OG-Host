@@ -6,6 +6,7 @@ mod backup;
 mod backup_api;
 mod brain;
 mod build;
+mod cluster;
 mod compose;
 mod containers;
 mod desktop;
@@ -183,6 +184,9 @@ enum Cmd {
         /// Also serve HTTPS on this address (e.g. 0.0.0.0:8006).
         #[arg(long)]
         listen_tls: Option<String>,
+        /// Port for other cluster nodes (mutual TLS; only open once in a cluster).
+        #[arg(long, default_value_t = cluster::DEFAULT_PORT)]
+        cluster_port: u16,
         /// PEM certificate for --listen-tls (default: self-signed, created in <root>/tls).
         #[arg(long)]
         tls_cert: Option<PathBuf>,
@@ -380,12 +384,12 @@ async fn main() -> Result<()> {
                 println!("OMEGA_HOST={host}");
             }
         },
-        Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key, lab } => {
+        Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key, lab, cluster_port } => {
             let tls = match listen_tls {
                 Some(addr) => Some((addr, tls::cert_files(&cli.root, tls_cert, tls_key)?)),
                 None => None,
             };
-            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label, tls, lab).await?;
+            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label, tls, lab, cluster_port).await?;
         }
         Cmd::Start { container } => {
             let m = node.find(&container)?;
