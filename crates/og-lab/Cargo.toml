@@ -1,0 +1,20 @@
+[package]
+name = "og-lab"
+description = "OG-Host lab control plane: fleet monitor, app tiles, metric history, logs, watches, install queue, OpenClaw bridge (OmegaEnv, in Rust)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+axum = "0.8"
+serde_yaml = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
+flate2.workspace = true

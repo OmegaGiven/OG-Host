@@ -76,6 +76,31 @@ const ICONS = {
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
   hdd: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 15h.01M3 12h18"/>',
   link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeoff: '<path d="M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3 3.9M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+  sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/>',
+  chevron: '<path d="m6 9 6 6 6-6"/>',
+  chevronr: '<path d="m9 6 6 6-6 6"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+  send: '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  pin: '<path d="M12 17v5M9 3h6l-1 6 4 4H6l4-4z"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+  servers: '<rect x="2" y="3" width="20" height="6" rx="1.5"/><rect x="2" y="15" width="20" height="6" rx="1.5"/><path d="M6 6h.01M6 18h.01M12 9v6"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
+  belloff: '<path d="M3 3l18 18M8.7 3.4A6 6 0 0 1 18 8c0 3 .7 5.2 1.5 6.7M17 17H3s3-2 3-9M13.7 21a2 2 0 0 1-3.4 0"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  down: '<path d="M12 5v14M19 12l-7 7-7-7"/>',
+  chart: '<path d="M3 3v18h18"/><path d="m7 15 4-5 3 3 5-6"/>',
+  thermo: '<path d="M14 14.8V5a2 2 0 0 0-4 0v9.8a4 4 0 1 0 4 0z"/>',
+  external: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  pause: '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>',
+  refresh: '<path d="M21 12a9 9 0 0 0-15-6.7L3 8"/><path d="M3 3v5h5M3 12a9 9 0 0 0 15 6.7L21 16"/><path d="M16 16h5v5"/>',
+  shieldok: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
+  note: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4M8 9h8M8 13h5"/>',
+  drag: '<circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/>',
+  mode: '<path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/>',
+  sleep: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
 };
 const ic = (n, cls = '') => `<svg class="i ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 function hydrateIcons(root = document) {
@@ -158,11 +183,24 @@ $('#loginForm').addEventListener('submit', async (ev) => {
 });
 
 let started = false;
-function startApp() {
+async function startApp() {
   $('#login').hidden = true;
   $('#app').hidden = false;
   connect();
-  if (!started) { started = true; route(); }
+  if (started) return;
+  started = true;
+  try {
+    const info = await api('/v1/info');
+    S.info = S.info || info;
+    S.lab = !!info.lab;
+    S.labHost = info.lab_host || info.hostname;
+  } catch { S.lab = false; }
+  if (S.lab) {
+    try { (await import('./lab.js')).init(H); }
+    catch (e) { console.error(e); S.lab = false; toast(`Lab UI failed to load: ${e.message}`, true); }
+  }
+  if (!S.lab) setNav(SERVER_TABS);
+  route();
 }
 
 // ---------------------------------------------------------------- live connection
@@ -216,15 +254,17 @@ function onStats() {
   else if (S.view === 'containers') paintContainerStats();
   else if (S.view === 'storage') paintDisks();
   if (S.drawer && S.drawerTab === 'info') paintDrawerLive();
+  if (H.onStats) H.onStats();
 }
 
 function onContainers() {
   const bad = S.containers.filter((c) => c.state === 'failed' || (c.oom_killed && c.state !== 'running')).length;
-  const b = $('#ctBadge'); b.hidden = !bad; b.textContent = bad;
+  const b = $('#ctBadge'); if (b) { b.hidden = !bad; b.textContent = bad; }
   if (S.view === 'containers') paintContainers();
   if (S.view === 'stacks') loadStacks();
-  if (S.view === 'logs') paintLogSources();
+  if (S.view === 'logs' || S.view === 'ctlogs') paintLogSources();
   if (S.view === 'overview') paintOverview();
+  if (H.onContainers) H.onContainers();
   if (S.drawer) {
     const c = S.byId.get(S.drawer);
     if (!c) closeDrawer(); else paintDrawerHead(c);
@@ -232,23 +272,41 @@ function onContainers() {
 }
 
 // ---------------------------------------------------------------- routing
-const VIEWS = ['overview', 'containers', 'stacks', 'images', 'storage', 'logs', 'vms'];
+// hash -> { el: section id, tab: highlighted top tab, run(arg) }. lab.js adds its own.
+const ROUTES = {
+  overview: { el: 'overview', tab: 'overview', run: () => { paintOverviewHead(); paintOverview(); paintBrain(); } },
+  containers: { el: 'containers', tab: 'containers', run: paintContainers },
+  stacks: { el: 'stacks', tab: 'stacks', run: () => loadStacks() },
+  images: { el: 'images', tab: 'images', run: () => loadImages() },
+  storage: { el: 'storage', tab: 'storage', run: () => { paintDisks(); loadStorage(); } },
+  logs: { el: 'logs', tab: 'logs', run: (arg) => { paintLogSources(); if (arg) openLog(arg); else if (S.log.id) openLog(S.log.id); } },
+  vms: { el: 'vms', tab: 'vms', run: () => {} },
+};
+const SERVER_TABS = [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['logs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs']];
+let NAV = SERVER_TABS;
+function defaultView() { return S.lab ? 'home' : 'overview'; }
+function setNav(tabs, sub) {
+  NAV = tabs;
+  $('#tabs').innerHTML = tabs.map(([id, icon, label]) => `<a href="#${id}" data-tab="${id}" class="tab">${ic(icon)}<span>${esc(label)}</span>${id === 'containers' || id === 'server' ? '<b class="tab-badge" id="ctBadge" hidden></b>' : ''}${id === 'monitor' ? '<b class="tab-badge" id="alertBadge" hidden></b>' : ''}${id === 'apps' ? '<b class="tab-badge info" id="queueBadge" hidden></b>' : ''}</a>`).join('');
+  $('#subnav').innerHTML = (sub || []).map(([id, icon, label]) => `<a href="#${id}" data-sub="${id}">${ic(icon)}<span>${esc(label)}</span></a>`).join('');
+}
+let curView = null;
 function route() {
   const h = location.hash.replace(/^#/, '');
-  const [view, arg] = h.split('/');
-  S.view = VIEWS.includes(view) ? view : 'overview';
-  for (const v of VIEWS) $(`#view-${v}`).hidden = v !== S.view;
-  for (const t of $$('.tab')) t.classList.toggle('active', t.dataset.tab === S.view);
+  const [view, ...rest] = h.split('/');
+  const name = ROUTES[view] ? view : defaultView();
+  const r = ROUTES[name];
+  const leaving = curView && curView !== name ? ROUTES[curView] : null;
+  if (leaving && leaving.leave) leaving.leave();
+  curView = name;
+  S.view = name;
+  for (const v of $$('main > .view')) v.hidden = v.id !== `view-${r.el}`;
+  for (const t of $$('#tabs .tab')) t.classList.toggle('active', t.dataset.tab === r.tab);
+  const sub = $('#subnav');
+  sub.hidden = !(S.lab && r.tab === 'server');
+  for (const a of $$('#subnav a')) a.classList.toggle('on', a.dataset.sub === name);
   if (S.view !== 'logs' && S.log.es) { S.log.es.close(); S.log.es = null; }
-  ({
-    overview: () => { paintOverviewHead(); paintOverview(); paintBrain(); },
-    containers: paintContainers,
-    stacks: loadStacks,
-    images: loadImages,
-    storage: () => { paintDisks(); loadStorage(); },
-    logs: () => { paintLogSources(); if (arg) openLog(arg); else if (S.log.id) openLog(S.log.id); },
-    vms: () => {},
-  })[S.view]();
+  r.run(rest.length ? rest.map(decodeURIComponent).join('/') : undefined, rest.map(decodeURIComponent));
 }
 window.addEventListener('hashchange', route);
 
@@ -566,7 +624,7 @@ async function containerAction(act, id, el) {
       .then(() => toast(act === 'minimal' ? `${c.name} minimized: a quarter core, memory held` : `${c.name} restored`))
       .catch((er) => toast(er.message, true));
   }
-  if (act === 'logs') { location.hash = `#logs/${id}`; return; }
+  if (act === 'logs') { location.hash = H.containerLogsHash(c); return; }
   el && el.classList.add('busy');
   toast(`${labels[act] || act} ${c.name}…`);
   try {
@@ -1022,7 +1080,7 @@ function paintLogSources() {
     `<div class="log-group">${esc(g)}</div>${groups[g].sort((a, b) => a.name.localeCompare(b.name)).map((c) => `<button class="log-src ${S.log.id === c.id ? 'sel' : ''}" data-log="${c.id}"><span class="dot dot-${stateOf(c).cls}"></span><span>${esc(c.name)}</span></button>`).join('')}`).join('') || '<p class="muted" style="padding:8px">No containers.</p>';
 }
 $('#logSrcQ').addEventListener('input', paintLogSources);
-$('#logSources').addEventListener('click', (e) => { const b = e.target.closest('[data-log]'); if (b) location.hash = `#logs/${b.dataset.log}`; });
+$('#logSources').addEventListener('click', (e) => { const b = e.target.closest('[data-log]'); if (b) location.hash = `#${S.lab ? 'ctlogs' : 'logs'}/${b.dataset.log}`; });
 function openLog(id) {
   const c = S.byId.get(id);
   if (S.log.es) S.log.es.close();
@@ -1073,7 +1131,8 @@ function openPalette() {
 function closePalette() { $('#palette').hidden = true; }
 function paintPalette() {
   const q = $('#paletteQ').value.toLowerCase().trim();
-  const pages = VIEWS.map((v) => ({ icon: { overview: 'grid', containers: 'box', stacks: 'layers', images: 'disc', storage: 'drive', logs: 'logs', vms: 'monitor' }[v], label: v[0].toUpperCase() + v.slice(1), hint: 'page', go: () => (location.hash = `#${v}`) }));
+  const pages = [...NAV, ...(S.lab ? SERVER_TABS.map(([id, i, l]) => [id === 'logs' ? 'ctlogs' : id, i, `${l} (this server)`]) : [])].filter(([id]) => id !== 'server').map(([id, icon, label]) => ({ icon, label, hint: 'page', go: () => (location.hash = `#${id}`) }));
+  const extra = H.paletteItems ? H.paletteItems(q) : [];
   const cts = S.containers.map((c) => ({ icon: 'box', label: c.name, hint: stateOf(c).text, go: () => openDrawer(c.id) }));
   const sts = stackCache.map((s) => ({ icon: 'layers', label: s.name, hint: 'stack', go: () => (location.hash = '#stacks') }));
   const acts = [
@@ -1081,7 +1140,7 @@ function paintPalette() {
     { icon: 'plus', label: 'New stack', hint: 'action', go: () => { location.hash = '#stacks'; openEditor(null); } },
     { icon: 'logout', label: 'Sign out', hint: 'action', go: signOut },
   ];
-  palItems = [...cts, ...sts, ...pages, ...acts].filter((x) => !q || x.label.toLowerCase().includes(q)).slice(0, 40);
+  palItems = [...extra, ...cts, ...sts, ...pages, ...acts].filter((x) => x.always || !q || x.label.toLowerCase().includes(q)).slice(0, 40);
   palSel = 0;
   $('#paletteList').innerHTML = palItems.map((x, i) => `<li data-i="${i}" class="${i === palSel ? 'sel' : ''}">${ic(x.icon)}<span>${esc(x.label)}</span><small>${esc(x.hint)}</small></li>`).join('') || '<li class="muted">Nothing found</li>';
 }
@@ -1110,5 +1169,12 @@ async function signOut() {
 $('#userBtn').addEventListener('click', (e) => {
   api('/v1/ui/me').then((m) => showMenu(e.currentTarget, [['user', `Signed in as ${m.user}`, () => {}], null, ['logout', 'Sign out', signOut]])).catch(() => {});
 });
+
+// ---------------------------------------------------------------- shared with lab.js
+const H = {
+  $, $$, esc, clamp, bytes, rate, pct, dur, now, ago, clock, parseSize, ic, ICONS, hydrateIcons, toast, api, S, ROUTES, SERVER_TABS,
+  setNav, route, modal, confirmBox, showMenu, spark, sparkPath, segOn, openDrawer, stateOf, lineDiff,
+  containerLogsHash: (c) => (S.lab ? `#logs/${encodeURIComponent(S.labHost)}/container/${encodeURIComponent(c.name)}` : `#logs/${c.id}`),
+};
 
 boot();

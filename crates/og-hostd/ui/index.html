@@ -28,23 +28,106 @@
   <a class="brand" href="#overview" aria-label="OG-Host overview">
     <span class="brand-mark"><b>OG</b><small>HOST</small></span><span class="brand-name">OG-Host</span><span class="host-chip" id="hostChip"></span>
   </a>
-  <nav class="tabs" id="tabs">
-    <a href="#overview" data-tab="overview" class="tab" data-icon="grid"><span>Overview</span></a>
-    <a href="#containers" data-tab="containers" class="tab" data-icon="box"><span>Containers</span><b class="tab-badge" id="ctBadge" hidden></b></a>
-    <a href="#stacks" data-tab="stacks" class="tab" data-icon="layers"><span>Stacks</span></a>
-    <a href="#images" data-tab="images" class="tab" data-icon="disc"><span>Images</span></a>
-    <a href="#storage" data-tab="storage" class="tab" data-icon="drive"><span>Storage</span></a>
-    <a href="#logs" data-tab="logs" class="tab" data-icon="logs"><span>Logs</span></a>
-    <a href="#vms" data-tab="vms" class="tab" data-icon="monitor"><span>VMs</span></a>
-  </nav>
+  <nav class="tabs" id="tabs"></nav>
   <div class="top-actions">
     <button class="search-trigger" id="searchBtn" title="Search (Ctrl K)"><i data-icon="search"></i><span>Search</span><kbd>Ctrl K</kbd></button>
+    <button class="icon-btn demo-btn" id="demoBtn" title="Demo mode" hidden data-icon="eye"><span class="demo-label">DEMO</span></button>
     <span class="live" id="live" title="Live connection"><span class="live-dot"></span></span>
+    <button class="claw-btn" id="clawBtn" title="Ask OpenClaw" hidden><span class="claw-ico" data-icon="sparkle"></span><span>OpenClaw</span></button>
     <button class="icon-btn" id="userBtn" title="Account" data-icon="user"></button>
   </div>
 </header>
 
 <main>
+  <nav class="subnav" id="subnav" hidden></nav>
+
+  <!-- HOME (lab) -->
+  <section id="view-home" class="view" hidden>
+    <div class="hero"><div><h1 id="greeting">Welcome home</h1><p class="hero-sub" id="heroSub"><span class="dot"></span> Checking your lab…</p></div></div>
+    <div class="group-head collapsible" data-hc="__widgets"><span class="chev" data-icon="chevron"></span><h2>At a glance</h2><span class="sp"></span><button class="link-btn" id="editLayout" data-icon="edit"> Edit layout</button><button class="link-btn" id="collapseAll">Collapse all</button></div>
+    <div class="widgets" id="homeWidgets"></div>
+    <div id="appGroups" class="app-groups"></div>
+    <button class="ghost-btn" id="toggleHidden" hidden></button>
+  </section>
+
+  <!-- MONITOR (lab) -->
+  <section id="view-monitor" class="view" hidden>
+    <div class="status-banner" id="banner"></div>
+    <div id="alerts" class="alerts"></div>
+    <div id="pveWrap" hidden><div class="section-head"><h2>Proxmox</h2><span class="muted" id="pveMeta"></span></div><div class="pve-grid" id="pveGrid"></div></div>
+    <div class="section-head"><h2>Machines</h2><span class="muted" id="hostsMeta"></span></div>
+    <div class="host-grid" id="hostGrid"></div>
+    <div class="two-col">
+      <div><div class="section-head"><h2>Storage</h2><span class="muted" id="storageMeta"></span></div><div class="panel" id="labStorage"></div></div>
+      <div><div class="section-head"><h2>Heaviest containers</h2><span class="muted">by memory, all machines</span></div><div class="panel" id="heavy"></div></div>
+    </div>
+    <div class="section-head"><h2>Apps</h2><span class="muted" id="appsMeta"></span></div>
+    <div class="panel table-wrap"><table class="table" id="appTable"></table></div>
+  </section>
+
+  <!-- EXPLORE (lab) -->
+  <section id="view-explore" class="view" hidden>
+    <div class="ex-bar">
+      <div class="ex-views"><select id="exView" title="Saved views"></select><button class="chip-btn" id="exSave" data-icon="check"> Save</button><button class="chip-btn" id="exDelete" data-icon="trash"></button></div>
+      <div class="seg seg-sm" id="exRanges"><button data-r="1h">1h</button><button data-r="6h">6h</button><button data-r="24h" class="on">24h</button><button data-r="7d">7d</button><button data-r="30d">30d</button><button data-r="1y">1y</button></div>
+      <div class="ex-custom"><input type="datetime-local" id="exFrom" title="From"><span class="muted">→</span><input type="datetime-local" id="exTo" title="To"></div>
+      <button class="chip-btn on" id="exAuto" title="Refresh every 30 s"><span class="live-dot"></span>Auto</button>
+    </div>
+    <div class="ex-builder">
+      <span class="muted">Add</span><select id="exHost"></select><select id="exMetric"></select><select id="exLabel"></select><span class="muted">to</span><select id="exTarget"></select>
+      <button class="primary-btn" id="exAdd" data-icon="plus"> Add</button><span class="muted ex-hint">Drag across a chart to zoom · double-click to zoom out</span>
+    </div>
+    <div class="ex-panels" id="exPanels"></div>
+    <p class="muted small" id="exFoot"></p>
+  </section>
+
+  <!-- WATCH (lab) -->
+  <section id="view-watch" class="view" hidden>
+    <div class="toolbar"><div><h1 class="inline">Watches</h1><p class="muted small" style="margin:4px 0 0;max-width:640px">OpenClaw opens each page in a real browser on schedule, answers your question, and OG-Host messages you on Signal when it matters — back in stock, a price drop, or a real change.</p></div><span class="sp"></span><button class="primary-btn" id="wNewBtn" data-icon="plus"> New watch</button></div>
+    <div id="watches" class="watches"></div>
+  </section>
+
+  <!-- APPS (lab) -->
+  <section id="view-apps" class="view" hidden>
+    <div class="toolbar">
+      <div class="seg" id="appsTabs"><button data-sub="installed" class="on" data-icon="layers"> Installed</button><button data-sub="add" data-icon="plus"> Add apps</button></div>
+      <span class="sp"></span>
+      <div id="installedTools" class="toolbar-inline"><div class="q"><span data-icon="search"></span><input id="projQ" placeholder="Find an app…" autocomplete="off"></div><select id="projHost"><option value="">All machines</option></select><label class="chk"><input type="checkbox" id="projStopped" checked> show stopped</label></div>
+      <label class="chk" id="addTools" hidden>Install on <select id="targetHost"></select></label>
+    </div>
+    <div class="section-head first" id="queueHead" hidden><h2>Waiting for you</h2><span class="muted" id="queueMeta"></span></div>
+    <div id="queue" class="queue"></div>
+    <div id="sub-installed"><div id="projects" class="projects"></div><details class="activity"><summary>Recent activity</summary><div id="activity"></div></details></div>
+    <div id="sub-add" hidden>
+      <p class="muted" style="margin:6px 0 0">Community containers from linuxserver.io. OpenClaw drafts the setup; nothing runs until you approve it.</p>
+      <div class="catalog-search"><span data-icon="search"></span><input id="catalogQ" placeholder="Search: photos, books, dns, vpn, wiki…" autocomplete="off"></div>
+      <div id="catalog" class="catalog"></div>
+    </div>
+  </section>
+
+  <!-- LOGS (lab: every machine) -->
+  <section id="view-labl" class="view" hidden>
+    <div class="logs-layout">
+      <aside class="log-side">
+        <div class="log-side-search"><span data-icon="search"></span><input id="llSrcQ" placeholder="Filter services…" autocomplete="off"></div>
+        <button class="log-src log-all" id="llAll"><span data-icon="globe"></span><span><b>All machines</b> <small class="muted">search everything</small></span></button>
+        <div id="llSources" class="log-sources"></div>
+        <p class="muted small log-stats" id="llStats"></p>
+      </aside>
+      <div class="log-main">
+        <div class="log-toolbar">
+          <div class="log-title" id="llTitle"></div>
+          <div class="seg seg-sm" id="llLevel"><button data-lv="all" class="on">All</button><button data-lv="warn">Warnings+</button><button data-lv="error">Errors</button></div>
+          <div class="q"><span data-icon="filter"></span><input id="llQ" placeholder="Find text…" autocomplete="off"></div>
+          <select id="llHours" title="Look back"><option value="1">1 h</option><option value="6" selected>6 h</option><option value="24">24 h</option><option value="72">3 days</option><option value="168">7 days</option><option value="336">14 days</option></select>
+          <button class="chip-btn on" id="llLive" title="Follow new lines"><span class="live-dot"></span>Live</button>
+          <button class="chip-btn" id="llAsk" title="Ask OpenClaw about these lines" data-icon="sparkle"> Ask</button>
+        </div>
+        <div class="log-lines wrap" id="llLines"></div>
+      </div>
+    </div>
+  </section>
+
   <!-- OVERVIEW -->
   <section id="view-overview" class="view">
     <div class="hero">
@@ -169,6 +252,17 @@
   </div>
   <div class="seg seg-sm drawer-tabs" id="drTabs"><button data-dt="info" class="on">Overview</button><button data-dt="logs">Logs</button><button data-dt="res">Resources</button><button data-dt="inspect">Inspect</button></div>
   <div class="drawer-body" id="drBody"></div>
+</aside>
+
+<!-- OpenClaw drawer -->
+<aside class="drawer chat-drawer" id="claw" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="drawer-title"><span class="claw-avatar" data-icon="sparkle"></span><div><b>OpenClaw</b><small id="clawState">local agent on station</small></div></div>
+    <div class="drawer-actions"><button class="icon-btn" id="clawNew" title="New conversation" data-icon="restart"></button><button class="icon-btn" id="clawClose" title="Close" data-icon="x"></button></div>
+  </div>
+  <div class="chat" id="chat"></div>
+  <div class="chat-suggest" id="chatSuggest"></div>
+  <form class="chat-input" id="chatForm"><textarea id="chatText" rows="1" placeholder="Ask OpenClaw to install, explain or automate something…"></textarea><button type="submit" class="send" title="Send" data-icon="send"></button></form>
 </aside>
 
 <!-- modal -->

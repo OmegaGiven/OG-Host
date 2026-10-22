@@ -32,6 +32,9 @@ pub struct Daemon {
     pub brain: Mutex<crate::brain::Brain>,
     pub hub: crate::stats::Hub,
     pub sessions: crate::ui::Sessions,
+    /// The lab control plane, when enabled (--lab).
+    pub lab: Option<Arc<og_lab::Lab>>,
+    log_shipper: crate::labnode::LogShipper,
 }
 
 #[derive(Debug, Clone)]
@@ -105,9 +108,15 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
     Ok(())
 }
 
-pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>, lab: bool) -> Result<()> {
+    let lab = if lab { Some(og_lab::Lab::open(&root.join("lab")).await.context("starting the lab control plane")?) } else { None };
     let token = if listen.is_some() || tls.is_some() { Some(load_or_create_token(&root)?) } else { None };
-    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::ui::Sessions::load(&root) });
+    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::ui::Sessions::load(&root), lab: lab.clone(), log_shipper: Default::default() });
+    if let Some(l) = &lab {
+        l.set_local(Arc::new(crate::labnode::LabNode { d: app.clone() }));
+        eprintln!("og-hostd: lab control plane on (data in {})", root.join("lab").display());
+    }
 
     // supervisor + health loop
     {
@@ -176,8 +185,18 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/stacks/down", post(stack_down))
         .with_state(app.clone())
         // the Docker Engine API too (images, networks, volumes, exec, ...), for the UI
-        .nest("/v1/docker", crate::dockerapi::router(crate::dockerapi::Ctx { d: app.clone(), scope: None }))
-        .fallback(crate::ui::asset);
+        .nest("/v1/docker", crate::dockerapi::router(crate::dockerapi::Ctx { d: app.clone(), scope: None }));
+    // lab API (OmegaEnv paths): who's calling goes into the request for its handlers; root on
+    // the unix socket is admin
+    let (router, unix_router) = match &lab {
+        Some(l) => (
+            router.clone().merge(og_lab::http::router(l.clone()).layer(axum::middleware::from_fn_with_state(app.clone(), crate::ui::lab_caller))),
+            router.merge(og_lab::http::router(l.clone()).layer(axum::Extension(og_lab::Caller::Admin))),
+        ),
+        None => (router.clone(), router),
+    };
+    let router = router.fallback(crate::ui::asset);
+    let unix_router = unix_router.fallback(crate::ui::asset);
 
     // unix socket, root-only
     let sock = PathBuf::from("/run/og-host/api.sock");
@@ -208,10 +227,11 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         let scope = crate::dockerapi::Scope { name: name.into(), key: key.into(), value: value.into(), labels };
         spawn_docker_socket(app.clone(), PathBuf::from(format!("/run/og-host/docker-{name}.sock")), Some(scope))?;
     }
-    let unix_router = router.clone();
+
     let unix_task = tokio::spawn(async move { axum::serve(unix, unix_router).await });
 
-    let authed = router.layer(axum::middleware::from_fn_with_state(app.clone(), crate::ui::guard));
+    // gzip JSON responses (event streams and pre-compressed assets are left alone)
+    let authed = router.layer(axum::middleware::from_fn_with_state(app.clone(), crate::ui::guard)).layer(tower_http::compression::CompressionLayer::new());
     if let Some((addr, files)) = tls {
         let r = authed.clone();
         tokio::spawn(async move {
@@ -244,6 +264,11 @@ impl Daemon {
         self.hub.publish("stats", json!({ "stats": snap, "gpus": gpus }).to_string());
         let containers: Vec<serde_json::Value> = list.iter().filter_map(|(m, _)| self.container_json(&m.id)).collect();
         self.hub.publish_if_changed("containers", serde_json::to_string(&containers).unwrap_or_default());
+        if let Some(lab) = &self.lab {
+            if let Some(host) = lab.local_name() {
+                self.log_shipper.ship(self, lab, &host);
+            }
+        }
     }
 
     fn think(&self) {
@@ -368,7 +393,7 @@ impl Daemon {
         }
     }
 
-    fn container_json(&self, id: &str) -> Option<serde_json::Value> {
+    pub(crate) fn container_json(&self, id: &str) -> Option<serde_json::Value> {
         let (m, st) = self.node.list().ok()?.into_iter().find(|(m, _)| m.id == id)?;
         let health = self.health.lock().unwrap().get(id).cloned();
         Some(json!({
@@ -433,7 +458,10 @@ fn brain_json(app: &Daemon) -> serde_json::Value {
 // ---- UI support ---------------------------------------------------------------------------
 
 async fn info(State(app): State<App>) -> Json<serde_json::Value> {
-    Json(crate::stats::node_info(&app.root))
+    let mut v = crate::stats::node_info(&app.root);
+    v["lab"] = json!(app.lab.is_some());
+    v["lab_host"] = json!(app.lab.as_ref().and_then(|l| l.local_name()));
+    Json(v)
 }
 
 fn sse_event(name: &str, data: &str) -> axum::response::sse::Event {

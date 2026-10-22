@@ -51,6 +51,7 @@ static ASSETS: LazyLock<HashMap<&'static str, Asset>> = LazyLock::new(|| {
         asset!("index.html", "text/html; charset=utf-8"),
         asset!("app.css", "text/css; charset=utf-8"),
         asset!("app.js", "text/javascript; charset=utf-8"),
+        asset!("lab.js", "text/javascript; charset=utf-8"),
         asset!("favicon.svg", "image/svg+xml"),
     ]
     .into_iter()
@@ -388,6 +389,49 @@ fn bearer_ok(d: &Daemon, headers: &HeaderMap) -> bool {
     !want.is_empty() && got.len() == want.len() && got.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
+/// A change made with a session cookie must carry X-OG-UI: 1 and, when the browser sends an
+/// Origin, come from this site.
+fn csrf_ok(headers: &HeaderMap) -> bool {
+    if headers.get("x-og-ui").and_then(|v| v.to_str().ok()) != Some("1") {
+        return false;
+    }
+    if let (Some(origin), Some(host)) = (headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()), headers.get(header::HOST).and_then(|v| v.to_str().ok())) {
+        let o = origin.split("://").nth(1).unwrap_or(origin);
+        if o != host && headers.get("x-forwarded-host").and_then(|v| v.to_str().ok()) != Some(o) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Who is calling the lab API: its own tokens (admin key, API token, agent token), this
+/// server's bearer token, or a signed-in session (changes need the CSRF header).
+pub async fn lab_caller(State(d): State<Arc<Daemon>>, mut req: Request<Body>, next: axum::middleware::Next) -> Response {
+    let headers = req.headers();
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-omega-key").and_then(|v| v.to_str().ok()))
+        .unwrap_or("")
+        .to_string();
+    let mut caller = match &d.lab {
+        Some(l) if !token.is_empty() => l.caller_for_token(&token),
+        _ => og_lab::Caller::Anonymous,
+    };
+    if caller == og_lab::Caller::Anonymous && bearer_ok(&d, headers) {
+        caller = og_lab::Caller::Admin;
+    }
+    if caller == og_lab::Caller::Anonymous && cookie_token(headers).and_then(|t| d.sessions.check(&d.root, &t)).is_some() {
+        let safe = matches!(*req.method(), Method::GET | Method::HEAD);
+        if safe || csrf_ok(headers) {
+            caller = og_lab::Caller::Admin;
+        }
+    }
+    req.extensions_mut().insert(caller);
+    next.run(req).await
+}
+
 /// TCP listener auth: the UI's own assets and sign-in are public; everything else needs the
 /// bearer token or a session (plus the CSRF header for changes).
 pub async fn guard(State(d): State<Arc<Daemon>>, req: Request<Body>, next: axum::middleware::Next) -> Response {
@@ -404,16 +448,8 @@ pub async fn guard(State(d): State<Arc<Daemon>>, req: Request<Body>, next: axum:
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "sign in first"}))).into_response();
     };
     let safe = matches!(*req.method(), Method::GET | Method::HEAD);
-    if !safe {
-        if headers.get("x-og-ui").and_then(|v| v.to_str().ok()) != Some("1") {
-            return (StatusCode::FORBIDDEN, Json(json!({"error": "missing X-OG-UI header"}))).into_response();
-        }
-        if let (Some(origin), Some(host)) = (headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()), headers.get(header::HOST).and_then(|v| v.to_str().ok())) {
-            let o = origin.split("://").nth(1).unwrap_or(origin);
-            if o != host && headers.get("x-forwarded-host").and_then(|v| v.to_str().ok()) != Some(o) {
-                return (StatusCode::FORBIDDEN, Json(json!({"error": "cross-origin request refused"}))).into_response();
-            }
-        }
+    if !safe && !csrf_ok(headers) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "missing X-OG-UI header or cross-origin request"}))).into_response();
     }
     next.run(req).await
 }

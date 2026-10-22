@@ -7,6 +7,7 @@ mod containers;
 mod desktop;
 mod dockerapi;
 mod idmap;
+mod labnode;
 mod resources;
 mod serve;
 mod stacks;
@@ -28,6 +29,22 @@ struct Cli {
     root: PathBuf,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum LabCmd {
+    /// Copy an OmegaEnv data directory (apps, groups, checks, hosts, watches, queue, ...)
+    /// into <root>/lab. With --env, its .env becomes config.json.
+    Import {
+        from: PathBuf,
+        #[arg(long)]
+        env: Option<PathBuf>,
+        /// Also take its secrets (agent/API tokens), so existing agents keep working.
+        #[arg(long)]
+        with_secrets: bool,
+    },
+    /// Print the settings an omega-agent needs to report to this server.
+    Agent { host: String },
 }
 
 #[derive(Subcommand)]
@@ -125,6 +142,11 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
+    /// Lab control plane maintenance.
+    Lab {
+        #[command(subcommand)]
+        cmd: LabCmd,
+    },
     /// Run the node daemon: API, restart policies, health monitoring.
     Serve {
         /// Also listen on TCP (e.g. 127.0.0.1:8411); requires the bearer token.
@@ -138,6 +160,10 @@ enum Cmd {
         /// wolf:og.profile=desktop. Repeatable.
         #[arg(long = "scope-label")]
         scope_label: Vec<String>,
+        /// Run the lab control plane too (OmegaEnv: fleet monitor, app tiles, metrics,
+        /// logs, watches, install queue, OpenClaw); data in <root>/lab.
+        #[arg(long)]
+        lab: bool,
         /// Also serve HTTPS on this address (e.g. 0.0.0.0:8006).
         #[arg(long)]
         listen_tls: Option<String>,
@@ -305,12 +331,27 @@ async fn main() -> Result<()> {
                 println!("account {user} saved; sign in on the web UI");
             }
         }
-        Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key } => {
+        Cmd::Lab { cmd } => match cmd {
+            LabCmd::Import { from, env, with_secrets } => {
+                let done = og_lab::import_omegaenv(&from, env.as_deref(), &cli.root.join("lab"), with_secrets)?;
+                println!("imported into {}: {}", cli.root.join("lab").display(), done.join(", "));
+                println!("metrics.db and the log directory are used where config.json points (copy them into {} to move them)", cli.root.join("lab").display());
+            }
+            LabCmd::Agent { host } => {
+                std::fs::create_dir_all(cli.root.join("lab"))?;
+                let lab = og_lab::Lab::open(&cli.root.join("lab")).await?;
+                println!("# omega-agent settings for {host} (put in ~/.config/omegaenv/agent.env or the unit's EnvironmentFile)");
+                println!("OMEGA_URL=https://<this-server>:8006");
+                println!("OMEGA_TOKEN={}", lab.secrets.agent_token);
+                println!("OMEGA_HOST={host}");
+            }
+        },
+        Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key, lab } => {
             let tls = match listen_tls {
                 Some(addr) => Some((addr, tls::cert_files(&cli.root, tls_cert, tls_key)?)),
                 None => None,
             };
-            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label, tls).await?;
+            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label, tls, lab).await?;
         }
         Cmd::Start { container } => {
             let m = node.find(&container)?;
