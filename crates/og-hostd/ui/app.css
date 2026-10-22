@@ -562,3 +562,7 @@ details summary { cursor: pointer; color: var(--text-3); font-size: 12.5px; }
 .qr svg { width: 220px; height: 220px; display: block; }
 pre.secret { font: 13px/1.6 var(--mono); background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; word-break: break-all; user-select: all; margin: 0; }
 .table td.wrap { white-space: normal; }
+.fw-pending { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.fw-opts { margin-top: 4px; }
+.fw-script { margin-top: 14px; }
+.table tr.off td { opacity: .55; }

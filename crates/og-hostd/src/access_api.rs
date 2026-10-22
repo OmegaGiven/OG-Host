@@ -374,3 +374,62 @@ async fn me_sessions(State(d): D, Extension(w): Extension<Who>, headers: HeaderM
 async fn me_session_end(State(d): D, Extension(w): Extension<Who>, Path(id): Path<String>) -> Response {
     if d.sessions.revoke(w.user(), &id) { Json(json!({"ok": true})).into_response() } else { bad("no such session") }
 }
+
+// ---- host firewall (Sys.Audit / Sys.Modify on /system, from auth::rule) ----
+
+pub fn firewall_router(d: Arc<Daemon>) -> Router {
+    Router::new()
+        .route("/v1/firewall", get(fw_get).put(fw_put))
+        .route("/v1/firewall/confirm", post(fw_confirm))
+        .route("/v1/firewall/rollback", post(fw_rollback))
+        .with_state(d)
+}
+
+async fn fw_get(State(d): D) -> Json<Value> {
+    Json(d.firewall.status())
+}
+
+#[derive(Deserialize)]
+struct FwReq {
+    config: crate::firewall::Config,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn fw_put(State(d): D, Extension(w): Extension<Who>, conn: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>, tls: Option<Extension<crate::tls::Secure>>, uri: axum::http::Uri, headers: HeaderMap, Json(b): Json<FwReq>) -> Response {
+    // the address the rules see: a local proxy (tailscale serve) comes in over loopback
+    let ip = conn.map(|c| c.0 .0.ip());
+    // HTTP/2 carries the port in the URI (:authority), HTTP/1 in Host
+    let port = uri
+        .port_u16()
+        .or_else(|| headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()).and_then(|h| h.parse::<axum::http::uri::Authority>().ok()).and_then(|a| a.port_u16()))
+        .unwrap_or(if tls.is_some() { 443 } else { 80 });
+    let d2 = d.clone();
+    match tokio::task::spawn_blocking(move || d2.firewall.apply(b.config, ip, port, b.force)).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+        Ok(generation) => {
+            let d3 = d.clone();
+            let who = w.label();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(crate::firewall::CONFIRM_SECS)).await;
+                let d4 = d3.clone();
+                if let Ok(Ok(true)) = tokio::task::spawn_blocking(move || d4.firewall.rollback(Some(generation))).await {
+                    d3.access.audit("system", "", "firewall rolled back (not confirmed)", &who, true);
+                    eprintln!("og-hostd: firewall change not confirmed in time: rolled back");
+                }
+            });
+            Json(json!({"ok": true, "confirm_within": crate::firewall::CONFIRM_SECS})).into_response()
+        }
+        Err(e) => bad(e),
+    }
+}
+
+async fn fw_confirm(State(d): D) -> Response {
+    done(d.firewall.confirm())
+}
+
+async fn fw_rollback(State(d): D) -> Response {
+    match d.firewall.rollback(None) {
+        Ok(r) => Json(json!({"ok": true, "rolled_back": r})).into_response(),
+        Err(e) => bad(e),
+    }
+}

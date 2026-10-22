@@ -33,6 +33,7 @@ pub struct Daemon {
     pub hub: crate::stats::Hub,
     pub sessions: crate::auth::Sessions,
     pub access: og_access::Access,
+    pub firewall: crate::firewall::Firewall,
     /// The lab control plane, when enabled (--lab).
     pub lab: Option<Arc<og_lab::Lab>>,
     log_shipper: crate::labnode::LogShipper,
@@ -113,7 +114,7 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
 pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>, lab: bool) -> Result<()> {
     let lab = if lab { Some(og_lab::Lab::open(&root.join("lab")).await.context("starting the lab control plane")?) } else { None };
     let token = if listen.is_some() || tls.is_some() { Some(load_or_create_token(&root)?) } else { None };
-    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::auth::Sessions::load(&root), access: og_access::Access::open(&root), lab: lab.clone(), log_shipper: Default::default() });
+    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::auth::Sessions::load(&root), access: og_access::Access::open(&root), firewall: crate::firewall::Firewall::open(&root, [listen.as_deref(), tls.as_ref().map(|t| t.0.as_str())].into_iter().flatten().filter_map(|a| a.rsplit_once(':').and_then(|(_, p)| p.parse().ok())).collect()), lab: lab.clone(), log_shipper: Default::default() });
     if let Some(l) = &lab {
         l.set_local(Arc::new(crate::labnode::LabNode { d: app.clone() }));
         eprintln!("og-hostd: lab control plane on (data in {})", root.join("lab").display());
@@ -187,6 +188,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/stacks/down", post(stack_down))
         .with_state(app.clone())
         .merge(crate::access_api::router(app.clone()))
+        .merge(crate::access_api::firewall_router(app.clone()))
         // the Docker Engine API too (images, networks, volumes, exec, ...), for the UI
         .nest("/v1/docker", crate::dockerapi::router(crate::dockerapi::Ctx { d: app.clone(), scope: None }));
     // lab API (OmegaEnv paths): who's calling goes into the request for its handlers; root on

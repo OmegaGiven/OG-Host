@@ -10,6 +10,7 @@ const TABS = [
   ['acl', 'shieldok', 'Permissions', 'Access.Audit'],
   ['tokens', 'link', 'API tokens', 'Access.Audit'],
   ['audit', 'note', 'Audit log', 'Access.Audit'],
+  ['firewall', 'shield', 'Firewall', 'Sys.Audit', '/system'],
 ];
 let cur = 'account';
 
@@ -27,13 +28,13 @@ const form = (f) => Object.fromEntries(new FormData(f).entries());
 const fail = (e) => toast(e.message, true);
 
 function open(tab) {
-  const tabs = TABS.filter((t) => !t[3] || H.can(t[3], '/access'));
+  const tabs = TABS.filter((t) => !t[3] || H.can(t[3], t[4] || '/access'));
   cur = tabs.some((t) => t[0] === tab) ? tab : 'account';
   $('#setTabs').innerHTML = tabs.map(([id, icon, label]) => `<button data-t="${id}" class="${id === cur ? 'on' : ''}">${ic(icon)}${esc(label)}</button>`).join('');
   $('#setTabs').hidden = tabs.length < 2;
   $('#setMeta').textContent = S.me ? `signed in as ${S.me.user}` : '';
   $('#setBody').innerHTML = '<p class="muted">Loading…</p>';
-  ({ account, users, groups, roles, acl, tokens, audit })[cur]().catch(fail);
+  ({ account, users, groups, roles, acl, tokens, audit, firewall })[cur]().catch(fail);
 }
 const again = () => open(cur);
 
@@ -266,4 +267,92 @@ async function audit() {
   H.hydrateIcons($('#setBody'));
   $('#auForm').onsubmit = (e) => { e.preventDefault(); auditQ = $('#auQ').value.trim(); audit().catch(fail); };
   onClick({});
+}
+
+// ---------------------------------------------------------------- host firewall
+let fw = null; // working copy (unsaved edits while fwDirty)
+let fwDirty = false;
+let fwTimer = null;
+async function firewall() {
+  const st = await api('/v1/firewall');
+  if (!fw || !fwDirty) fw = structuredClone(st.config);
+  const edit = H.can('Sys.Modify', '/system');
+  const dis = edit ? '' : 'disabled';
+  const ruleRow = (r, i) => `<tr class="${r.enabled ? '' : 'off'}">
+    <td class="num">${i + 1}</td>
+    <td><span class="chip ${r.action === 'accept' ? 'good' : 'crit'}">${esc(r.action)}</span></td>
+    <td>${esc(r.proto || 'any')}</td><td class="addr">${esc(r.dport || 'any')}</td><td class="addr">${esc(r.source || 'anywhere')}</td><td class="addr">${esc(r.iface || 'any')}</td>
+    <td>${esc(r.comment)}${r.enabled ? '' : ' <span class="chip">off</span>'}</td>
+    <td>${edit ? `<div class="row-actions">${rowBtn(`data-fup="${i}"`, 'up', 'Move up')}${rowBtn(`data-fdown="${i}"`, 'down', 'Move down')}${rowBtn(`data-fedit="${i}"`, 'edit', 'Edit')}${rowBtn(`data-fdel="${i}"`, 'trash', 'Remove', 'stop')}</div>` : ''}</td></tr>`;
+  $('#setBody').innerHTML = `
+    ${st.pending ? `<div class="status-banner warn fw-pending"><b>${ic('alert')} New firewall rules are on trial.</b> They go back in <b id="fwLeft">${st.pending.seconds_left}</b> s unless you keep them. <span class="sp"></span><button class="ghost-btn" id="fwUndo">Undo now</button><button class="primary-btn" id="fwKeep">${ic('check')}Keep</button></div>` : ''}
+    <div class="panel set-card">
+      <h3>${ic('shield')}Host firewall ${st.config.enabled ? '<span class="chip good">on</span>' : '<span class="chip warn">off</span>'}</h3>
+      <p class="muted">Controls what can reach this server. SSH and the web UI (ports ${st.management_ports.join(', ')}) always stay open to the management networks, and changes go back by themselves after ${60} s unless you keep them, so you can't lock yourself out. Published container ports are not filtered here.</p>
+      <div class="form fw-opts">
+        <label class="check"><input type="checkbox" id="fwOn" ${fw.enabled ? 'checked' : ''} ${dis}> Firewall on</label>
+        <div class="row2">
+          <label>Everything else<select id="fwPolicy" ${dis}><option value="drop">drop (silently)</option><option value="reject">reject (refuse)</option><option value="accept">accept</option></select></label>
+          <label>Management networks <span class="muted small">one per line, empty = anywhere</span><textarea id="fwMgmt" rows="2" placeholder="192.168.0.0/24&#10;100.64.0.0/10" ${dis}>${esc(fw.management.join('\n'))}</textarea></label>
+        </div>
+        <label class="check"><input type="checkbox" id="fwPing" ${fw.allow_ping ? 'checked' : ''} ${dis}> Answer ping</label>
+        <label class="check"><input type="checkbox" id="fwCtr" ${fw.allow_containers ? 'checked' : ''} ${dis}> Containers may reach services on this server</label>
+      </div>
+    </div>
+    ${fwDirty ? `<p class="chip warn fw-dirty">Unsaved changes: press Apply</p>` : ''}
+    ${head('Rules', edit ? `<button class="ghost-btn" id="fwAdd">${ic('plus')}Add rule</button><button class="primary-btn" id="fwApply">${ic('check')}Apply</button>` : '')}
+    <p class="muted small">Checked top to bottom; the first rule that matches decides. Tailscale works without a rule; add <code>udp 41641</code> for direct connections.</p>
+    ${table(['#', 'Action', 'Protocol', 'Ports', 'From', 'Interface', 'Comment', ''], fw.rules.map(ruleRow), 'No rules: only the always-allowed traffic gets in.')}
+    <details class="fw-script"><summary class="muted small">nftables rules now in force</summary><pre class="secret">${esc(st.script)}</pre></details>`;
+  $('#fwPolicy').value = fw.policy;
+  H.hydrateIcons($('#setBody'));
+  const sync = () => {
+    fwDirty = true;
+    fw.enabled = $('#fwOn').checked; fw.policy = $('#fwPolicy').value; fw.allow_ping = $('#fwPing').checked; fw.allow_containers = $('#fwCtr').checked;
+    fw.management = $('#fwMgmt').value.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+  };
+  clearInterval(fwTimer);
+  if (st.pending) {
+    let left = st.pending.seconds_left;
+    fwTimer = setInterval(() => { left -= 1; const el = $('#fwLeft'); if (!el || left < 0) { clearInterval(fwTimer); if (el) again(); return; } el.textContent = left; }, 1000);
+  }
+  const ruleModal = (i) => {
+    const r = i === null ? { enabled: true, action: 'accept', proto: 'tcp', dport: '', source: '', iface: '', comment: '' } : fw.rules[i];
+    formModal(i === null ? 'Add rule' : `Rule ${i + 1}`, 'shield', `
+      <div class="row2"><label>Action<select name="action">${['accept', 'drop', 'reject'].map((a) => `<option ${r.action === a ? 'selected' : ''}>${a}</option>`).join('')}</select></label>
+      <label>Protocol<select name="proto">${[['tcp', 'TCP'], ['udp', 'UDP'], ['tcp/udp', 'TCP and UDP'], ['icmp', 'ICMP (ping)'], ['', 'any']].map(([v, l]) => `<option value="${v}" ${r.proto === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+      <div class="row2"><label>Ports <span class="muted small">e.g. 80,443 or 9000-9100</span><input name="dport" value="${esc(r.dport)}"></label>
+      <label>From <span class="muted small">address or CIDR, empty = anywhere</span><input name="source" value="${esc(r.source)}" placeholder="192.168.0.0/24"></label></div>
+      <div class="row2"><label>Interface <span class="muted small">optional, e.g. eth0, tailscale0</span><input name="iface" value="${esc(r.iface)}"></label>
+      <label>Comment<input name="comment" value="${esc(r.comment)}" maxlength="64"></label></div>
+      <label class="check"><input type="checkbox" name="enabled" ${r.enabled ? 'checked' : ''}> Rule on</label>`, (v, f) => {
+      sync();
+      const nr = { action: v.action, proto: v.proto, dport: v.dport.trim(), source: v.source.trim(), iface: v.iface.trim(), comment: v.comment, enabled: f.enabled.checked };
+      if (i === null) fw.rules.push(nr); else fw.rules[i] = nr;
+      firewall().catch(fail);
+    }, { ok: i === null ? 'Add' : 'Save', wide: true });
+  };
+  const move = (i, d) => { sync(); const j = i + d; if (j < 0 || j >= fw.rules.length) return; [fw.rules[i], fw.rules[j]] = [fw.rules[j], fw.rules[i]]; firewall().catch(fail); };
+  const apply = async (force = false) => {
+    sync();
+    try {
+      await api('/v1/firewall', { method: 'PUT', body: { config: fw, force } });
+      fwDirty = false;
+      toast('Applied. Check that everything still works, then press Keep.');
+      again();
+    } catch (e) {
+      if (/would block you/.test(e.message) && await H.confirmBox('You would be locked out', `${e.message}. Apply anyway? It goes back by itself in 60 s if you can't reach the server.`, 'Apply anyway')) apply(true);
+      else if (!/would block you/.test(e.message)) fail(e);
+    }
+  };
+  onClick({
+    '#fwAdd': () => ruleModal(null),
+    '#fwApply': () => apply(false),
+    '#fwKeep': () => api('/v1/firewall/confirm', { method: 'POST' }).then(() => { toast('Firewall rules kept'); fw = null; fwDirty = false; again(); }, fail),
+    '#fwUndo': () => api('/v1/firewall/rollback', { method: 'POST' }).then(() => { toast('Put back the previous rules'); fw = null; fwDirty = false; again(); }, fail),
+    '[data-fedit]': (el) => { sync(); ruleModal(+el.dataset.fedit); },
+    '[data-fup]': (el) => move(+el.dataset.fup, -1),
+    '[data-fdown]': (el) => move(+el.dataset.fdown, 1),
+    '[data-fdel]': (el) => { sync(); fw.rules.splice(+el.dataset.fdel, 1); firewall().catch(fail); },
+  });
 }

@@ -8,6 +8,7 @@ mod compose;
 mod containers;
 mod desktop;
 mod dockerapi;
+mod firewall;
 mod idmap;
 mod labnode;
 mod resources;
