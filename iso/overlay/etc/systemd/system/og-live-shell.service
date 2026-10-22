@@ -1,0 +1,16 @@
+[Unit]
+Description=Root shell on tty2 while installing
+ConditionKernelCommandLine=og.installer
+Conflicts=getty@tty2.service
+After=systemd-user-sessions.service
+
+[Service]
+ExecStart=-/sbin/agetty --autologin root --noclear tty2 linux
+Restart=always
+UtmpIdentifier=tty2
+TTYPath=/dev/tty2
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=multi-user.target

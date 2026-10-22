@@ -16,6 +16,7 @@ mod dockerapi;
 mod firewall;
 mod ha;
 mod hostnet;
+mod installer;
 mod idmap;
 mod labnode;
 mod migrate;
@@ -168,6 +169,12 @@ enum Cmd {
         #[arg(long)]
         reset_tfa: bool,
     },
+    /// Install OG-Host on a disk (on the install ISO's console). `--auto FILE` (or `og.auto=FILE`
+    /// on the kernel command line) answers from a file instead of asking.
+    Installer {
+        #[arg(long)]
+        auto: Option<PathBuf>,
+    },
     /// Make releases (for publishers): keygen DIR, make ...
     Release {
         #[command(subcommand)]
@@ -316,6 +323,7 @@ async fn main() -> Result<()> {
             update::guard(&cli.root);
             return Ok(());
         }
+        Cmd::Installer { auto } => return installer::run(auto.clone()),
         Cmd::Release { cmd: ReleaseCmd::Keygen { dir } } => return release::keygen(dir),
         Cmd::Release { cmd: ReleaseCmd::Make { version, channel, notes, key, mirror, bins, arch, url } } => {
             return release::make(&release::MakeOpts { version: version.clone(), channel: channel.clone(), notes: notes.clone(), key: key.clone(), mirror: mirror.clone(), bins: bins.clone(), arch: arch.clone(), url: url.clone() })
@@ -445,7 +453,7 @@ async fn main() -> Result<()> {
                 println!("account {id} saved; sign in on the web UI");
             }
         }
-        Cmd::Release { .. } | Cmd::UpdateGuard => unreachable!("handled before the store opens"),
+        Cmd::Release { .. } | Cmd::UpdateGuard | Cmd::Installer { .. } => unreachable!("handled before the store opens"),
         Cmd::Mirror { cmd } => match cmd {
             MirrorCmd::Sync { url, dir } => release::sync(&cli.root, &url, &dir).await?,
         },

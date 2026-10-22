@@ -1,8 +1,8 @@
 # OG-Host
 
-Headless, web-managed server OS for the homelab: our own Rust container engine
-(Docker/OCI compatible), virtual machines, backups, clusters across sites, and a resource
-brain that shares memory and GPUs where they're needed. Managed from the browser (OmegaEnv,
+Headless, web-managed hypervisor OS for the homelab: virtual machines (QEMU/KVM) and our own
+Rust container engine (Docker/OCI compatible) side by side, backups, clusters across sites, and a
+resource brain that shares memory and GPUs where they're needed. Managed from the browser (OmegaEnv,
 rewritten in Rust, is its UI).
 
 Status: in development, running on test VMs. See [docs/DESIGN.md](docs/DESIGN.md) and the
@@ -13,8 +13,11 @@ Status: in development, running on test VMs. See [docs/DESIGN.md](docs/DESIGN.md
 - **Containers**: own engine, Docker Engine API + Compose, BuildKit builds, GPUs (CDI), rootless by
   default, live resource caps, a "desktop" profile that looks like a real PC.
 - **VMs**: QEMU/KVM with UEFI, Secure Boot and TPM 2.0, browser console (own VNC client),
-  snapshots, PCI/USB passthrough, built-in DHCP on OG-Host networks or macvtap onto the LAN, and
-  a "looks like a real PC" mode.
+  snapshots, PCI/USB passthrough, a "looks like a real PC" mode; storage pools (directory,
+  LVM-thin, ZFS), templates with linked clones, cloud-init; NICs on Linux bridges (VLAN-aware),
+  OG-Host networks or macvtap, per-VM firewall; live migration between nodes and HA by
+  replication; memory ballooning by the brain.
+- **Host networking**: bridges, bonds and VLANs from the web UI, applied with commit-confirm.
 - **Backups**: deduplicated, compressed, optionally encrypted (og-backup); datastores on disk,
   NFS or SMB; jobs with retention; restore in place or to a folder; verify and GC.
 - **Clusters**: nodes at any site over mutual TLS, shared accounts, manage every node from any
@@ -27,7 +30,13 @@ Status: in development, running on test VMs. See [docs/DESIGN.md](docs/DESIGN.md
 
 ## Install
 
-On a Debian or Ubuntu server, as root, from a mirror:
+**From the ISO** (recommended, a whole server): build or download `og-host-<version>-amd64.iso`,
+write it to a USB stick (`dd if=og-host-….iso of=/dev/sdX bs=4M`) or attach it to a VM, boot it
+(UEFI or BIOS) and answer the installer's questions. It erases the chosen disk and lays it out
+like Proxmox: the system, and the rest as an LVM thin pool (`local-thin`) for VM disks. See
+[iso/README.md](iso/README.md), including unattended installs.
+
+**On an existing Debian or Ubuntu server**, as root, from a mirror:
 
     curl -fsSL https://<mirror>/install.sh | sh
     og-hostd passwd admin

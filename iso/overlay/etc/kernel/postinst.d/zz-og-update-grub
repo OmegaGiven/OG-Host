@@ -1,0 +1,4 @@
+#!/bin/sh
+# OG-Host installs grub's -bin packages (EFI and BIOS side by side), which don't hook kernel updates
+set -e
+command -v update-grub >/dev/null && [ -d /boot/grub ] && update-grub >/dev/null 2>&1 || true

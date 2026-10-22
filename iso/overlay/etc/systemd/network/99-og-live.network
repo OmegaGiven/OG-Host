@@ -1,0 +1,6 @@
+# Install medium: DHCP on every wired card (the installer writes the real configuration)
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
