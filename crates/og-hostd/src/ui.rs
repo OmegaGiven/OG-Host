@@ -334,7 +334,13 @@ pub struct Login {
     password: String,
 }
 
-pub async fn login(State(d): State<Arc<Daemon>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(b): Json<Login>) -> Response {
+pub async fn login(
+    State(d): State<Arc<Daemon>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    tls: Option<axum::Extension<crate::tls::Secure>>,
+    headers: HeaderMap,
+    Json(b): Json<Login>,
+) -> Response {
     let ip = client_ip(peer, &headers);
     if d.sessions.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "too many failed sign-ins; try again in a few minutes"}))).into_response();
@@ -348,7 +354,7 @@ pub async fn login(State(d): State<Arc<Daemon>>, ConnectInfo(peer): ConnectInfo<
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "wrong user name or password"}))).into_response();
     }
     let token = d.sessions.create(&d.root, &b.user);
-    let secure = if https(&headers) { "; Secure" } else { "" };
+    let secure = if tls.is_some() || https(&headers) { "; Secure" } else { "" };
     let mut r = Json(json!({"user": b.user})).into_response();
     r.headers_mut().insert(
         header::SET_COOKIE,

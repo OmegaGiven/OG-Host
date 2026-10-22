@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/og-hostd serve --listen 127.0.0.1:8411
+ExecStart=/usr/local/bin/og-hostd serve --listen 127.0.0.1:8411 --listen-tls 0.0.0.0:8006
 Restart=always
 RestartSec=2
 # Containers are supervised by their own og-shim processes, so stopping or restarting the

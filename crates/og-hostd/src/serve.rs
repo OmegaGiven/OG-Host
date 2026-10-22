@@ -105,8 +105,8 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
     Ok(())
 }
 
-pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>) -> Result<()> {
-    let token = if listen.is_some() { Some(load_or_create_token(&root)?) } else { None };
+pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>) -> Result<()> {
+    let token = if listen.is_some() || tls.is_some() { Some(load_or_create_token(&root)?) } else { None };
     let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::ui::Sessions::load(&root) });
 
     // supervisor + health loop
@@ -211,10 +211,18 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     let unix_router = router.clone();
     let unix_task = tokio::spawn(async move { axum::serve(unix, unix_router).await });
 
+    let authed = router.layer(axum::middleware::from_fn_with_state(app.clone(), crate::ui::guard));
+    if let Some((addr, files)) = tls {
+        let r = authed.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::tls::serve(&addr, files, r).await {
+                eprintln!("og-hostd: https stopped: {e:#}");
+            }
+        });
+    }
     if let Some(addr) = listen {
         let tcp = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
         eprintln!("og-hostd: web UI and API on http://{addr} (bearer token in {}; UI accounts: og-hostd passwd <user>)", root.join("api-token").display());
-        let authed = router.layer(axum::middleware::from_fn_with_state(app.clone(), crate::ui::guard));
         axum::serve(tcp, authed.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     }
     unix_task.await??;

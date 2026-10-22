@@ -11,6 +11,7 @@ mod resources;
 mod serve;
 mod stacks;
 mod stats;
+mod tls;
 mod ui;
 
 use std::path::PathBuf;
@@ -137,6 +138,14 @@ enum Cmd {
         /// wolf:og.profile=desktop. Repeatable.
         #[arg(long = "scope-label")]
         scope_label: Vec<String>,
+        /// Also serve HTTPS on this address (e.g. 0.0.0.0:8006).
+        #[arg(long)]
+        listen_tls: Option<String>,
+        /// PEM certificate for --listen-tls (default: self-signed, created in <root>/tls).
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
     },
     /// Start a stopped container.
     Start { container: String },
@@ -296,8 +305,12 @@ async fn main() -> Result<()> {
                 println!("account {user} saved; sign in on the web UI");
             }
         }
-        Cmd::Serve { listen, docker_scope, scope_label } => {
-            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label).await?;
+        Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key } => {
+            let tls = match listen_tls {
+                Some(addr) => Some((addr, tls::cert_files(&cli.root, tls_cert, tls_key)?)),
+                None => None,
+            };
+            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label, tls).await?;
         }
         Cmd::Start { container } => {
             let m = node.find(&container)?;
