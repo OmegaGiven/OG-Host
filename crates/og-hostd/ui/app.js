@@ -217,6 +217,7 @@ async function startApp() {
     S.lab = !!info.lab;
     S.labHost = info.lab_host || info.hostname;
   } catch { S.lab = false; }
+  try { (await import('./backups.js')).init(H); } catch (e) { console.error(e); }
   if (S.lab) {
     try { (await import('./lab.js')).init(H); }
     catch (e) { console.error(e); S.lab = false; toast(`Lab UI failed to load: ${e.message}`, true); }
@@ -304,11 +305,11 @@ const ROUTES = {
   logs: { el: 'logs', tab: 'logs', run: (arg) => { paintLogSources(); if (arg) openLog(arg); else if (S.log.id) openLog(S.log.id); } },
   vms: { el: 'vms', tab: 'vms', run: () => {} },
 };
-const SERVER_TABS = [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['logs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs']];
+const SERVER_TABS = [['overview', 'grid', 'Overview'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['backups', 'shield', 'Backups'], ['logs', 'logs', 'Logs'], ['vms', 'monitor', 'VMs']];
 let NAV = SERVER_TABS;
 function defaultView() { const v = S.lab ? 'home' : 'overview'; return allowedTab([v]) ? v : (NAV[0] ? NAV[0][0] : 'settings'); }
 // what a page needs (held anywhere): pages the caller can't use are left out
-const NEEDS = { overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
+const NEEDS = { backups: 'Datastore.Audit', overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
 let NAV_ALL = SERVER_TABS, SUB_ALL = [];
 const allowedTab = ([id]) => !S.me || !NEEDS[id] || can(NEEDS[id], '*') || (id === 'logs' && (can('Lab.Audit', '*') || can('Container.Audit', '*')));
 function setNav(tabs, sub) {

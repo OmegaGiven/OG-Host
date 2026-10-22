@@ -1,0 +1,21 @@
+[package]
+name = "og-backup"
+description = "Deduplicating, compressed, optionally encrypted backup store for OG-Host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zstd.workspace = true
+tar.workspace = true
+hmac = "0.12"
+chacha20poly1305 = "0.10"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

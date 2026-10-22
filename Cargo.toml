@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/og-oci", "crates/og-runtime", "crates/og-net", "crates/og-compose", "crates/og-shim", "crates/og-hostd", "crates/og-lab", "crates/og-access"]
+members = ["crates/og-oci", "crates/og-runtime", "crates/og-net", "crates/og-compose", "crates/og-shim", "crates/og-hostd", "crates/og-lab", "crates/og-access", "crates/og-backup"]
 
 [workspace.package]
 version = "0.1.0"

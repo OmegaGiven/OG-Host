@@ -12,6 +12,9 @@ og-net = { path = "../og-net" }
 og-compose = { path = "../og-compose" }
 og-lab = { path = "../og-lab" }
 og-access = { path = "../og-access" }
+og-backup = { path = "../og-backup" }
+tar.workspace = true
+hex.workspace = true
 serde.workspace = true
 libc = "0.2"
 flate2.workspace = true

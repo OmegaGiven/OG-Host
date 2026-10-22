@@ -206,6 +206,19 @@
     </table></div>
   </section>
 
+  <!-- BACKUPS -->
+  <section id="view-backups" class="view" hidden>
+    <div class="toolbar"><h1 class="inline">Backups</h1><span class="sp"></span><button class="primary-btn" id="bkNow"><i data-icon="shield"></i>Back up now</button></div>
+    <div class="section-head first"><h2>Datastores</h2><span class="muted">where backups go</span></div>
+    <div class="ds-grid" id="bkStores"></div>
+    <div class="section-head"><h2>Jobs</h2><span class="muted">backups on a schedule</span><span class="sp"></span><button class="link-btn" id="jobAdd"><i data-icon="plus"></i> New job</button></div>
+    <div class="panel table-wrap"><table class="table"><thead><tr><th>Job</th><th>When</th><th>What</th><th>Where</th><th>Last run</th><th></th></tr></thead><tbody id="bkJobs"></tbody></table></div>
+    <div class="section-head"><h2>In <span id="bkStoreName"></span></h2><span class="muted" id="bkMeta"></span><span class="sp"></span><form class="q" id="bkQForm"><i data-icon="search"></i><input id="bkQ" placeholder="Filter backups"></form></div>
+    <div id="bkList"></div>
+    <div class="section-head"><h2>Tasks</h2><span class="muted">what ran on this server</span></div>
+    <div class="panel table-wrap"><table class="table"><tbody id="bkTasks"></tbody></table></div>
+  </section>
+
   <!-- SETTINGS: account + access control -->
   <section id="view-settings" class="view" hidden>
     <div class="toolbar"><h1 class="inline">Settings</h1><span class="muted" id="setMeta"></span></div>

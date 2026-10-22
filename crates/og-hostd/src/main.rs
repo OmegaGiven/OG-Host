@@ -2,6 +2,8 @@
 
 mod access_api;
 mod auth;
+mod backup;
+mod backup_api;
 mod brain;
 mod build;
 mod compose;
@@ -12,9 +14,12 @@ mod firewall;
 mod idmap;
 mod labnode;
 mod resources;
+mod schedule;
 mod serve;
 mod stacks;
 mod stats;
+mod storage;
+mod tasks;
 mod tls;
 mod ui;
 

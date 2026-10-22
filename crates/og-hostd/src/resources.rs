@@ -49,6 +49,11 @@ fn load(node: &Node, id: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&std::fs::read(bundle(node, id)).context("reading the container's bundle")?)?)
 }
 
+/// The container's cgroup directory.
+pub fn cgroup_of(node: &Node, id: &str) -> Option<PathBuf> {
+    cgroup_dir(&load(node, id).ok()?)
+}
+
 fn cgroup_dir(spec: &Value) -> Option<PathBuf> {
     spec["linux"]["cgroupsPath"].as_str().map(|p| PathBuf::from("/sys/fs/cgroup").join(p.trim_start_matches('/')))
 }

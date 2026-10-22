@@ -33,6 +33,7 @@ static ASSETS: LazyLock<HashMap<&'static str, Asset>> = LazyLock::new(|| {
         asset!("app.js", "text/javascript; charset=utf-8"),
         asset!("lab.js", "text/javascript; charset=utf-8"),
         asset!("access.js", "text/javascript; charset=utf-8"),
+        asset!("backups.js", "text/javascript; charset=utf-8"),
         asset!("favicon.svg", "image/svg+xml"),
     ]
     .into_iter()

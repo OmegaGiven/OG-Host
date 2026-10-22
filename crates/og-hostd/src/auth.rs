@@ -383,6 +383,21 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["access", "me", ..] => None,
         ["access", ..] => r("/access".into(), if get { "Access.Audit" } else { "Access.Modify" }),
         ["firewall", ..] => r("/system".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
+        ["storage"] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
+        ["storage", id] => r(format!("/storage/{id}"), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
+        // keys: the handler also wants Sys.Modify on /
+        ["storage", id, "key"] => r(format!("/storage/{id}"), "Datastore.Allocate"),
+        ["storage", id, "backups"] => r(format!("/storage/{id}"), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
+        ["storage", id, "backups", "files"] => r(format!("/storage/{id}"), "Datastore.Audit"),
+        ["storage", id, "backups", "download"] => r(format!("/storage/{id}"), "Backup.Restore"),
+        ["storage", id, "backups", "notes"] => r(format!("/storage/{id}"), "Backup.Create"),
+        ["storage", id, "prune" | "gc"] => r(format!("/storage/{id}"), "Datastore.Allocate"),
+        ["storage", id, "verify"] => r(format!("/storage/{id}"), "Datastore.Audit"),
+        // per target (or on the datastore), checked in the handler
+        ["backup"] => None,
+        ["backup", "jobs", ..] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),
+        ["restore"] => r("/storage".into(), "Backup.Restore"),
+        ["tasks", ..] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
         _ => r("/".into(), "Sys.Modify"),
     }
 }
