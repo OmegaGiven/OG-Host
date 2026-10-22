@@ -148,7 +148,8 @@ fn prepare_inner(d: &Daemon, b: Prepare) -> Result<Value> {
         if b.live {
             mig_port = free_port()?;
             q("migrate-set-parameters", json!({"tls-creds": "ogtls"}))?;
-            q("migrate-incoming", json!({"uri": format!("tcp:0.0.0.0:{mig_port}")}))?;
+            // a failed load keeps QEMU here (paused) so finish can say why, instead of it vanishing
+            q("migrate-incoming", json!({"uri": format!("tcp:0.0.0.0:{mig_port}"), "exit-on-error": false}))?;
         }
         Ok(json!({"nbd_port": nbd_port, "migrate_port": mig_port, "disks": vm.disks.iter().map(|x| json!({"id": x.id, "volume": x.volume})).collect::<Vec<_>>()}))
     })();
@@ -175,7 +176,26 @@ pub async fn finish(State(d): State<Arc<Daemon>>, UrlPath(name): UrlPath<String>
         let _ = std::fs::remove_file(d2.vms.dir(&name).join(INCOMING));
         let _ = d2.vms.qmp(&name, "nbd-server-stop", json!({}));
         if b.live {
-            // the VM runs here now
+            // the VM runs here now, if the memory and device state really arrived
+            let mut ok = false;
+            for _ in 0..50 {
+                let m = d2.vms.qmp(&name, "query-migrate", json!({})).unwrap_or_default();
+                match m["status"].as_str().unwrap_or("") {
+                    "completed" => {
+                        ok = true;
+                        break;
+                    }
+                    "failed" => bail!("the VM's state didn't load here: {}", m["error-desc"].as_str().unwrap_or("?")),
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            if !ok {
+                bail!("the incoming migration didn't complete here");
+            }
+            let st = d2.vms.qmp(&name, "query-status", json!({}))?;
+            if st["status"] != "running" {
+                d2.vms.qmp(&name, "cont", json!({}))?;
+            }
             d2.vms.set_desired(&name, "running")?;
         } else {
             let _ = d2.vms.qmp(&name, "quit", json!({}));
@@ -332,6 +352,11 @@ async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq
                 Ok(())
             });
         }
+        // the VM never ran there: it carries on here
+        let _ = c.post(format!("{base}/{name}/abort")).json(&json!({})).send().await;
+        if live {
+            let _ = d.vms.qmp(name, "cont", json!({}));
+        }
         bail!("finishing on {}: {e}", node.name);
     }
     // gone from here: the VM (its QEMU, settings and volumes)
@@ -435,10 +460,15 @@ async fn live_copy_inner(d: &Daemon, t: &crate::tasks::Task, name: &str, vm: &Vm
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     t.log(format!("disks in sync after {:.0} s; moving memory", t0.elapsed().as_secs_f64()));
+    // what the link really carries (the mirror just measured it), so QEMU's guess of the
+    // pause at the switch is right: half of it, at least 10 MB/s
+    let moved: u64 = q("query-block-jobs", json!({}))?.as_array().into_iter().flatten().filter(|j| j["device"].as_str().is_some_and(|n| n.starts_with("mirror-"))).map(|j| j["offset"].as_u64().unwrap_or(0)).sum();
+    let link = (moved as f64 / t0.elapsed().as_secs_f64().max(1.0)) as u64;
     q("migrate-set-capabilities", json!({"capabilities": [{"capability": "events", "state": true}]}))?;
     // the guest is paused for at most ~50 ms at the switch (QEMU's default allows 300 ms;
     // Proxmox uses 100 ms); QEMU caps the bandwidth at 128 MiB/s unless told otherwise
     q("migrate-set-parameters", json!({"tls-creds": "ogtls", "tls-hostname": host, "downtime-limit": 50, "max-bandwidth": 10u64 << 30}))?;
+    let _ = q("migrate-set-parameters", json!({"avail-switchover-bandwidth": (link / 2).max(10 << 20)}));
     q("migrate", json!({"uri": format!("tcp:{host}:{mig_port}")}))?;
     let t1 = Instant::now();
     loop {

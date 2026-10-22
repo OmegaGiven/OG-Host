@@ -815,7 +815,7 @@ impl Vms {
         if !Path::new("/dev/vhost-net").exists() {
             let _ = Command::new("modprobe").arg("vhost_net").status();
         }
-        let vhost = if Path::new("/dev/vhost-net").exists() { "on" } else { "off" };
+        let vhost = if Path::new("/dev/vhost-net").exists() && std::env::var("OG_EXPERIMENT_NET").map_or(true, |v| !v.contains("novhost")) { "on" } else { "off" };
         for (nic, dev) in vm.nics.iter().zip(taps.iter().map(|t| &t.1)) {
             let netdev = match dev {
                 NetDev::Tap(ifname) => format!("tap,id=nd-{},ifname={},script=no,downscript=no,vhost={vhost}", nic.id, ifname),
@@ -829,7 +829,7 @@ impl Vms {
             };
             // a deeper receive ring (QEMU's default is 256): fewer drops when a guest is busy
             // under VM-to-VM load
-            let rings = if model == "virtio-net-pci" { ",rx_queue_size=1024" } else { "" };
+            let rings = if model == "virtio-net-pci" && std::env::var("OG_EXPERIMENT_NET").map_or(true, |v| !v.contains("noring")) { ",rx_queue_size=1024" } else { "" };
             push(&["-device", &format!("{model},netdev=nd-{id},id={id},mac={}{rings}{}", nic.mac, bootidx(&nic.id), id = nic.id)]);
         }
         match vm.vga.as_str() {

@@ -34,7 +34,9 @@ elif [ $K = og ]; then
   for i in $(seq $R); do
     for dir in "22202 og-bench2" "22204 og-bench"; do set -- $dir
       o=$(./pssh $1 'cd /root/bench; . ./lib.sh; s=$(t); T=$(ogapi POST /v1/vms/v60/migrate "{\"node\":\"'$2'\"}" | sed -n "s/.*\"task\":\"\([^\"]*\)\".*/\1/p"); st=$(ogtask $T | grep -o "\"status\":\"[a-z]*\""); echo "st=$st total=$(since $s) down=$(ogapi GET /v1/tasks/$T | sed -n "s/.*downtime \([0-9]*\) ms.*/\1/p")"')
-      echo "DIAG og migrate to $2: $o"; tot+=("$(echo "$o" | sed -n 's/.*total=\([0-9.]*\).*/\1/p')"); down+=("$(echo "$o" | sed -n 's/.*down=\([0-9]*\).*/\1/p')")
+      tp=$([ $1 = 22202 ] && echo 22204 || echo 22202)
+      ok=$(./pssh $tp "$LIB; P=og; $GS; waitfor 60 vm_ready 60 && echo ssh-ok || echo SSH-FAILED")
+      echo "DIAG og migrate to $2: $o $ok"; tot+=("$(echo "$o" | sed -n 's/.*total=\([0-9.]*\).*/\1/p')"); down+=("$(echo "$o" | sed -n 's/.*down=\([0-9]*\).*/\1/p')")
     done
   done
   echo "RESULT migrate_live_s $(printf '%s\n' "${tot[@]}" | med) s"
