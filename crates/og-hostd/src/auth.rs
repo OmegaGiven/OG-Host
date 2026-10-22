@@ -410,6 +410,7 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["vms"] | ["vms", "host"] => r("/vms".into(), if get { "VM.Audit" } else { "VM.Allocate" }),
         ["vms", n] => r(format!("/vms/{n}"), match *m { Method::GET | Method::HEAD => "VM.Audit", Method::DELETE => "VM.Allocate", _ => "VM.Config" }),
         ["vms", _, "clone"] => r("/vms".into(), "VM.Allocate"),
+        ["vms", n, "migrate"] => r(format!("/vms/{n}"), "VM.Allocate"),
         ["vms", n, "template"] => r(format!("/vms/{n}"), "VM.Allocate"),
         ["vms", n, "cloudinit"] => r(format!("/vms/{n}"), "VM.Config"),
         ["pools", ..] => r("/storage".into(), if get { "Datastore.Audit" } else { "Datastore.Allocate" }),

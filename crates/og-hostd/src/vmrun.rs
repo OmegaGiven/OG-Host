@@ -67,6 +67,12 @@ fn release_vfio(addr: &str) {
 }
 
 pub fn start(d: &Daemon, name: &str) -> Result<()> {
+    start_with(d, name, false)
+}
+
+/// `incoming`: start paused, waiting for a migration (QMP migrate-incoming) or a disk copy
+/// over NBD; the desired state is left alone.
+pub fn start_with(d: &Daemon, name: &str, incoming: bool) -> Result<()> {
     let vm = d.vms.get(name)?;
     if vm.template {
         bail!("{name} is a template: clone it to make a VM");
@@ -151,7 +157,10 @@ pub fn start(d: &Daemon, name: &str) -> Result<()> {
             }
         }
         let cg = setup_cgroup(&vm)?;
-        let args = d.vms.command(&vm, &devs)?;
+        let mut args = d.vms.command(&vm, &devs)?;
+        if incoming {
+            args.extend(["-incoming".to_string(), "defer".to_string()]);
+        }
         let mut c = Command::new(&qemu);
         c.args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let procs = std::ffi::CString::new(cg.join("cgroup.procs").to_string_lossy().as_bytes())?;
@@ -187,7 +196,9 @@ pub fn start(d: &Daemon, name: &str) -> Result<()> {
         cleanup(d, &vm);
         return Err(e);
     }
-    d.vms.set_desired(name, "running")?;
+    if !incoming {
+        d.vms.set_desired(name, "running")?;
+    }
     refresh_firewall(d);
     Ok(())
 }

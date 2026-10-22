@@ -42,6 +42,7 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/vms/{name}/snapshots/{snap}/rollback", post(snap_rollback))
         .route("/v1/vms/{name}/template", post(make_template))
         .route("/v1/vms/{name}/clone", post(clone_vm))
+        .route("/v1/vms/{name}/migrate", post(crate::migrate::migrate))
         .route("/v1/vms/{name}/cloudinit", post(set_cloudinit))
         .route("/v1/pools", get(pools).post(pool_put))
         .route("/v1/pools/{id}", delete(pool_delete))

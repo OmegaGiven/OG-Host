@@ -229,6 +229,14 @@ impl Cluster {
         self.client.read().unwrap().clone().context("this server isn't in a cluster")
     }
 
+    pub fn node_pub(&self, name: &str) -> Result<NodeEntry> {
+        self.node(name)
+    }
+
+    pub fn client_pub(&self) -> Result<reqwest::Client> {
+        self.client()
+    }
+
     fn node(&self, name: &str) -> Result<NodeEntry> {
         self.state().context("this server isn't in a cluster")?.nodes.into_iter().find(|n| n.name == name).with_context(|| format!("no node {name:?} in the cluster"))
     }
@@ -568,6 +576,9 @@ fn cluster_router(d: Arc<Daemon>) -> Router {
         .route("/cluster/v1/store/{ds}/chunk/{id}", put(remote_chunk))
         .route("/cluster/v1/store/{ds}/snapshot", put(remote_snapshot))
         .route("/cluster/v1/store/{ds}/prune", post(remote_prune))
+        .route("/cluster/v1/vm/prepare", post(vm_prepare))
+        .route("/cluster/v1/vm/{name}/finish", post(vm_finish))
+        .route("/cluster/v1/vm/{name}/abort", post(vm_abort))
         .with_state(d)
 }
 
@@ -659,6 +670,29 @@ async fn proxied(State(d): D, Extension(p): Extension<Peer>, mut req: Request<Bo
         Ok(r) => r.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
+}
+
+// ---- VMs arriving from another node (migration) ----
+
+async fn vm_prepare(st: D, Extension(p): Extension<Peer>, b: Json<crate::migrate::Prepare>) -> Response {
+    if let Err(r) = need_peer(&p) {
+        return r;
+    }
+    crate::migrate::prepare(st, b).await
+}
+
+async fn vm_finish(st: D, Extension(p): Extension<Peer>, n: UrlPath<String>, b: Json<crate::migrate::Finish>) -> Response {
+    if let Err(r) = need_peer(&p) {
+        return r;
+    }
+    crate::migrate::finish(st, n, b).await
+}
+
+async fn vm_abort(st: D, Extension(p): Extension<Peer>, n: UrlPath<String>) -> Response {
+    if let Err(r) = need_peer(&p) {
+        return r;
+    }
+    crate::migrate::abort(st, n).await
 }
 
 // ---- datastores at other sites (sync jobs push here) ----

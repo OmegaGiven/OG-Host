@@ -17,6 +17,7 @@ mod firewall;
 mod hostnet;
 mod idmap;
 mod labnode;
+mod migrate;
 mod pools;
 mod resources;
 mod schedule;
@@ -302,9 +303,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
         .init();
-    // behave like a normal CLI when piped into `head` etc. (exit quietly on SIGPIPE)
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
+    // a CLI command piped into `head` etc. exits quietly on SIGPIPE; the daemon must not (a
+    // peer closing a socket would kill it), so it keeps Rust's default of ignoring it
+    if !matches!(cli.cmd, Cmd::Serve { .. }) {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     // publishing tools need no server state (and no root)
     match &cli.cmd {
         Cmd::UpdateGuard => {

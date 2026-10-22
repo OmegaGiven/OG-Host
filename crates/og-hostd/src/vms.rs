@@ -804,10 +804,15 @@ impl Vms {
         if sata_port > 6 {
             bail!("too many SATA devices (6 at most)");
         }
+        // in-kernel virtio-net backend when there is one (faster), else QEMU's own
+        if !Path::new("/dev/vhost-net").exists() {
+            let _ = Command::new("modprobe").arg("vhost_net").status();
+        }
+        let vhost = if Path::new("/dev/vhost-net").exists() { "on" } else { "off" };
         for (nic, dev) in vm.nics.iter().zip(taps.iter().map(|t| &t.1)) {
             let netdev = match dev {
-                NetDev::Tap(ifname) => format!("tap,id=nd-{},ifname={},script=no,downscript=no,vhost=on", nic.id, ifname),
-                NetDev::Fd(fd) => format!("tap,id=nd-{},fd={fd},vhost=on", nic.id),
+                NetDev::Tap(ifname) => format!("tap,id=nd-{},ifname={},script=no,downscript=no,vhost={vhost}", nic.id, ifname),
+                NetDev::Fd(fd) => format!("tap,id=nd-{},fd={fd},vhost={vhost}", nic.id),
             };
             push(&["-netdev", &netdev]);
             let model = match nic.model.as_str() {

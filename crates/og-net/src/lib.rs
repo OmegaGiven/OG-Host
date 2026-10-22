@@ -143,6 +143,20 @@ fn ifname(prefix: &str, id: &str) -> String {
     s
 }
 
+/// IPv4 networks the server reaches directly through interfaces that aren't OG-Host's own
+/// bridges (so new OG-Host networks never overlap them).
+fn host_routes() -> Vec<Subnet> {
+    let out = Command::new("ip").args(["-4", "-o", "route", "show", "scope", "link"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    out.lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let net = w.next()?;
+            let dev = l.split_whitespace().skip_while(|x| *x != "dev").nth(1)?;
+            (!dev.starts_with("og") && net.contains('/')).then(|| Subnet::parse(net).ok()).flatten()
+        })
+        .collect()
+}
+
 /// A VM's tap device name.
 pub fn tap_name(owner: &str) -> String {
     ifname("ogt", owner)
@@ -211,11 +225,28 @@ impl Net {
             return Err(Error::Invalid(format!("invalid network name {name:?}")));
         }
         let net = match self.get(name)? {
-            Some(n) => n,
+            Some(n) => {
+                // never bring up a bridge on a network the server itself is on: it would
+                // take the server's own traffic
+                if !Path::new("/sys/class/net").join(&n.bridge).exists() {
+                    if let Some(r) = host_routes().into_iter().find(|r| r.contains(n.subnet.base) || n.subnet.contains(r.base)) {
+                        return Err(Error::Invalid(format!("network {} ({}) overlaps a network this server is on ({r}); give it another subnet", n.name, n.subnet)));
+                    }
+                }
+                n
+            }
             None => {
                 let subnet = match subnet {
-                    Some(s) => Subnet::parse(s)?,
-                    None if name == DEFAULT_NETWORK => Subnet::parse(DEFAULT_SUBNET)?,
+                    Some(s) => {
+                        let s = Subnet::parse(s)?;
+                        if let Some(r) = host_routes().into_iter().find(|r| r.contains(s.base) || s.contains(r.base)) {
+                            return Err(Error::Invalid(format!("{s} overlaps a network this server is on ({r})")));
+                        }
+                        s
+                    }
+                    // the default subnet unless the server sits on it (e.g. a nested node, or a LAN
+                    // that happens to use 10.89.0.x)
+                    None if name == DEFAULT_NETWORK && !host_routes().iter().any(|r| r.contains(Subnet::parse(DEFAULT_SUBNET).unwrap().base)) => Subnet::parse(DEFAULT_SUBNET)?,
                     None => self.next_free_subnet()?,
                 };
                 if let Some(clash) = self.list()?.into_iter().find(|n| n.subnet.contains(subnet.base) || subnet.contains(n.subnet.base)) {
@@ -234,7 +265,8 @@ impl Net {
 
     /// 10.89.N.0/24 for the first N not used yet.
     fn next_free_subnet(&self) -> Result<Subnet> {
-        let used: Vec<Subnet> = self.list()?.into_iter().map(|n| n.subnet).collect();
+        let mut used: Vec<Subnet> = self.list()?.into_iter().map(|n| n.subnet).collect();
+        used.extend(host_routes());
         for n in 1..=255u8 {
             let s = Subnet::parse(&format!("10.89.{n}.0/24"))?;
             if !used.iter().any(|u| u.contains(s.base) || s.contains(u.base)) {
