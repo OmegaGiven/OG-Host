@@ -193,11 +193,19 @@ fn updates_dir(root: &Path) -> PathBuf {
     root.join("updates")
 }
 
-/// The installed binaries this updater manages.
-fn targets() -> Vec<(&'static str, PathBuf)> {
+/// Where the running og-hostd is installed.
+fn bin_dir() -> PathBuf {
     let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/og-hostd"));
-    let dir = me.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/usr/local/bin"));
+    me.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/usr/local/bin"))
+}
+
+/// The installed binaries this updater manages, in `dir`.
+fn targets_in(dir: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![("og-hostd", dir.join("og-hostd")), ("og-shim", dir.join("og-shim"))]
+}
+
+fn targets() -> Vec<(&'static str, PathBuf)> {
+    targets_in(&bin_dir())
 }
 
 /// Download, check and install a release, then restart. Blocking (run as a task).
@@ -252,7 +260,8 @@ pub fn install(root: &Path, task: &crate::tasks::Task, a: &Available) -> Result<
         std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
         task.log(format!("installed {}", path.display()));
     }
-    std::fs::write(updates_dir(root).join("pending.json"), serde_json::to_vec(&json!({"from": VERSION, "to": a.manifest.version, "attempts": 0, "time": crate::containers::unix_now()}))?)?;
+    // where to put things back: the guard runs from elsewhere, so it can't go by its own path
+    std::fs::write(updates_dir(root).join("pending.json"), serde_json::to_vec(&json!({"from": VERSION, "to": a.manifest.version, "attempts": 0, "time": crate::containers::unix_now(), "bin": bin_dir()}))?)?;
     install_guard(root, task);
     task.log("restarting og-hostd (containers and VMs keep running)");
     restart_soon();
@@ -320,7 +329,8 @@ pub fn guard(root: &Path) {
 
 fn rollback(root: &Path, v: &mut Value) {
     let prev = updates_dir(root).join("previous");
-    for (name, path) in targets() {
+    let dir = v["bin"].as_str().map(PathBuf::from).filter(|p| p.is_absolute() && p.is_dir()).unwrap_or_else(|| PathBuf::from("/usr/local/bin"));
+    for (name, path) in targets_in(&dir) {
         let src = prev.join(name);
         if src.exists() {
             let tmp = path.with_extension("og-new");

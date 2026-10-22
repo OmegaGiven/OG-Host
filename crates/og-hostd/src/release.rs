@@ -223,7 +223,8 @@ h1 { margin: 0; font-size: 28px; letter-spacing: -.01em; } .tag { margin: 2px 0 
 .btn { display: inline-flex; align-items: center; gap: 8px; background: var(--accent); color: #fff; padding: 10px 16px; border-radius: 10px; text-decoration: none; font-weight: 600; }
 .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
 pre { background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); margin: 0; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 22px 0; }
+.grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin: 22px 0; }
+@media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
 .card h3 { margin: 0 0 6px; font-size: 15px; } .card p { margin: 0; color: var(--text-2); font-size: 14px; }
 h2.sec { font-size: 13px; text-transform: uppercase; letter-spacing: .1em; color: var(--text-3); margin: 34px 0 10px; }
