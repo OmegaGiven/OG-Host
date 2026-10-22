@@ -16,6 +16,7 @@
 //! XChaCha20-Poly1305. Snapshot groups: `ct/<name>`, `stack/<name>`, `vm/<name>`.
 
 pub mod chunker;
+pub mod disk;
 pub mod prune;
 
 use std::collections::HashSet;
@@ -256,7 +257,9 @@ impl Repo {
             }
         }
         std::fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        // a name of its own: worker threads may store the same chunk at the same moment
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::write(&tmp, &out)?;
         std::fs::rename(&tmp, &p)?;
         Ok((id, out.len() as u64))
@@ -306,7 +309,7 @@ impl Repo {
             return Ok(());
         }
         std::fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), random::<8>().iter().map(|b| format!("{b:02x}")).collect::<String>()));
         std::fs::write(&tmp, raw)?;
         std::fs::rename(tmp, p)?;
         Ok(())
@@ -479,6 +482,9 @@ impl Repo {
         let mut err = String::new();
         for a in &m.archives {
             let r = (|| -> Result<()> {
+                if a.csum.starts_with("b:") {
+                    return self.verify_disk(&m, &a.name);
+                }
                 let mut r = self.reader(&m, &a.name)?;
                 std::io::copy(&mut r, &mut std::io::sink())?;
                 if r.csum() != a.csum {

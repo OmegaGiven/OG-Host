@@ -10,6 +10,12 @@
 //! Back to full memory when the host is below 60 % used and not under pressure (or right away
 //! when an idle VM gets busy and the host has room). [`decide`] is pure; [`tick`] reads and
 //! applies over QMP.
+//!
+//! Same-page merging (KSM): with two or more VMs running, identical memory pages (the same
+//! guest kernel and libraries, zeroed pages) are kept once. It scans fast for a while after a VM
+//! starts, then slowly in the background, and stops when fewer than two VMs run. `<root>/ksm`
+//! containing `off` turns it off (VMs of different tenants that mustn't share pages: merging
+//! can leak timing information between them).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -77,6 +83,66 @@ pub struct State {
     cpu: HashMap<String, VecDeque<(Instant, f64)>>,
     pub targets: HashMap<String, u64>,
     pub last: Vec<(String, u64)>,
+    pub ksm: Ksm,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct Ksm {
+    /// auto | off
+    pub mode: String,
+    pub on: bool,
+    pub fast: bool,
+    /// memory saved by merging, MiB
+    pub saved_mib: u64,
+    #[serde(skip)]
+    vms: usize,
+    #[serde(skip)]
+    fast_until: Option<Instant>,
+}
+
+const KSM: &str = "/sys/kernel/mm/ksm";
+/// fast: ~400 MB/s scanned (merges a new VM's pages in seconds); slow: ~4 MB/s
+const KSM_FAST: (&str, &str) = ("4000", "20");
+const KSM_SLOW: (&str, &str) = ("200", "200");
+const KSM_FAST_FOR: Duration = Duration::from_secs(120);
+
+fn ksm_set(file: &str, v: &str) {
+    let _ = std::fs::write(format!("{KSM}/{file}"), v);
+}
+
+/// One round of KSM management (`running`: VMs running now; `used_pct`: host memory used).
+fn ksm_tick(root: &std::path::Path, k: &mut Ksm, running: usize, used_pct: f64) {
+    if !std::path::Path::new(KSM).exists() {
+        return;
+    }
+    let off = std::fs::read_to_string(root.join("ksm")).is_ok_and(|s| s.trim() == "off");
+    k.mode = if off { "off" } else { "auto" }.into();
+    let now = Instant::now();
+    if off || running < 2 {
+        if k.on {
+            ksm_set("run", "0");
+            k.on = false;
+            k.fast = false;
+        }
+        k.vms = running;
+        k.saved_mib = 0;
+        return;
+    }
+    if !k.on || running > k.vms || used_pct > 85.0 {
+        k.fast_until = Some(now + KSM_FAST_FOR);
+    }
+    let fast = k.fast_until.is_some_and(|t| now < t);
+    if !k.on || fast != k.fast {
+        let (pages, sleep) = if fast { KSM_FAST } else { KSM_SLOW };
+        ksm_set("use_zero_pages", "1");
+        ksm_set("pages_to_scan", pages);
+        ksm_set("sleep_millisecs", sleep);
+        ksm_set("run", "1");
+        k.on = true;
+        k.fast = fast;
+    }
+    k.vms = running;
+    k.saved_mib = std::fs::read_to_string(format!("{KSM}/pages_sharing")).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0) * 4 / 1024;
 }
 
 /// One round: read VMs and the host, balloon as decided.
@@ -88,6 +154,7 @@ pub fn tick(d: &crate::serve::Daemon) {
     {
         let mut st = d.vmbrain.lock().unwrap();
         let now = Instant::now();
+        let mut running = 0;
         for vm in d.vms.list() {
             let s = d.vms.status(&vm.name);
             let Some(pid) = s.pid.filter(|_| s.state == "running") else {
@@ -95,6 +162,7 @@ pub fn tick(d: &crate::serve::Daemon) {
                 st.targets.remove(&vm.name);
                 continue;
             };
+            running += 1;
             if vm.balloon == 0 {
                 continue;
             }
@@ -111,6 +179,7 @@ pub fn tick(d: &crate::serve::Daemon) {
             let target = *st.targets.entry(vm.name.clone()).or_insert(vm.memory);
             snaps.push(VmSnap { name: vm.name.clone(), class: Class::from_labels(&vm.labels), memory: vm.memory, balloon_min: vm.balloon, target, idle });
         }
+        ksm_tick(&d.root, &mut st.ksm, running, used_pct);
     }
     let changes = decide(host, &snaps);
     for (name, mib) in &changes {

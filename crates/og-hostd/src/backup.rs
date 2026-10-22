@@ -318,10 +318,10 @@ fn run_vm(d: &Daemon, task: &Task, store: &str, name: &str, opts: &Opts) -> Resu
                 }
                 info
             } else {
-                let mut f = std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?;
-                let mut w = snap.archive(&format!("raw-{}", x.id))?;
-                std::io::copy(&mut f, &mut w)?;
-                w.finish()?
+                // block devices (thin volumes): fixed blocks, read and stored by all cores,
+                // unused (zero) space recognised without hashing it
+                let f = std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?;
+                snap.disk_archive(&format!("raw-{}", x.id), &f, &|| task.check())?
             };
             task.log(format!("  {}: {} ({} new)", x.volume, human(info.size), human(info.new_bytes)));
             vols.push(json!({"disk": x.id, "volume": x.volume, "size": size, "archive": info.name}));
@@ -453,33 +453,9 @@ pub fn restore(d: &Daemon, task: &Task, store: &str, snapshot: &str, o: &Restore
                         std::fs::File::create(&path)?.set_len(size)?;
                     }
                 }
-                // sparse: zero blocks are skipped (a new volume reads as zeros)
-                let fresh = created;
-                let mut out = std::fs::OpenOptions::new().write(true).open(&path)?;
-                let mut rd = repo.reader(&m, archive)?;
-                let mut buf = vec![0u8; 1 << 20];
-                use std::io::{Read, Seek, Write};
-                loop {
-                    let mut n = 0;
-                    while n < buf.len() {
-                        let k = rd.read(&mut buf[n..])?;
-                        if k == 0 {
-                            break;
-                        }
-                        n += k;
-                    }
-                    if n == 0 {
-                        break;
-                    }
-                    for blk in buf[..n].chunks(65536) {
-                        if fresh && blk.iter().all(|b| *b == 0) {
-                            out.seek(std::io::SeekFrom::Current(blk.len() as i64))?;
-                        } else {
-                            out.write_all(blk)?;
-                        }
-                    }
-                }
-                out.sync_all()?;
+                // all cores; on a new volume (reads as zeros) zero blocks are skipped
+                let out = std::fs::OpenOptions::new().write(true).open(&path)?;
+                repo.restore_disk(&m, archive, &out, created, &|| task.check())?;
             }
             task.log(format!("  {archive} -> {target}"));
             if let Some(x) = vm.disks.iter_mut().find(|x| x.id == disk) {

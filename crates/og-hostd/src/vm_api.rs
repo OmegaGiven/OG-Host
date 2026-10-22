@@ -99,6 +99,7 @@ async fn host(State(d): D) -> Json<Value> {
     h["pools"] = json!(d.vms.pools.list().iter().map(|p| json!({"id": p.id, "type": p.kind})).collect::<Vec<_>>());
     h["templates"] = json!(d.vms.list().into_iter().filter(|v| v.template).map(|v| json!({"name": v.name, "os": v.os, "memory": v.memory, "cores": v.cores, "comment": v.comment})).collect::<Vec<_>>());
     h["networks"] = json!(d.node.net.list().unwrap_or_default().iter().map(|n| json!({"name": n.name, "subnet": n.subnet.to_string()})).collect::<Vec<_>>());
+    h["ksm"] = json!(d.vmbrain.lock().unwrap().ksm);
     Json(h)
 }
 

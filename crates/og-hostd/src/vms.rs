@@ -716,7 +716,8 @@ impl Vms {
         push(&["-qmp", &format!("unix:{},server=on,wait=off", qv(&run.join("qmp.sock").to_string_lossy()))]);
         push(&["-rtc", if vm.os == "windows" { "base=localtime,driftfix=slew" } else { "base=utc" }]);
         push(&["-global", "kvm-pit.lost_tick_policy=delay"]);
-        push(&["-boot", "menu=on,splash-time=2000"]);
+        // the firmware waits this long for Esc (the boot menu) on every start: 1 s, not 2
+        push(&["-boot", "menu=on,splash-time=1000"]);
         if !vm.kernel.is_empty() {
             push(&["-kernel", &vm.kernel]);
             if !vm.initrd.is_empty() {
@@ -826,7 +827,10 @@ impl Vms {
                 "rtl8139" => "rtl8139",
                 _ => "virtio-net-pci",
             };
-            push(&["-device", &format!("{model},netdev=nd-{id},id={id},mac={}{}", nic.mac, bootidx(&nic.id), id = nic.id)]);
+            // a deeper receive ring (QEMU's default is 256): fewer drops when a guest is busy
+            // under VM-to-VM load
+            let rings = if model == "virtio-net-pci" { ",rx_queue_size=1024" } else { "" };
+            push(&["-device", &format!("{model},netdev=nd-{id},id={id},mac={}{rings}{}", nic.mac, bootidx(&nic.id), id = nic.id)]);
         }
         match vm.vga.as_str() {
             "none" => push(&["-vga", "none"]),

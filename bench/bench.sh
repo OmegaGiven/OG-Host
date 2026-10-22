@@ -42,7 +42,19 @@ cleanup() { # leftovers of an interrupted run
   else
     for v in $(ogapi GET /v1/vms | grep -o '"name":"v[0-9]*"' | cut -d'"' -f4 | sort -u); do ogapi POST /v1/vms/$v/stop >/dev/null; sleep 1; ogapi DELETE /v1/vms/$v >/dev/null; done
     for c in $(og-hostd ps | awk 'NR>1 && $2 ~ /^c[0-9]+$/ {print $2}'); do og-hostd stop $c >/dev/null 2>&1; og-hostd rm $c >/dev/null 2>&1; done
+    rm -rf /var/lib/og-host/bench-store # an earlier run's backups (they'd count as disk used, and dedup the next backup)
   fi
+}
+
+# what the host does for its VMs, for comparing the two (DIAG lines; not results)
+diag_host() {
+  echo "DIAG kernel $(uname -r)"
+  echo "DIAG thp $(cat /sys/kernel/mm/transparent_hugepage/enabled) defrag $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
+  echo "DIAG ksm run=$(cat /sys/kernel/mm/ksm/run 2>/dev/null) pages_sharing=$(cat /sys/kernel/mm/ksm/pages_sharing 2>/dev/null)"
+  for p in $(pgrep -f '^(/usr/bin/)?(qemu-system-x86_64|kvm) '); do
+    echo "DIAG qemu $p $(awk '/^(Rss|Pss_Anon|Pss_File|AnonHugePages|Swap):/{printf "%s %d MB  ", $1, $2/1024}' /proc/$p/smaps_rollup)"
+    echo "DIAG qemu $p cmdline $(tr '\0' ' ' < /proc/$p/cmdline | grep -oE -- '-(machine|cpu|m|netdev|device|vga|bios|drive) [^ ]+' | grep -vE 'pflash|smbios' | tr '\n' ' ')"
+  done
 }
 [ "${1:-}" = footprint ] || cleanup
 
@@ -83,6 +95,7 @@ s_vms() {
   for i in 21 22 23; do vm_clone $i 1; vm_start $i; done
   for i in 21 22 23; do waitfor 180 vm_ready $i || echo "WARN v$i"; done
   sleep 30; out vm_mem_per_idle_1g_guest_mb "$(( ($(memsettled) - m0) / 3 ))" MB
+  diag_host
   for i in 21 22 23; do vm_rm $i; done
 }
 
@@ -121,6 +134,7 @@ s_vmnet() {
   out vm_to_vm_gbit "$(printf '%s\n' "${g[@]}" | median)" Gbit/s
   r=$($GSSH bench@"$b" "ping -c 50 -i 0.05 -q $a" | awk -F/ '/rtt/{print $5}')
   out vm_to_vm_ping_ms "$r" ms
+  echo "DIAG guest $($GSSH bench@"$b" 'echo nproc $(nproc); ethtool -g eth0 2>/dev/null | tr -s "\t\n" " "; ethtool -l eth0 2>/dev/null | tr -s "\t\n" " "')"
   # host to guest
   if command -v iperf3 >/dev/null; then
     g=()
@@ -158,6 +172,7 @@ s_backup() { # back up a stopped VM with 1 GB of random data written into it, th
     s=$(t); tk=$(ogapi POST /v1/restore "{\"store\":\"bench\",\"snapshot\":\"$snap\"}" | sed -n 's/.*"task":"\([^"]*\)".*/\1/p'); ogtask "$tk" >/dev/null; out restore_vm_s "$(since $s)" s
     s=$(t); tk=$(ogapi POST /v1/backup '{"store":"bench","targets":[{"kind":"vm","name":"v51"}]}' | sed -n 's/.*"task":"\([^"]*\)".*/\1/p'); ogtask "$tk" >/dev/null; out backup_vm_again_s "$(since $s)" s
     ogapi DELETE /v1/vms/v51 >/dev/null
+    rm -rf /var/lib/og-host/bench-store
   fi
 }
 

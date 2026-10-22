@@ -143,7 +143,15 @@ impl Pools {
         let (p, n) = self.split(vol)?;
         Ok(match p.kind.as_str() {
             "dir" => Path::new(&p.path).join(if n.contains('.') { n } else { format!("{n}.qcow2") }),
-            "lvmthin" => PathBuf::from(format!("/dev/{}/{n}", p.vg)),
+            "lvmthin" => {
+                let dev = PathBuf::from(format!("/dev/{}/{n}", p.vg));
+                // thin snapshots (linked clones) are marked "skip activation", so they're
+                // inactive after a reboot: bring a volume up when it's asked for
+                if !dev.exists() {
+                    let _ = std::process::Command::new("lvchange").args(["-q", "-ay", "-K", &format!("{}/{n}", p.vg)]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                }
+                dev
+            }
             _ => PathBuf::from(format!("/dev/zvol/{}/{n}", p.dataset)),
         })
     }
