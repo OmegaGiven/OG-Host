@@ -352,7 +352,9 @@ async fn live_copy(d: &Daemon, t: &crate::tasks::Task, name: &str, vm: &Vm, host
     }
     t.log(format!("disks in sync after {:.0} s; moving memory", t0.elapsed().as_secs_f64()));
     q("migrate-set-capabilities", json!({"capabilities": [{"capability": "events", "state": true}]}))?;
-    q("migrate-set-parameters", json!({"tls-creds": "ogtls", "tls-hostname": host}))?;
+    // the guest is paused for at most ~50 ms at the switch (QEMU's default allows 300 ms;
+    // Proxmox uses 100 ms); QEMU caps the bandwidth at 128 MiB/s unless told otherwise
+    q("migrate-set-parameters", json!({"tls-creds": "ogtls", "tls-hostname": host, "downtime-limit": 50, "max-bandwidth": 10u64 << 30}))?;
     q("migrate", json!({"uri": format!("tcp:{host}:{mig_port}")}))?;
     let t1 = Instant::now();
     loop {

@@ -109,7 +109,9 @@ s_vms() {
   local m0; m0=$(memsettled)
   for i in 21 22 23; do vm_clone $i 1; vm_start $i; done
   for i in 21 22 23; do waitfor 180 vm_ready $i || echo "WARN v$i"; done
-  sleep 30; out vm_mem_per_idle_1g_guest_mb "$(( ($(memsettled) - m0) / 3 ))" MB
+  # idle VMs run for hours: measured after 3 minutes (also after 30 s, freshly booted)
+  sleep 30; out vm_mem_per_fresh_1g_guest_mb "$(( ($(memsettled) - m0) / 3 ))" MB
+  sleep 150; out vm_mem_per_idle_1g_guest_mb "$(( ($(memsettled) - m0) / 3 ))" MB
   diag_host
   for i in 21 22 23; do vm_rm $i; done
 }
@@ -122,16 +124,20 @@ guest_tools() { # N: install fio + iperf3 in the guest
 s_vmdisk() {
   vm_clone 31 1; vm_start 31; waitfor 180 vm_ready 31; guest_tools 31 || echo "WARN no fio"
   local ip; ip=$(vm_ip 31)
-  for spec in "randread 4k 32" "randwrite 4k 32" "read 1M 8" "write 1M 8"; do
+  # each test RUNS times on its own fresh 2 GB file, medians; terse v3: read iops 8, read KB/s 7, write iops 49, write KB/s 48
+  for spec in "randread 4k 32 8" "randwrite 4k 32 49" "read 1M 8 7" "write 1M 8 48"; do
     set -- $spec
-    r=$($GSSH bench@"$ip" "sudo fio --name=b --filename=/var/tmp/fio --size=2G --direct=1 --ioengine=libaio --rw=$1 --bs=$2 --iodepth=$3 --runtime=20 --time_based --group_reporting --output-format=terse --terse-version=3" 2>/dev/null)
-    # terse v3: read iops field 8, read KB/s 7; write iops 49, write KB/s 48
+    local v=()
+    for i in $(seq $RUNS); do
+      r=$($GSSH bench@"$ip" "sudo rm -f /var/tmp/fio; sudo fio --name=b --filename=/var/tmp/fio --size=2G --direct=1 --ioengine=libaio --rw=$1 --bs=$2 --iodepth=$3 --runtime=20 --time_based --group_reporting --output-format=terse --terse-version=3" 2>/dev/null)
+      v+=("$(echo "$r" | cut -d';' -f$4)")
+    done
+    local m; m=$(printf '%s\n' "${v[@]}" | median)
     case $1 in
-      randread) out vm_fio_randread_4k_iops "$(echo "$r" | cut -d';' -f8)" iops ;;
-      randwrite) out vm_fio_randwrite_4k_iops "$(echo "$r" | cut -d';' -f49)" iops ;;
-      read) out vm_fio_seqread_1m_mbs "$(echo "$r" | cut -d';' -f7 | awk '{printf "%d", $1/1024}')" MB/s ;;
-      write) out vm_fio_seqwrite_1m_mbs "$(echo "$r" | cut -d';' -f48 | awk '{printf "%d", $1/1024}')" MB/s ;;
+      randread|randwrite) out vm_fio_${1}_4k_iops "$m" iops ;;
+      *) out vm_fio_seq${1}_1m_mbs "$(awk -v x="$m" 'BEGIN{printf "%d", x/1024}')" MB/s ;;
     esac
+    echo "DIAG fio $1 runs: ${v[*]}"
   done
   vm_rm 31
 }
@@ -315,6 +321,7 @@ s_vmdensity() { # 1 GB guests started until one doesn't come up within 3 minutes
     vm_clone $i 1; vm_start $i
     if waitfor 180 vm_ready $i; then n=$((n+1)); else echo "WARN v$i not ready"; break; fi
   done
+  sleep 180
   out vm_density_1g_guests "$n" "(max 16)"
   out vm_density_host_used_mb "$(memsettled)" MB
   out vm_density_ksm_saved_mb "$(( $(cat /sys/kernel/mm/ksm/pages_sharing) * 4 / 1024 ))" MB

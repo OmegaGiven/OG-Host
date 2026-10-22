@@ -108,6 +108,31 @@ pub struct Attachment {
     pub ports: Vec<PortMap>,
 }
 
+/// `ip netns add` for `owner` (if missing); its /run/netns path.
+fn netns_add(owner: &str) -> Result<PathBuf> {
+    let name = ifname("og-", owner);
+    let path = PathBuf::from("/run/netns").join(&name);
+    if !path.exists() {
+        run(&["ip", "netns", "add", &name])?;
+    }
+    Ok(path)
+}
+
+/// Several `ip` commands in one process (`ip [-n NS] -batch -`); stops at the first failure.
+fn ip_batch(ns: Option<&str>, lines: &[String]) -> Result<()> {
+    let mut c = Command::new("ip");
+    if let Some(n) = ns {
+        c.args(["-n", n]);
+    }
+    let mut child = c.args(["-batch", "-"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
+    child.stdin.take().expect("stdin").write_all(lines.join("\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::Command { cmd: format!("ip -batch: {}", lines.join("; ")), stderr: String::from_utf8_lossy(&out.stderr).trim().to_string() });
+    }
+    Ok(())
+}
+
 fn run(args: &[&str]) -> Result<String> {
     let out = Command::new(args[0]).args(&args[1..]).stdin(Stdio::null()).output()?;
     if !out.status.success() {
@@ -363,12 +388,8 @@ impl Net {
 
     /// A namespace with only loopback (up). Used for `network: none` and as the first step of attach.
     pub fn create_netns(&self, owner: &str) -> Result<PathBuf> {
-        let name = ifname("og-", owner);
-        let path = PathBuf::from("/run/netns").join(&name);
-        if !path.exists() {
-            run(&["ip", "netns", "add", &name])?;
-        }
-        run(&["ip", "-n", &name, "link", "set", "lo", "up"])?;
+        let path = netns_add(owner)?;
+        run(&["ip", "-n", &path.file_name().unwrap().to_string_lossy(), "link", "set", "lo", "up"])?;
         Ok(path)
     }
 
@@ -385,21 +406,30 @@ impl Net {
             }
         }
         let net = self.ensure(network, None)?;
-        let netns = self.create_netns(owner)?;
+        let netns = netns_add(owner)?;
         let ns_name = netns.file_name().unwrap().to_string_lossy().to_string();
         let ip = ipam::allocate(&self.ipam_path(&net.name), &net.subnet, owner)?;
         let veth = ifname("ogv", owner);
         let result = (|| -> Result<()> {
+            // two `ip` processes (host side, namespace side) instead of one per step
+            let mut host = vec![];
             if !Path::new("/sys/class/net").join(&veth).exists() {
-                run(&["ip", "link", "add", &veth, "type", "veth", "peer", "name", "eth0", "netns", &ns_name])?;
+                host.push(format!("link add {veth} type veth peer name eth0 netns {ns_name}"));
             }
-            run(&["ip", "link", "set", &veth, "master", &net.bridge, "up"])?;
+            host.push(format!("link set {veth} master {} up", net.bridge));
+            ip_batch(None, &host)?;
             let mac = mac.map(str::to_string).unwrap_or_else(|| mac_for(ip));
-            run(&["ip", "-n", &ns_name, "link", "set", "eth0", "address", &mac])?;
-            let _ = run(&["ip", "-n", &ns_name, "addr", "flush", "dev", "eth0"]);
-            run(&["ip", "-n", &ns_name, "addr", "add", &format!("{ip}/{}", net.subnet.prefix), "dev", "eth0"])?;
-            run(&["ip", "-n", &ns_name, "link", "set", "eth0", "up"])?;
-            run(&["ip", "-n", &ns_name, "route", "replace", "default", "via", &net.subnet.gateway().to_string()])?;
+            ip_batch(
+                Some(&ns_name),
+                &[
+                    "link set lo up".to_string(),
+                    format!("link set eth0 address {mac}"),
+                    "addr flush dev eth0".to_string(),
+                    format!("addr add {ip}/{} dev eth0", net.subnet.prefix),
+                    "link set eth0 up".to_string(),
+                    format!("route replace default via {}", net.subnet.gateway()),
+                ],
+            )?;
             self.publish(owner, ip, ports)?;
             Ok(())
         })();
@@ -485,11 +515,25 @@ impl Net {
         Ok(())
     }
 
+    fn published_marker(&self, owner: &str) -> PathBuf {
+        self.state_dir.join("published").join(owner)
+    }
+
     fn publish(&self, owner: &str, ip: Ipv4Addr, ports: &[PortMap]) -> Result<()> {
+        // nothing published now and nothing before: no need to read the ruleset
+        let marker = self.published_marker(owner);
+        if ports.is_empty() && !marker.exists() {
+            return Ok(());
+        }
         self.unpublish(owner)?; // idempotent: re-attaching never duplicates rules
+        let _ = std::fs::remove_file(&marker);
         if ports.is_empty() {
             return Ok(());
         }
+        if let Some(d) = marker.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(&marker, "");
         let tag = format!("og:{owner}");
         let mut script = String::new();
         for p in ports {
@@ -512,6 +556,7 @@ impl Net {
     /// Remove everything `owner` had: rules, veth, namespace, address. Safe to call twice.
     pub fn detach(&self, owner: &str) -> Result<()> {
         self.unpublish(owner)?;
+        let _ = std::fs::remove_file(self.published_marker(owner));
         for dev in [ifname("ogv", owner), tap_name(owner), ifname("ogm", owner)] {
             if Path::new("/sys/class/net").join(&dev).exists() {
                 let _ = run(&["ip", "link", "del", &dev]);

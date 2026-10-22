@@ -613,12 +613,12 @@ impl Node {
         }
         cmd.spawn().context("starting og-shim")?;
         // wait briefly for the shim to report running/failed
-        for _ in 0..100 {
+        for _ in 0..1000 {
             let st = self.status(id);
             match st.state.as_str() {
                 "running" | "exited" => return Ok(()),
                 "failed" => bail!("container failed to start: {}", st.error.unwrap_or_default()),
-                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
         bail!("container did not report a state within 5s (see {})", dir.join("shim.log").display())
