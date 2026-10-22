@@ -138,6 +138,13 @@ One daemon per node. Any node's UI shows the whole cluster (two nodes today).
 - virtio-mem / free page reporting so idle VMs return memory where the guest supports it.
 - Browser console (noVNC/serial over WebSocket), snapshots on ZFS zvols.
 - The OG-OS CI runner becomes a container with `/dev/kvm` instead of a VM.
+- VMs stay first-class for what containers can't do: Windows (builds, Windows-only apps and
+  games), other kernels, untrusted code that needs a hardware boundary.
+- "Looks like a real PC" profile for VMs too (Windows games/anti-cheat check for VMs): hide
+  the KVM signature (`kvm=off`, custom `hv_vendor_id`, no hypervisor CPUID bit where the
+  guest allows), host SMBIOS/DMI passed through or a realistic custom one, real-looking disk
+  model/serial and NIC vendor (OUI) instead of QEMU/virtio names. Trade-off: hiding Hyper-V
+  enlightenments costs Windows guest performance, so it is opt-in per VM.
 
 ### 4.7 The brain (resource policy)
 - Every workload gets a priority class: **critical** (Jellyfin, Immich, databases,
@@ -159,6 +166,34 @@ One daemon per node. Any node's UI shows the whole cluster (two nodes today).
   batch job once squeezing stops freeing memory (without swap that is immediate) -> alert.
   Tested on a 1.8 GB VM: a 1.1 GB batch job is throttled then evicted before the kernel OOM
   killer runs; critical/normal containers untouched. Containers report `OOMKilled`.
+
+### 4.9 "Looks like a real PC" (desktop profile)
+Applies to containers and VMs alike (VM side in §4.6). Game containers (Wolf sessions) should not look like containers or VMs to games and
+anti-cheat. Containers start ahead here: the game sees the real CPU (no hypervisor CPUID
+bit), real GPU and real devices. `og.profile=desktop` removes the remaining tells:
+- hostname like a desktop (`og.hostname`, default `DESKTOP-XXXXXXX`), a stable
+  `/etc/machine-id`, a NIC MAC with a real vendor prefix instead of a random 02:xx one;
+- DMI/SMBIOS (`/sys/class/dmi/id`): the host's own when it is bare metal; when the host is
+  itself a VM, generic desktop-board values (or `og.dmi.*` labels) over the QEMU ones;
+- no container markers (`/.dockerenv`, `/run/.containerenv`, `container=`); cgroup
+  namespace so `/proc/self/cgroup` is `0::/`;
+- nested namespaces allowed (seccomp) and `/proc` left fully visible (no masked paths) so
+  Steam's pressure-vessel / bubblewrap works inside. Safe enough because the container root is
+  an unprivileged host user (user namespace); documented trade-off vs the default profile.
+- Wolf creates session containers through its scoped socket; the scope adds the profile and
+  `og.gpu-class=gaming` to every container it creates (`--scope-label`).
+Known remaining tells: the host kernel version string, `/proc/self/mountinfo` paths. A
+resource view (LXCFS-style /proc/meminfo, cpuinfo) is planned for capped non-desktop
+containers; it can't be used with the desktop profile because overmounting /proc breaks
+nested /proc mounts (bubblewrap).
+
+### 4.10 Resource caps
+Per container, set at create time and changeable live (`docker update`, `POST
+/v1/containers/{id}/resources`, the UI): memory max/high/low, CPU quota (`cpus`), CPU
+pinning (`cpuset`), CPU weight, pids, disk I/O bandwidth and IOPS per device. Presets:
+`minimal` (a quarter core, lowest weight, memory held at its current size) and `restore`
+(back to what it was created with). Changes are written to the cgroup at once and kept in
+the bundle so they survive restarts.
 
 ### 4.8 Web UI and API
 - OmegaEnv becomes the UI: Home (apps), Monitor, Explore (metrics), Logs, Watch, Apps
@@ -201,8 +236,12 @@ One daemon per node. Any node's UI shows the whole cluster (two nodes today).
 4. **Brain** — priority classes, memory.low/high, PSI, scale-to-zero, GPU scheduler.
 5. **Storage + networking** — ZFS volumes and snapshots, backups to the NAS, VPN networks.
 6. **Base image** — mkosi build, A/B updates, first-boot setup, CI boot tests.
-7. **VMs** — Cloud Hypervisor + QEMU, console, Windows.
-8. **Pilot** — proxmoxtwo (after its RAM is tested/fenced), then the main host, one stack
+7. **VMs** — Cloud Hypervisor + QEMU, console, Windows (builds, Windows-only software),
+   "looks like a real PC" option for game VMs.
+8. **Own game streaming** — look into rewriting Wolf (Moonlight-compatible streaming,
+   per-session game containers) for OG-Host: native use of the desktop profile, the GPU
+   scheduler and the brain instead of driving a Docker socket. After the steps above.
+9. **Pilot** — proxmoxtwo (after its RAM is tested/fenced), then the main host, one stack
    at a time.
 
 ## 8. Decisions log

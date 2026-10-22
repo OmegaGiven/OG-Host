@@ -30,6 +30,8 @@ pub struct Scope {
     pub name: String,
     pub key: String,
     pub value: String,
+    /// og.* labels put on every container this scope creates (e.g. og.profile=desktop for Wolf).
+    pub labels: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -94,6 +96,7 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/containers/{id}/attach", post(container_attach))
         .route("/containers/{id}/logs", get(container_logs))
         .route("/containers/{id}/stats", get(container_stats))
+        .route("/containers/{id}/update", post(container_update))
         .route("/containers/{id}/exec", post(exec_create))
         .route("/exec/{id}/start", post(exec_start))
         .route("/exec/{id}/json", get(exec_inspect))
@@ -445,6 +448,33 @@ struct CreateBody {
     healthcheck: Option<Value>,
 }
 
+/// NanoCpus, or CpuQuota/CpuPeriod -> (quota, period) in microseconds.
+fn cpu_quota_of(hc: &Value) -> Option<(i64, u64)> {
+    if let Some(n) = hc["NanoCpus"].as_i64().filter(|n| *n > 0) {
+        return Some((n / 10_000, 100_000)); // 1e9 nano-CPUs = one core = 100000/100000
+    }
+    let q = hc["CpuQuota"].as_i64().filter(|q| *q > 0)?;
+    Some((q, hc["CpuPeriod"].as_u64().filter(|p| *p > 0).unwrap_or(100_000)))
+}
+
+/// BlkioDevice{Read,Write}{Bps,IOps}: [{Path, Rate}] -> one IoLimit per device.
+fn io_limits_of(hc: &Value) -> Vec<og_runtime::IoLimit> {
+    let mut by_dev: BTreeMap<String, og_runtime::IoLimit> = BTreeMap::new();
+    for (key, which) in [("BlkioDeviceReadBps", 0), ("BlkioDeviceWriteBps", 1), ("BlkioDeviceReadIOps", 2), ("BlkioDeviceWriteIOps", 3)] {
+        for d in hc[key].as_array().into_iter().flatten() {
+            let (Some(path), Some(rate)) = (d["Path"].as_str(), d["Rate"].as_u64()) else { continue };
+            let l = by_dev.entry(path.to_string()).or_insert_with(|| og_runtime::IoLimit { device: path.into(), read_bps: None, write_bps: None, read_iops: None, write_iops: None });
+            match which {
+                0 => l.read_bps = Some(rate),
+                1 => l.write_bps = Some(rate),
+                2 => l.read_iops = Some(rate),
+                _ => l.write_iops = Some(rate),
+            }
+        }
+    }
+    by_dev.into_values().collect()
+}
+
 fn str_vec(v: &Value) -> Vec<String> {
     v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
 }
@@ -591,6 +621,12 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
 
     let mut labels = b.labels.clone().unwrap_or_default();
     if let Some(s) = &ctx.scope {
+        // OG-Host policy labels (priority, profile, ...) come from the scope's configuration,
+        // never from the client: a scoped client can't promote itself or loosen its sandbox
+        labels.retain(|k, _| !k.starts_with("og."));
+        for (k, v) in &s.labels {
+            labels.insert(k.clone(), v.clone());
+        }
         labels.insert(s.key.clone(), if s.value.is_empty() { "1".into() } else { s.value.clone() });
     }
     let healthcheck = b.healthcheck.as_ref().and_then(|h| {
@@ -625,6 +661,11 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
     let shm = hc["ShmSize"].as_u64().filter(|m| *m > 0);
     let pids = hc["PidsLimit"].as_i64().filter(|p| *p > 0);
     let cpu_shares = hc["CpuShares"].as_u64().filter(|c| *c > 0);
+    let cpu_quota = cpu_quota_of(&hc);
+    let cpuset_cpus = hc["CpusetCpus"].as_str().filter(|s| !s.is_empty()).map(String::from);
+    let cpuset_mems = hc["CpusetMems"].as_str().filter(|s| !s.is_empty()).map(String::from);
+    let io_weight = hc["BlkioWeight"].as_u64().filter(|w| *w > 0).map(|w| (w as u16).saturating_mul(10).min(10000));
+    let io_limits = io_limits_of(&hc);
     let read_only = hc["ReadonlyRootfs"].as_bool().unwrap_or(false);
     let (image, name) = (b.image.clone(), q.name.clone());
     let d = ctx.d.clone();
@@ -649,6 +690,11 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
             o.memory_low = memory_low;
             o.shm_size = shm;
             o.cpu_shares = cpu_shares;
+            o.cpu_quota = cpu_quota;
+            o.cpuset_cpus = cpuset_cpus;
+            o.cpuset_mems = cpuset_mems;
+            o.io_weight = io_weight;
+            o.io_limits = io_limits;
             o.read_only_root = read_only;
             if let Some(p) = pids {
                 o.pids_max = p;
@@ -819,6 +865,40 @@ async fn container_attach(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>, 
         .header(header::UPGRADE, "tcp")
         .body(Body::empty())
         .unwrap())
+}
+
+/// docker update: live resource changes.
+async fn container_update(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>, Json(b): Json<Value>) -> R<Json<Value>> {
+    let m = find(&ctx, &id)?;
+    let mut r = crate::resources::Resources::default();
+    let mut warnings = Vec::new();
+    if let Some(v) = b["Memory"].as_i64().filter(|v| *v != 0) {
+        r.memory_max = Some(v.max(0));
+    }
+    if let Some(v) = b["MemoryReservation"].as_i64().filter(|v| *v != 0) {
+        r.memory_low = Some(v.max(0));
+    }
+    if let Some((q, p)) = cpu_quota_of(&b) {
+        r.cpus = Some(q as f64 / p as f64);
+    }
+    if let Some(sh) = b["CpuShares"].as_u64().filter(|v| *v > 0) {
+        r.cpu_weight = Some(1 + (sh.clamp(2, 262144) - 2) * 9999 / 262142);
+    }
+    if let Some(c) = b["CpusetCpus"].as_str().filter(|c| !c.is_empty()) {
+        r.cpuset_cpus = Some(c.to_string());
+    }
+    if let Some(p) = b["PidsLimit"].as_i64().filter(|v| *v != 0) {
+        r.pids_max = Some(p.max(0));
+    }
+    if let Some(w) = b["BlkioWeight"].as_u64().filter(|w| *w > 0) {
+        r.io_weight = Some((w as u16).saturating_mul(10).min(10000));
+    }
+    if b["RestartPolicy"]["Name"].as_str().is_some_and(|n| !n.is_empty()) {
+        warnings.push("restart policy changes are not supported by update yet".to_string());
+    }
+    let d = ctx.d.clone();
+    tokio::task::spawn_blocking(move || crate::resources::update(&d.node, &m.id, &r)).await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(json!({ "Warnings": warnings })))
 }
 
 // ---- exec ----------------------------------------------------------------------------------

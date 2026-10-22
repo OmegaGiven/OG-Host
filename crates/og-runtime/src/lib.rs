@@ -13,6 +13,67 @@ pub mod users;
 
 pub use oci_spec::runtime::Capability;
 
+/// Disk I/O cap on one block device (a partition or a path on it means its whole disk).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IoLimit {
+    pub device: PathBuf,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
+    pub read_iops: Option<u64>,
+    pub write_iops: Option<u64>,
+}
+
+impl IoLimit {
+    /// `MAJ:MIN` of the whole disk behind `device`.
+    pub fn disk(&self) -> Result<(u32, u32)> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let md = std::fs::metadata(&self.device).map_err(|e| Error::Invalid(format!("{}: {e}", self.device.display())))?;
+        let dev = if md.file_type().is_block_device() { md.rdev() } else { md.dev() };
+        let (mut maj, mut min) = (libc_major(dev) as u32, libc_minor(dev) as u32);
+        // a partition: use its parent disk
+        let sys = PathBuf::from(format!("/sys/dev/block/{maj}:{min}"));
+        if sys.join("partition").exists() {
+            if let Ok(d) = std::fs::read_to_string(sys.join("../dev")) {
+                if let Some((a, b)) = d.trim().split_once(':') {
+                    maj = a.parse().unwrap_or(maj);
+                    min = b.parse().unwrap_or(min);
+                }
+            }
+        }
+        Ok((maj, min))
+    }
+
+    /// The line for cgroup v2 io.max.
+    pub fn io_max_line(&self) -> Result<String> {
+        let (maj, min) = self.disk()?;
+        let v = |o: Option<u64>| o.map_or("max".to_string(), |x| x.to_string());
+        Ok(format!("{maj}:{min} rbps={} wbps={} riops={} wiops={}", v(self.read_bps), v(self.write_bps), v(self.read_iops), v(self.write_iops)))
+    }
+}
+
+/// Paths hidden from the container. The desktop profile leaves /proc alone: the kernel only
+/// lets a nested user namespace mount a fresh procfs (bubblewrap, Steam's pressure-vessel) when
+/// no part of the existing /proc is covered. The user namespace still keeps the sensitive files
+/// (kcore, sysrq-trigger, /proc/sys) out of reach: their checks are against the host's root.
+fn masked_paths(desktop: bool) -> Vec<String> {
+    let proc = ["/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi"];
+    let sys = ["/sys/firmware", "/sys/devices/virtual/powercap"];
+    let mut v: Vec<String> = sys.iter().map(|s| s.to_string()).collect();
+    if !desktop {
+        v.extend(proc.iter().map(|s| s.to_string()));
+    }
+    v
+}
+
+fn readonly_paths(desktop: bool) -> Vec<String> {
+    if desktop {
+        return vec![];
+    }
+    ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"].iter().map(|s| s.to_string()).collect()
+}
+
+
+
 use std::path::{Path, PathBuf};
 
 use og_oci::registry::ImageConfig;
@@ -123,6 +184,17 @@ pub struct RunOptions {
     pub memory_low: Option<i64>,
     /// cgroup v2 cpu.weight equivalent (shares 2..262144; Docker's default is 1024).
     pub cpu_shares: Option<u64>,
+    /// CPU quota per period in microseconds (`cpus: 1.5` = 150000 per 100000).
+    pub cpu_quota: Option<(i64, u64)>,
+    /// CPU / memory-node pinning, e.g. "0-3".
+    pub cpuset_cpus: Option<String>,
+    pub cpuset_mems: Option<String>,
+    /// io.weight, 1..=10000 (default 100).
+    pub io_weight: Option<u16>,
+    pub io_limits: Vec<IoLimit>,
+    /// Desktop profile (DESIGN.md §4.9): /proc left fully visible and nested namespaces
+    /// allowed, so bubblewrap / Steam's pressure-vessel work inside.
+    pub desktop: bool,
     pub pids_max: i64,
     pub shm_size: Option<u64>,
     /// cgroup path relative to the cgroup root, e.g. `/og-host/<stack>/<name>`.
@@ -155,6 +227,12 @@ impl RunOptions {
             memory_high: None,
             memory_low: None,
             cpu_shares: None,
+            cpu_quota: None,
+            cpuset_cpus: None,
+            cpuset_mems: None,
+            io_weight: None,
+            io_limits: Vec::new(),
+            desktop: false,
             pids_max: 4096,
             shm_size: None,
             cgroup_path: cgroup_path.into(),
@@ -413,8 +491,46 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
     if let Some(m) = opts.memory_max {
         res = res.memory(LinuxMemoryBuilder::default().limit(m).build()?);
     }
-    if let Some(s) = opts.cpu_shares {
-        res = res.cpu(LinuxCpuBuilder::default().shares(s).build()?);
+    if opts.cpu_shares.is_some() || opts.cpu_quota.is_some() || opts.cpuset_cpus.is_some() || opts.cpuset_mems.is_some() {
+        let mut cpu = LinuxCpuBuilder::default();
+        if let Some(s) = opts.cpu_shares {
+            cpu = cpu.shares(s);
+        }
+        if let Some((q, p)) = opts.cpu_quota {
+            cpu = cpu.quota(q).period(p);
+        }
+        if let Some(c) = &opts.cpuset_cpus {
+            cpu = cpu.cpus(c.clone());
+        }
+        if let Some(m) = &opts.cpuset_mems {
+            cpu = cpu.mems(m.clone());
+        }
+        res = res.cpu(cpu.build()?);
+    }
+    if let Some(w) = opts.io_weight {
+        unified.insert("io.weight".to_string(), format!("default {}", w.clamp(1, 10000)));
+    }
+    if !opts.io_limits.is_empty() {
+        use oci_spec::runtime::{LinuxBlockIoBuilder, LinuxThrottleDevice, LinuxThrottleDeviceBuilder};
+        let (mut rb, mut wb, mut ri, mut wi) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let dev = |maj: u32, min: u32, rate: u64| -> Result<LinuxThrottleDevice> {
+            Ok(LinuxThrottleDeviceBuilder::default().major(maj as i64).minor(min as i64).rate(rate).build()?)
+        };
+        for l in &opts.io_limits {
+            let (maj, min) = l.disk()?;
+            if let Some(r) = l.read_bps { rb.push(dev(maj, min, r)?); }
+            if let Some(r) = l.write_bps { wb.push(dev(maj, min, r)?); }
+            if let Some(r) = l.read_iops { ri.push(dev(maj, min, r)?); }
+            if let Some(r) = l.write_iops { wi.push(dev(maj, min, r)?); }
+        }
+        res = res.block_io(
+            LinuxBlockIoBuilder::default()
+                .throttle_read_bps_device(rb)
+                .throttle_write_bps_device(wb)
+                .throttle_read_iops_device(ri)
+                .throttle_write_iops_device(wi)
+                .build()?,
+        );
     }
     if !unified.is_empty() {
         res = res.unified(unified);
@@ -425,24 +541,14 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         .devices(linux_devices)
         .resources(res.build()?)
         .cgroups_path(opts.cgroup_path.clone())
-        .masked_paths(
-            [
-                "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list",
-                "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi", "/sys/firmware", "/sys/devices/virtual/powercap",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
-        )
-        .readonly_paths(
-            ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"].iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        );
+        .masked_paths(masked_paths(opts.desktop))
+        .readonly_paths(readonly_paths(opts.desktop));
     if let Some(map) = opts.userns.filter(|_| opts.userns_path.is_none()) {
         let m = LinuxIdMappingBuilder::default().container_id(0u32).host_id(map.host_start).size(map.size).build()?;
         linux = linux.uid_mappings(vec![m]).gid_mappings(vec![m]);
     }
     if !opts.seccomp_unconfined {
-        linux = linux.seccomp(seccomp::default_profile(&caps));
+        linux = linux.seccomp(seccomp::default_profile(&caps, opts.desktop));
     }
 
     // CDI hooks (e.g. nvidia-cdi-hook update-ldcache / create-symlinks)

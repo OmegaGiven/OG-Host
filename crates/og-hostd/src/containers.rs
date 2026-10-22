@@ -47,6 +47,9 @@ pub struct Meta {
     pub healthcheck: Option<og_compose::Healthcheck>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// Resources before a `minimal` preset, for `restore`.
+    #[serde(default)]
+    pub saved_resources: Option<crate::resources::Resources>,
     /// CDI devices (GPUs) it was given.
     #[serde(default)]
     pub gpus: Vec<String>,
@@ -139,7 +142,7 @@ fn valid_name(n: &str) -> bool {
 }
 
 impl Node {
-    fn dir(&self, id: &str) -> PathBuf {
+    pub(crate) fn dir(&self, id: &str) -> PathBuf {
         self.root.join("containers").join(id)
     }
 
@@ -237,6 +240,14 @@ impl Node {
             }
         }
 
+        // desktop profile: look like a real PC (DESIGN.md §4.9)
+        let desktop = crate::desktop::is_desktop(&extra.labels);
+        if desktop {
+            opts.desktop = true;
+            opts.hostname = crate::desktop::hostname(&extra.labels, &id, &opts.hostname, &name);
+        }
+        let mac = crate::desktop::mac(&extra.labels, &id);
+
         // networking: namespace + address before the container exists
         if !ports.is_empty() && !matches!(net_choice, NetChoice::Network(_)) {
             bail!("ports can only be published on a network (not with none/host/container:)");
@@ -249,7 +260,7 @@ impl Node {
         }
         let (attachment, network_mode, my_ip) = match &net_choice {
             NetChoice::Network(n) => {
-                let a = self.net.attach(&id, n, &ports).with_context(|| format!("attaching to network {n:?}"))?;
+                let a = self.net.attach_mac(&id, n, &ports, mac.as_deref()).with_context(|| format!("attaching to network {n:?}"))?;
                 opts.network = og_runtime::Network::Join(a.netns.clone());
                 let ip = a.ip;
                 (Some(a), n.clone(), ip)
@@ -332,9 +343,24 @@ impl Node {
         let hosts_entries: Vec<(String, String)> = extra.peers.iter().cloned().chain(extra_hosts.iter().cloned()).collect();
         std::fs::write(etc.join("hosts"), og_net::container_hosts(extra.service.as_deref().unwrap_or(&name), my_ip, &hosts_entries))?;
         std::fs::write(etc.join("extra_hosts.json"), serde_json::to_vec(&extra_hosts)?)?;
-        std::fs::write(etc.join("hostname"), format!("{name}\n"))?;
+        std::fs::write(etc.join("hostname"), format!("{}\n", opts.hostname))?;
+        let mut etc_files = vec!["resolv.conf", "hosts", "hostname"];
+        if desktop {
+            std::fs::write(etc.join("machine-id"), format!("{}\n", crate::desktop::machine_id(&id)))?;
+            etc_files.push("machine-id");
+            // DMI/SMBIOS: generic desktop values over a VM host's, or og.dmi.* labels
+            let dmi = dir.join("dmi");
+            for (field, value) in crate::desktop::dmi_overrides(&extra.labels, crate::desktop::host_is_virtual()) {
+                if !std::path::Path::new("/sys/class/dmi/id").join(&field).exists() {
+                    continue;
+                }
+                std::fs::create_dir_all(&dmi)?;
+                std::fs::write(dmi.join(&field), format!("{value}\n"))?;
+                opts.mounts.push(og_runtime::BindMount { source: dmi.join(&field), target: PathBuf::from("/sys/devices/virtual/dmi/id").join(&field), read_only: true });
+            }
+        }
         if !matches!(net_choice, NetChoice::Host) {
-            for f in ["resolv.conf", "hosts", "hostname"] {
+            for f in etc_files {
                 // the target must exist inside the image for the bind mount
                 let target = og_oci::unpack::secure_join(&rootfs, std::path::Path::new("etc").join(f).as_path())?;
                 if let Some(p) = target.parent() {
@@ -370,6 +396,7 @@ impl Node {
             auto_remove: extra.auto_remove,
             aliases: extra.aliases,
             gpus: opts.cdi_devices.clone(),
+            saved_resources: None,
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         if extra.no_start {
@@ -417,7 +444,7 @@ impl Node {
         }
     }
 
-    fn save_meta(&self, m: &Meta) -> Result<()> {
+    pub(crate) fn save_meta(&self, m: &Meta) -> Result<()> {
         let p = self.dir(&m.id).join("meta.json");
         let tmp = p.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(m)?)?;
@@ -450,7 +477,7 @@ impl Node {
         }
         if let Some(a) = meta.net.clone() {
             if let Some(network) = &a.network {
-                let fresh = self.net.attach(&meta.id, network, &a.ports).with_context(|| format!("re-attaching to {network}"))?;
+                let fresh = self.net.attach_mac(&meta.id, network, &a.ports, crate::desktop::mac(&meta.labels, &meta.id).as_deref()).with_context(|| format!("re-attaching to {network}"))?;
                 meta.net = Some(fresh);
                 self.save_meta(&meta)?;
             }

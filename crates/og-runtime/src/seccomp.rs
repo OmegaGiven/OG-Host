@@ -58,17 +58,22 @@ fn architectures() -> Vec<&'static str> {
     }
 }
 
-/// The profile for a container holding `caps`.
-pub fn default_profile(caps: &[Capability]) -> LinuxSeccomp {
+/// Syscalls a sandbox inside the container needs to build its own namespaces (bubblewrap,
+/// Steam's pressure-vessel, browsers' sandboxes): allowed with `nested`. Inside our user
+/// namespace they act on namespaces owned by the container's unprivileged root.
+const NESTED: &[&str] = &["unshare", "setns", "mount", "umount", "umount2", "pivot_root", "fsopen", "fsconfig", "fsmount", "fspick", "move_mount", "open_tree", "mount_setattr"];
+
+/// The profile for a container holding `caps`; `nested` allows nested namespaces (desktop profile).
+pub fn default_profile(caps: &[Capability], nested: bool) -> LinuxSeccomp {
     let has = |c: &[Capability]| c.iter().any(|x| caps.contains(x));
     let mut names: Vec<&str> = Vec::new();
     for (calls, lift) in RULES {
         if lift.is_empty() || !has(lift) {
-            names.extend_from_slice(calls);
+            names.extend(calls.iter().filter(|c| !(nested && NESTED.contains(c))));
         }
     }
     let mut syscalls: Vec<Value> = vec![json!({ "names": names, "action": "SCMP_ACT_ERRNO", "errnoRet": EPERM })];
-    if !caps.contains(&Capability::SysAdmin) {
+    if !caps.contains(&Capability::SysAdmin) && !nested {
         // clone's flags are its first argument on x86_64/aarch64 (s390x differs; not a target)
         for f in CLONE_NS_FLAGS {
             syscalls.push(json!({
@@ -95,16 +100,21 @@ mod tests {
     #[test]
     fn caps_lift_rules() {
         let names = |p: &LinuxSeccomp| -> Vec<String> { p.syscalls().as_ref().unwrap()[0].names().clone() };
-        let base = default_profile(&[Capability::Chown]);
+        let base = default_profile(&[Capability::Chown], false);
         let n = names(&base);
         for s in ["mount", "unshare", "bpf", "keyctl", "io_uring_setup", "kexec_load"] {
             assert!(n.iter().any(|x| x == s), "{s} should be refused");
         }
         assert!(base.syscalls().as_ref().unwrap().iter().any(|r| r.names() == &["clone3".to_string()]));
-        let admin = default_profile(&[Capability::SysAdmin]);
+        let admin = default_profile(&[Capability::SysAdmin], false);
         let n = names(&admin);
         assert!(!n.iter().any(|x| x == "mount" || x == "unshare" || x == "bpf"));
         assert!(n.iter().any(|x| x == "keyctl")); // never lifted
+        let desk = default_profile(&[Capability::Chown], true);
+        let n = names(&desk);
+        assert!(!n.iter().any(|x| x == "unshare" || x == "mount" || x == "setns"));
+        assert!(n.iter().any(|x| x == "bpf" || x == "keyctl" || x == "kexec_load"));
+        assert!(!desk.syscalls().as_ref().unwrap().iter().any(|r| r.names() == &["clone3".to_string()]));
         assert!(!admin.syscalls().as_ref().unwrap().iter().any(|r| r.names() == &["clone3".to_string()]));
     }
 }

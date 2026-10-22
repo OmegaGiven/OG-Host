@@ -95,6 +95,17 @@ pub struct Service {
     pub cap_drop: Vec<String>,
     pub shm_size: Option<String>,
     pub mem_limit: Option<String>,
+    /// mem_reservation / deploy.resources.reservations.memory (-> memory.low).
+    pub mem_reservation: Option<String>,
+    /// cpus / deploy.resources.limits.cpus.
+    pub cpus: Option<f64>,
+    pub cpuset: Option<String>,
+    pub cpu_shares: Option<u64>,
+    /// pids_limit / deploy.resources.limits.pids.
+    pub pids_limit: Option<i64>,
+    pub blkio_weight: Option<u16>,
+    /// blkio_config device limits: (path, kind 0=read_bps 1=write_bps 2=read_iops 3=write_iops, rate).
+    pub blkio_devices: Vec<(String, u8, String)>,
     pub user: Option<String>,
     pub working_dir: Option<String>,
     pub healthcheck: Option<Healthcheck>,
@@ -121,7 +132,8 @@ pub struct Project {
 const SUPPORTED_SERVICE_KEYS: &[&str] = &[
     "image", "build", "container_name", "command", "entrypoint", "environment", "env_file", "ports", "volumes",
     "restart", "depends_on", "networks", "network_mode", "hostname", "extra_hosts", "dns", "devices", "cap_add",
-    "cap_drop", "shm_size", "mem_limit", "user", "working_dir", "healthcheck", "security_opt", "labels",
+    "cap_drop", "shm_size", "mem_limit", "mem_reservation", "cpus", "cpuset", "cpu_shares", "pids_limit",
+    "blkio_config", "user", "working_dir", "healthcheck", "security_opt", "labels",
     "privileged", "deploy", "runtime", "stop_grace_period", "expose", "tty", "stdin_open", "init",
 ];
 
@@ -492,6 +504,28 @@ pub fn load(file: &Path, project_name: Option<&str>, env: &interp::Vars) -> Resu
         let mem_limit = get("mem_limit").and_then(s).or_else(|| {
             deploy.and_then(|d| d.get("resources")).and_then(|r| r.get("limits")).and_then(|l| l.get("memory")).and_then(s)
         });
+        let limits = deploy.and_then(|d| d.get("resources")).and_then(|r| r.get("limits"));
+        let reservations = deploy.and_then(|d| d.get("resources")).and_then(|r| r.get("reservations"));
+        let num = |v: Option<&Value>| -> Option<f64> {
+            match v? {
+                Value::Number(n) => n.as_f64(),
+                Value::String(x) => x.trim().parse().ok(),
+                _ => None,
+            }
+        };
+        let mem_reservation = get("mem_reservation").and_then(s).or_else(|| reservations.and_then(|r| r.get("memory")).and_then(s));
+        let cpus = num(get("cpus")).or_else(|| num(limits.and_then(|l| l.get("cpus")))).filter(|c| *c > 0.0);
+        let pids_limit = num(get("pids_limit")).or_else(|| num(limits.and_then(|l| l.get("pids")))).map(|p| p as i64).filter(|p| *p > 0);
+        let blkio = get("blkio_config");
+        let blkio_weight = num(blkio.and_then(|b| b.get("weight"))).map(|w| w as u16);
+        let mut blkio_devices = Vec::new();
+        for (key, kind) in [("device_read_bps", 0u8), ("device_write_bps", 1), ("device_read_iops", 2), ("device_write_iops", 3)] {
+            for d in blkio.and_then(|b| b.get(key)).and_then(Value::as_sequence).into_iter().flatten() {
+                if let (Some(p), Some(r)) = (d.get("path").and_then(s), d.get("rate").and_then(s)) {
+                    blkio_devices.push((p, kind, r));
+                }
+            }
+        }
         let gpus = get("runtime").and_then(s).as_deref() == Some("nvidia")
             || deploy
                 .and_then(|d| d.get("resources"))
@@ -535,6 +569,13 @@ pub fn load(file: &Path, project_name: Option<&str>, env: &interp::Vars) -> Resu
             cap_drop: str_list(get("cap_drop")),
             shm_size: get("shm_size").and_then(s),
             mem_limit,
+            mem_reservation,
+            cpus,
+            cpuset: get("cpuset").and_then(s),
+            cpu_shares: num(get("cpu_shares")).map(|c| c as u64).filter(|c| *c > 0),
+            pids_limit,
+            blkio_weight,
+            blkio_devices,
             user: get("user").and_then(s),
             working_dir: get("working_dir").and_then(s),
             healthcheck: healthcheck(get("healthcheck")),

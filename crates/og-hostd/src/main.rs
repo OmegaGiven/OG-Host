@@ -4,8 +4,10 @@ mod brain;
 mod build;
 mod compose;
 mod containers;
+mod desktop;
 mod dockerapi;
 mod idmap;
+mod resources;
 mod serve;
 
 use std::path::PathBuf;
@@ -121,6 +123,10 @@ enum Cmd {
         /// limited to containers carrying that label. Repeatable.
         #[arg(long = "docker-scope")]
         docker_scope: Vec<String>,
+        /// Label put on every container a scope creates: name:key=value, e.g.
+        /// wolf:og.profile=desktop. Repeatable.
+        #[arg(long = "scope-label")]
+        scope_label: Vec<String>,
     },
     /// Start a stopped container.
     Start { container: String },
@@ -267,8 +273,8 @@ async fn main() -> Result<()> {
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || compose::down(&node, &root, &p, volumes)).await??;
         }
-        Cmd::Serve { listen, docker_scope } => {
-            serve::serve(node, cli.root.clone(), listen, docker_scope).await?;
+        Cmd::Serve { listen, docker_scope, scope_label } => {
+            serve::serve(node, cli.root.clone(), listen, docker_scope, scope_label).await?;
         }
         Cmd::Start { container } => {
             let m = node.find(&container)?;

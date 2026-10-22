@@ -144,6 +144,14 @@ fn ifname(prefix: &str, id: &str) -> String {
 }
 
 /// Docker-style locally administered MAC derived from the IP (02:42:a.b.c.d).
+/// Unicast `xx:xx:xx:xx:xx:xx`.
+pub fn valid_mac(m: &str) -> bool {
+    let parts: Vec<&str> = m.split(':').collect();
+    parts.len() == 6
+        && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+        && u8::from_str_radix(parts[0], 16).is_ok_and(|b| b & 1 == 0)
+}
+
 fn mac_for(ip: Ipv4Addr) -> String {
     let o = ip.octets();
     format!("02:42:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
@@ -324,6 +332,16 @@ impl Net {
 
     /// Create a namespace for `owner`, plug it into `network`, publish `ports`.
     pub fn attach(&self, owner: &str, network: &str, ports: &[PortMap]) -> Result<Attachment> {
+        self.attach_mac(owner, network, ports, None)
+    }
+
+    /// Like [`attach`](Self::attach), with a chosen MAC address for the container's interface.
+    pub fn attach_mac(&self, owner: &str, network: &str, ports: &[PortMap], mac: Option<&str>) -> Result<Attachment> {
+        if let Some(m) = mac {
+            if !valid_mac(m) {
+                return Err(Error::Invalid(format!("bad MAC address {m:?}")));
+            }
+        }
         let net = self.ensure(network, None)?;
         let netns = self.create_netns(owner)?;
         let ns_name = netns.file_name().unwrap().to_string_lossy().to_string();
@@ -334,7 +352,8 @@ impl Net {
                 run(&["ip", "link", "add", &veth, "type", "veth", "peer", "name", "eth0", "netns", &ns_name])?;
             }
             run(&["ip", "link", "set", &veth, "master", &net.bridge, "up"])?;
-            run(&["ip", "-n", &ns_name, "link", "set", "eth0", "address", &mac_for(ip)])?;
+            let mac = mac.map(str::to_string).unwrap_or_else(|| mac_for(ip));
+            run(&["ip", "-n", &ns_name, "link", "set", "eth0", "address", &mac])?;
             let _ = run(&["ip", "-n", &ns_name, "addr", "flush", "dev", "eth0"]);
             run(&["ip", "-n", &ns_name, "addr", "add", &format!("{ip}/{}", net.subnet.prefix), "dev", "eth0"])?;
             run(&["ip", "-n", &ns_name, "link", "set", "eth0", "up"])?;

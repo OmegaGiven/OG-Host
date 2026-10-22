@@ -585,10 +585,15 @@ pub fn apply_class(cs: &[CSnap], labels: &HashMap<String, BTreeMap<String, Strin
 pub fn apply(node: &Node, brain: &std::sync::Mutex<Brain>, actions: Vec<Action>) {
     for a in actions {
         let msg = match &a {
-            Action::SetLow { name, bytes, .. } => write(cg(name).join("memory.low"), &bytes.to_string()).err().map(|e| format!("{name}: memory.low: {e}")),
+            Action::SetLow { id, name, bytes } => {
+                // never below what the container was configured with
+                let configured = crate::resources::configured_unified(node, id, "memory.low").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                write(cg(name).join("memory.low"), &(*bytes).max(configured).to_string()).err().map(|e| format!("{name}: memory.low: {e}"))
+            }
             Action::SetParentLow { bytes } => write(PathBuf::from(CGROUP_ROOT).join("memory.low"), &bytes.to_string()).err().map(|e| format!("og-host memory.low: {e}")),
-            Action::SetHigh { name, bytes, .. } => {
-                let v = bytes.map_or("max".to_string(), |b| b.to_string());
+            Action::SetHigh { id, name, bytes } => {
+                // giving back means back to the configured memory.high, not unlimited
+                let v = bytes.map_or_else(|| crate::resources::configured_unified(node, id, "memory.high").unwrap_or_else(|| "max".into()), |b| b.to_string());
                 Some(match write(cg(name).join("memory.high"), &v) {
                     Ok(()) => match bytes {
                         Some(b) => format!("{name}: memory.high -> {} MiB (memory pressure)", b / MIB),

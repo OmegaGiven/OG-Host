@@ -103,7 +103,7 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
     Ok(())
 }
 
-pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>) -> Result<()> {
+pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>) -> Result<()> {
     let token = if listen.is_some() { Some(load_or_create_token(&root)?) } else { None };
     let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()) });
 
@@ -139,6 +139,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/version", get(version))
         .route("/v1/brain", get(brain_status))
         .route("/v1/containers/{id}/wake", post(start))
+        .route("/v1/containers/{id}/resources", get(resources_get).post(resources_set))
         .route("/v1/node", get(node_info))
         .route("/v1/containers", get(list).post(create))
         .route("/v1/containers/{id}", get(inspect).delete(remove))
@@ -164,7 +165,18 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             anyhow::bail!("bad scope name {name:?}");
         }
-        let scope = crate::dockerapi::Scope { name: name.into(), key: key.into(), value: value.into() };
+        let mut labels = Vec::new();
+        for sl in &scope_labels {
+            let (n, kv) = sl.split_once(':').context("--scope-label wants name:key=value")?;
+            let (k, v) = kv.split_once('=').context("--scope-label wants name:key=value")?;
+            if !k.starts_with("og.") {
+                anyhow::bail!("--scope-label {sl:?}: only og.* labels");
+            }
+            if n == name {
+                labels.push((k.to_string(), v.to_string()));
+            }
+        }
+        let scope = crate::dockerapi::Scope { name: name.into(), key: key.into(), value: value.into(), labels };
         spawn_docker_socket(app.clone(), PathBuf::from(format!("/run/og-host/docker-{name}.sock")), Some(scope))?;
     }
     let unix_router = router.clone();
@@ -325,6 +337,24 @@ impl Daemon {
             "health": health,
         }))
     }
+}
+
+async fn resources_get(State(app): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult<Json<crate::resources::Resources>> {
+    Ok(Json(crate::resources::current(&app.node, &app.node.find(&id)?.id)?))
+}
+
+/// Body: a `Resources` change, or `{"preset": "minimal" | "restore"}`.
+async fn resources_set(State(app): State<App>, UrlPath(id): UrlPath<String>, Json(b): Json<serde_json::Value>) -> ApiResult<Json<crate::resources::Resources>> {
+    let r = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::resources::Resources> {
+        let m = app.node.find(&id)?;
+        match b.get("preset").and_then(|p| p.as_str()) {
+            Some(p) => crate::resources::preset(&app.node, &m.id, p),
+            None => crate::resources::update(&app.node, &m.id, &serde_json::from_value(b)?),
+        }
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(r))
 }
 
 async fn brain_status(State(app): State<App>) -> Json<serde_json::Value> {

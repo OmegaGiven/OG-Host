@@ -120,6 +120,23 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
         }
         let devices: Vec<PathBuf> = s.devices.iter().map(|d| PathBuf::from(d.split(':').next().unwrap_or(d))).collect();
         let memory = s.mem_limit.as_deref().map(parse_size).transpose()?;
+        let mut io_limits: Vec<og_runtime::IoLimit> = Vec::new();
+        for (path, kind, rate) in &s.blkio_devices {
+            let rate = parse_size(rate).with_context(|| format!("{}: blkio rate {rate:?}", s.name))?.max(0) as u64;
+            let l = match io_limits.iter_mut().find(|l| l.device.as_os_str() == path.as_str()) {
+                Some(l) => l,
+                None => {
+                    io_limits.push(og_runtime::IoLimit { device: path.into(), read_bps: None, write_bps: None, read_iops: None, write_iops: None });
+                    io_limits.last_mut().unwrap()
+                }
+            };
+            match kind {
+                0 => l.read_bps = Some(rate),
+                1 => l.write_bps = Some(rate),
+                2 => l.read_iops = Some(rate),
+                _ => l.write_iops = Some(rate),
+            }
+        }
         let shm = s.shm_size.as_deref().map(parse_size).transpose()?.map(|v| v as u64);
         if s.privileged {
             eprintln!("warning: {}: privileged mode is not supported; running with default privileges", s.name);
@@ -171,6 +188,15 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
                 o.cap_add = cap_add;
                 o.cap_drop = cap_drop;
                 o.memory_max = memory;
+                o.memory_low = svc.mem_reservation.as_deref().and_then(|v| crate::containers::parse_size(v).ok());
+                o.cpu_quota = svc.cpus.map(|c| ((c * 100_000.0).round() as i64, 100_000));
+                o.cpuset_cpus = svc.cpuset.clone();
+                o.cpu_shares = svc.cpu_shares;
+                if let Some(p) = svc.pids_limit {
+                    o.pids_max = p;
+                }
+                o.io_weight = svc.blkio_weight.map(|w| w.saturating_mul(10).min(10000));
+                o.io_limits = io_limits.clone();
                 o.shm_size = shm;
             })
         })
