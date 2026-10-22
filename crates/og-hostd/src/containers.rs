@@ -47,6 +47,9 @@ pub struct Meta {
     pub healthcheck: Option<og_compose::Healthcheck>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// CDI devices (GPUs) it was given.
+    #[serde(default)]
+    pub gpus: Vec<String>,
     /// Remove the container once it exits (docker run --rm).
     #[serde(default)]
     pub auto_remove: bool,
@@ -101,6 +104,8 @@ pub struct Status {
     pub state: String,
     pub pid: Option<i32>,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub oom_killed: bool,
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub error: Option<String>,
@@ -115,6 +120,10 @@ pub struct Node {
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+pub fn unix_now() -> u64 {
+    now()
 }
 
 pub fn new_id() -> Result<String> {
@@ -206,6 +215,27 @@ impl Node {
         let mut opts = RunOptions::new(name.clone(), rootfs.clone(), PathBuf::from(format!("/og-host/{name}")));
         opts.userns = Some(map);
         opts_in(&mut opts);
+        // og.vram: place on the GPU with the most free VRAM (batch work is refused when none fits)
+        if let Some(need) = extra.labels.get("og.vram").and_then(|v| parse_size(v).ok()) {
+            if opts.cdi_devices.iter().any(|d| d == "nvidia.com/gpu=all") {
+                let gpus = crate::brain::read_gpus();
+                let need_mib = need.max(0) as u64 >> 20;
+                match crate::brain::pick_gpu(&gpus, need_mib) {
+                    Some(i) => {
+                        opts.cdi_devices.retain(|d| d != "nvidia.com/gpu=all");
+                        opts.cdi_devices.push(format!("nvidia.com/gpu={i}"));
+                    }
+                    None if !gpus.is_empty() => {
+                        let best = gpus.iter().map(|g| g.free_mib()).max().unwrap_or(0);
+                        if crate::brain::GpuClass::from_labels(&extra.labels) == crate::brain::GpuClass::Batch {
+                            bail!("no GPU has {need_mib} MiB of free VRAM (most free: {best} MiB)");
+                        }
+                        eprintln!("warning: {name}: no GPU has {need_mib} MiB of free VRAM (most free: {best} MiB); starting anyway");
+                    }
+                    None => {}
+                }
+            }
+        }
 
         // networking: namespace + address before the container exists
         if !ports.is_empty() && !matches!(net_choice, NetChoice::Network(_)) {
@@ -339,6 +369,7 @@ impl Node {
             labels: extra.labels,
             auto_remove: extra.auto_remove,
             aliases: extra.aliases,
+            gpus: opts.cdi_devices.clone(),
         };
         std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         if extra.no_start {

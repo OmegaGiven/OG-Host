@@ -85,6 +85,8 @@ struct Status {
     pid: Option<i32>,
     exit_code: Option<i32>,
     signal: Option<i32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    oom_killed: bool,
     started_at: Option<u64>,
     finished_at: Option<u64>,
     error: Option<String>,
@@ -146,7 +148,7 @@ fn main() {
         },
     };
     if let Err(e) = run(&args) {
-        write_status(&args.status, &Status { state: "failed", pid: None, exit_code: None, signal: None, started_at: None, finished_at: Some(now()), error: Some(format!("{e:#}")) });
+        write_status(&args.status, &Status { state: "failed", pid: None, exit_code: None, signal: None, oom_killed: false, started_at: None, finished_at: Some(now()), error: Some(format!("{e:#}")) });
         eprintln!("og-shim: {e:#}");
         std::process::exit(1);
     }
@@ -200,7 +202,7 @@ fn run(args: &Args) -> Result<()> {
     });
     let pid = container.pid().map(|p| p.as_raw()).context("container has no pid after start")?;
     let started_at = now();
-    write_status(&args.status, &Status { state: "running", pid: Some(pid), exit_code: None, signal: None, started_at: Some(started_at), finished_at: None, error: None });
+    write_status(&args.status, &Status { state: "running", pid: Some(pid), exit_code: None, signal: None, oom_killed: false, started_at: Some(started_at), finished_at: None, error: None });
 
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
@@ -237,13 +239,25 @@ fn run(args: &Args) -> Result<()> {
     };
 
     let _ = copier.join();
+    let oom_killed = oom_kills(&args.bundle) > 0;
     // libcontainer state + cgroup cleanup
     let _ = container.refresh_status();
     if let Err(e) = container.delete(true) {
         eprintln!("og-shim: cleanup of {}: {e}", args.id);
     }
-    write_status(&args.status, &Status { state: "exited", pid: Some(pid), exit_code, signal, started_at: Some(started_at), finished_at: Some(now()), error: None });
+    write_status(&args.status, &Status { state: "exited", pid: Some(pid), exit_code, signal, oom_killed, started_at: Some(started_at), finished_at: Some(now()), error: None });
     Ok(())
+}
+
+/// OOM kills in the container's cgroup (memory.events), read before the cgroup is removed.
+fn oom_kills(bundle: &std::path::Path) -> u64 {
+    let cfg: Option<serde_json::Value> = std::fs::read(bundle.join("config.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let Some(cg) = cfg.as_ref().and_then(|c| c["linux"]["cgroupsPath"].as_str().map(String::from)) else { return 0 };
+    let path = PathBuf::from("/sys/fs/cgroup").join(cg.trim_start_matches('/')).join("memory.events");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("oom_kill ").and_then(|v| v.trim().parse().ok())))
+        .unwrap_or(0)
 }
 
 fn parse_pair(s: &str) -> Option<(u32, u32)> {

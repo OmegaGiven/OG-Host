@@ -29,6 +29,7 @@ pub struct Daemon {
     pub token: Option<String>,
     restarts: Mutex<HashMap<String, Backoff>>,
     health: Mutex<HashMap<String, Health>>,
+    pub brain: Mutex<crate::brain::Brain>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +105,7 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
 
 pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>) -> Result<()> {
     let token = if listen.is_some() { Some(load_or_create_token(&root)?) } else { None };
-    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()) });
+    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()) });
 
     // supervisor + health loop
     {
@@ -122,8 +123,22 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         });
     }
 
+    // brain: resource policy every 5 s
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                let a = app.clone();
+                let _ = tokio::task::spawn_blocking(move || a.think()).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     let router = Router::new()
         .route("/v1/version", get(version))
+        .route("/v1/brain", get(brain_status))
+        .route("/v1/containers/{id}/wake", post(start))
         .route("/v1/node", get(node_info))
         .route("/v1/containers", get(list).post(create))
         .route("/v1/containers/{id}", get(inspect).delete(remove))
@@ -178,6 +193,25 @@ async fn require_token(State(app): State<App>, headers: HeaderMap, req: axum::ex
 
 impl Daemon {
     /// Restart policy enforcement.
+    fn think(&self) {
+        use crate::brain;
+        let node = brain::read_node();
+        let cs = brain::snapshot(&self.node);
+        let gpus = brain::read_gpus();
+        let labels: HashMap<String, std::collections::BTreeMap<String, String>> =
+            self.node.list().unwrap_or_default().into_iter().map(|(m, _)| (m.id, m.labels)).collect();
+        brain::apply_class(&cs, &labels);
+        let actions = {
+            let mut b = self.brain.lock().unwrap();
+            let a = b.decide(&node, &cs, &gpus, Instant::now());
+            b.last_node = node;
+            b.last_containers = cs;
+            b.last_gpus = gpus;
+            a
+        };
+        brain::apply(&self.node, &self.brain, actions);
+    }
+
     fn supervise(&self) {
         let Ok(list) = self.node.list() else { return };
         for (m, st) in list {
@@ -291,6 +325,31 @@ impl Daemon {
             "health": health,
         }))
     }
+}
+
+async fn brain_status(State(app): State<App>) -> Json<serde_json::Value> {
+    let b = app.brain.lock().unwrap();
+    let n = &b.last_node;
+    let containers: Vec<_> = b
+        .last_containers
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id, "name": c.name, "class": c.class, "gpu_class": c.gpu_class,
+                "running": c.running, "desired": c.desired,
+                "memory": { "current": c.mem_current, "max": c.mem_max, "low": b.low(&c.id), "squeezed_high": b.squeezed_high(&c.id), "psi": c.psi },
+                "preempted": b.is_preempted(&c.id),
+            })
+        })
+        .collect();
+    let sessions: u32 = b.last_gpus.iter().map(|g| g.encoder_sessions).sum();
+    Json(json!({
+        "node": { "mem_total": n.mem_total, "mem_available": n.mem_available, "psi_memory": n.psi, "psi_memory_host_services": n.host_psi },
+        "containers": containers,
+        "gpus": b.last_gpus,
+        "nvenc": { "sessions": sessions, "limit": crate::brain::NVENC_LIMIT },
+        "log": b.log.iter().rev().take(50).map(|(t, m)| json!({ "at": t, "message": m })).collect::<Vec<_>>(),
+    }))
 }
 
 async fn version() -> Json<serde_json::Value> {

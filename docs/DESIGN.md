@@ -149,6 +149,16 @@ One daemon per node. Any node's UI shows the whole cluster (two nodes today).
 - Scale-to-zero: idle-stop apps are stopped after N minutes without traffic; the built-in
   proxy holds the first request, starts the app, then forwards it.
 - zram for compressed swap; KSM for VMs.
+- Implemented (og-hostd `brain.rs`, every 5 s; status at `GET /v1/brain`). Labels:
+  `og.priority` (critical | normal | batch | idle-stop), `og.memory-low` (extra floor for
+  critical), `og.idle-after` (default 30m), `og.gpu-class` (gaming | interactive | batch),
+  `og.gpu-preempt` (stop | pause), `og.vram` (placement / admission).
+  Pressure is measured on what the *protected* workloads feel (PSI of host services and
+  non-batch containers, plus MemAvailable), so a throttled batch job doesn't count its own
+  stall. Order: squeeze batch `memory.high` -> sleep idle-stop (severe) -> evict the biggest
+  batch job once squeezing stops freeing memory (without swap that is immediate) -> alert.
+  Tested on a 1.8 GB VM: a 1.1 GB batch job is throttled then evicted before the kernel OOM
+  killer runs; critical/normal containers untouched. Containers report `OOMKilled`.
 
 ### 4.8 Web UI and API
 - OmegaEnv becomes the UI: Home (apps), Monitor, Explore (metrics), Logs, Watch, Apps

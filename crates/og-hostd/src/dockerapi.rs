@@ -370,7 +370,7 @@ async fn container_inspect(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>)
         "Id": m.id, "Created": rfc3339(m.created_at), "Path": m.args.first(), "Args": m.args.iter().skip(1).collect::<Vec<_>>(),
         "State": {
             "Status": docker_state(&state), "Running": state.state == "running", "Paused": false, "Restarting": false,
-            "OOMKilled": false, "Dead": state.state == "dead", "Pid": state.pid.unwrap_or(0), "ExitCode": state.exit_code.unwrap_or(0),
+            "OOMKilled": state.oom_killed, "Dead": state.state == "dead", "Pid": state.pid.unwrap_or(0), "ExitCode": state.exit_code.unwrap_or(0),
             "Error": state.error.clone().unwrap_or_default(),
             "StartedAt": state.started_at.map(rfc3339).unwrap_or_else(|| "0001-01-01T00:00:00Z".into()),
             "FinishedAt": state.finished_at.map(rfc3339).unwrap_or_else(|| "0001-01-01T00:00:00Z".into()),
