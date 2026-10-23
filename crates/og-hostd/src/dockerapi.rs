@@ -106,6 +106,7 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/build", post(image_build))
         .route("/images/json", get(images_list))
         .route("/images/create", post(images_create))
+        .route("/images/load", post(images_load).layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/images/{*name}", get(image_inspect_or).delete(image_delete))
         .route("/networks", get(networks_list))
         .route("/networks/create", post(network_create))
@@ -1402,6 +1403,33 @@ async fn image_inspect_or(State(ctx): State<Ctx>, UrlPath(name): UrlPath<String>
         "Config": {"Env": cfg.config.env, "Cmd": cfg.config.cmd, "Entrypoint": cfg.config.entrypoint, "WorkingDir": cfg.config.working_dir,
                    "User": cfg.config.user, "ExposedPorts": cfg.config.exposed_ports, "Volumes": cfg.config.volumes, "Labels": cfg.config.labels},
     })))
+}
+
+/// docker load: the body is a `docker save` / OCI archive.
+async fn images_load(State(ctx): State<Ctx>, body: axum::body::Body) -> R<Json<Value>> {
+    if ctx.scope.is_some() {
+        return Err(DErr(StatusCode::FORBIDDEN, "loading images is not allowed on this socket".into()));
+    }
+    let tmpdir = ctx.d.root.join("content/tmp");
+    let _ = std::fs::create_dir_all(&tmpdir);
+    let tmp = tmpdir.join(format!("load-{}.tar", crate::containers::unix_now()));
+    {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(&tmp).await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut st = body.into_data_stream();
+        while let Some(chunk) = st.next().await {
+            let c = chunk.map_err(|e| DErr(StatusCode::BAD_REQUEST, e.to_string()))?;
+            f.write_all(&c).await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        f.flush().await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    let root = ctx.d.root.clone();
+    let t2 = tmp.clone();
+    let r = tokio::task::spawn_blocking(move || crate::load_archive(&root, &t2, None)).await.map_err(|e| DErr(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = std::fs::remove_file(&tmp);
+    let loaded = r.map_err(|e| DErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(json!({"stream": loaded.iter().map(|(n, _)| format!("Loaded image: {n}\n")).collect::<String>()})))
 }
 
 async fn image_delete(State(ctx): State<Ctx>, UrlPath(name): UrlPath<String>) -> R<Json<Value>> {

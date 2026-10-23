@@ -75,6 +75,13 @@ enum LabCmd {
 enum Cmd {
     /// Pull an image (all layers verified by digest) into the local store.
     Pull { image: String },
+    /// Load images from a `docker save` / OCI archive (FILE, or - for stdin), like docker load.
+    Load {
+        file: PathBuf,
+        /// tag it as this too (when the archive carries no name)
+        #[arg(long)]
+        tag: Option<String>,
+    },
     /// Build a root filesystem for a pulled image in DEST.
     Unpack {
         image: String,
@@ -271,6 +278,65 @@ pub(crate) async fn ensure_pulled(root: &std::path::Path, store: &Store, image: 
     Ok(img.manifest_digest)
 }
 
+/// Import a `docker save` (OCI layout) archive and tag what it names: (name, manifest digest).
+pub(crate) fn load_archive(root: &std::path::Path, file: &std::path::Path, tag: Option<&str>) -> Result<Vec<(String, String)>> {
+    use std::io::Read;
+    // from stdin: to a file first (the archive is read twice)
+    let tmp;
+    let path = if file.as_os_str() == "-" {
+        tmp = root.join("content/tmp").join(format!("load-{}.tar", std::process::id()));
+        std::fs::create_dir_all(tmp.parent().unwrap())?;
+        std::io::copy(&mut std::io::stdin().lock(), &mut std::fs::File::create(&tmp)?)?;
+        tmp.clone()
+    } else {
+        file.to_path_buf()
+    };
+    let digest = og_oci::store::import_oci_tar(&root.join("content"), &path).context("importing the archive")?;
+    // names: docker's manifest.json RepoTags, OCI index annotations, --tag
+    let mut names: Vec<String> = vec![];
+    let mut ar = tar::Archive::new(std::fs::File::open(&path)?);
+    for e in ar.entries()? {
+        let mut e = e?;
+        let p = e.path()?.to_string_lossy().trim_start_matches("./").to_string();
+        if p == "manifest.json" || p == "index.json" {
+            let mut b = vec![];
+            e.read_to_end(&mut b)?;
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+            if p == "manifest.json" {
+                for m in v.as_array().into_iter().flatten() {
+                    names.extend(m["RepoTags"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)));
+                }
+            } else {
+                for m in v["manifests"].as_array().into_iter().flatten() {
+                    for k in ["io.containerd.image.name", "org.opencontainers.image.ref.name"] {
+                        if let Some(n) = m["annotations"][k].as_str().filter(|n| n.contains(':') || n.contains('/')) {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if file.as_os_str() == "-" {
+        let _ = std::fs::remove_file(&path);
+    }
+    names.extend(tag.map(String::from));
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        anyhow::bail!("the archive names no image: give --tag NAME");
+    }
+    let mut out = vec![];
+    for n in names {
+        let r = Reference::parse(&n)?;
+        let p = ref_path(root, &r);
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        std::fs::write(&p, &digest)?;
+        out.push((n, digest.clone()));
+    }
+    Ok(out)
+}
+
 fn ago(t: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let s = now.saturating_sub(t);
@@ -372,6 +438,11 @@ async fn main() -> Result<()> {
         net: og_net::Net::new(cli.root.join("networks")),
     };
     match cli.cmd {
+        Cmd::Load { file, tag } => {
+            for (name, digest) in load_archive(&cli.root, &file, tag.as_deref())? {
+                println!("loaded {name} ({digest})");
+            }
+        }
         Cmd::Pull { image } => {
             let r = Reference::parse(&image)?;
             let _ = tokio::fs::remove_file(ref_path(&cli.root, &r)).await; // explicit pull refreshes the tag
