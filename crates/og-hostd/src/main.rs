@@ -33,6 +33,7 @@ mod release;
 mod tls;
 mod update;
 mod vm_api;
+mod vma;
 mod vmrun;
 mod vmbrain;
 mod vmfw;
@@ -75,6 +76,15 @@ enum LabCmd {
 enum Cmd {
     /// Pull an image (all layers verified by digest) into the local store.
     Pull { image: String },
+    /// Import a Proxmox VE backup (vzdump .vma / .vma.zst / .vma.gz, or - for stdin): its disks
+    /// become volumes vm-NAME-<device> in POOL, its config is kept in <root>/imported/NAME/.
+    ImportVma {
+        file: PathBuf,
+        #[arg(long, default_value = "local-thin")]
+        pool: String,
+        #[arg(long)]
+        name: String,
+    },
     /// Load images from a `docker save` / OCI archive (FILE, or - for stdin), like docker load.
     Load {
         file: PathBuf,
@@ -438,6 +448,10 @@ async fn main() -> Result<()> {
         net: og_net::Net::new(cli.root.join("networks")),
     };
     match cli.cmd {
+        Cmd::ImportVma { file, pool, name } => {
+            let (root, file) = (cli.root.clone(), file.clone());
+            tokio::task::spawn_blocking(move || vma::cli(&root, &file, &pool, &name)).await??;
+        }
         Cmd::Load { file, tag } => {
             for (name, digest) in load_archive(&cli.root, &file, tag.as_deref())? {
                 println!("loaded {name} ({digest})");
