@@ -8,6 +8,12 @@
 //! `/etc/og-host/trusted-keys/*.pub`), and only installs artifacts whose SHA-256 the signed
 //! manifest gives.
 //!
+//! Signing keys: the release (root) keys are built in and kept offline. Day-to-day releases are
+//! signed by delegated keys (a CI key): `keys/delegations.json` on the mirror lists them, signed
+//! by a root key, each with an expiry and the channels it may sign. The list has a version;
+//! a server remembers the newest it has seen and refuses older ones, so a revoked key (dropped
+//! from a newer list) can't come back by replaying an old list.
+//!
 //! Installing swaps the binaries (keeping the previous ones) and restarts the daemon;
 //! containers and VMs keep running. The new version counts its start attempts: if it
 //! doesn't stay up for a minute three times in a row, the previous binaries come back.
@@ -35,11 +41,15 @@ pub struct Config {
     /// notify | download | install
     pub auto: String,
     pub schedule: String,
+    /// include the operating system (Debian packages, kernel) in updates
+    pub system: bool,
+    /// auto: reboot in the update window when an update needs it; manual: wait for you
+    pub reboot: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { channel: "stable".into(), mirrors: vec![], auto: "notify".into(), schedule: "daily 03:15".into() }
+        Config { channel: "stable".into(), mirrors: vec![], auto: "notify".into(), schedule: "daily 03:15".into(), system: true, reboot: "auto".into() }
     }
 }
 
@@ -93,6 +103,9 @@ pub fn save_config(root: &Path, c: &Config) -> Result<()> {
     if !["notify", "download", "install"].contains(&c.auto.as_str()) {
         bail!("automatic updates: notify, download or install");
     }
+    if !["auto", "manual"].contains(&c.reboot.as_str()) {
+        bail!("reboots: auto or manual");
+    }
     for m in &c.mirrors {
         if !(m.starts_with("https://") || m.starts_with("http://")) || m.contains(char::is_whitespace) {
             bail!("mirrors are http(s) URLs");
@@ -127,6 +140,82 @@ pub fn trusted_keys(root: &Path) -> Vec<(String, ed25519_dalek::VerifyingKey)> {
 
 pub fn key_id(k: &ed25519_dalek::VerifyingKey) -> String {
     hex::encode(&sha2::Sha256::digest(k.as_bytes())[..8])
+}
+
+/// A key a root key vouches for.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Delegation {
+    /// hex ed25519 public key
+    pub key: String,
+    pub name: String,
+    /// unix seconds
+    pub not_after: u64,
+    pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Delegations {
+    pub version: u64,
+    pub keys: Vec<Delegation>,
+}
+
+fn parse_sig(sig: &str) -> Result<(ed25519_dalek::Signature, String)> {
+    let mut lines = sig.lines();
+    let s: [u8; 64] = hex::decode(lines.next().unwrap_or("").trim()).ok().and_then(|b| b.try_into().ok()).context("bad signature file")?;
+    Ok((ed25519_dalek::Signature::from_bytes(&s), lines.next().unwrap_or("").trim().to_string()))
+}
+
+fn delegations_seen(root: &Path) -> PathBuf {
+    root.join("updates").join("delegations-version")
+}
+
+/// Check a delegation list against a root key and the newest version seen; remember it.
+pub fn check_delegations(root: &Path, body: &[u8], sig: &str) -> Result<Delegations> {
+    let (s, _) = parse_sig(sig)?;
+    let roots = trusted_keys(root);
+    if !roots.iter().any(|(_, k)| k.verify_strict(body, &s).is_ok()) {
+        bail!("the mirror's key list isn't signed by a release key");
+    }
+    let d: Delegations = serde_json::from_slice(body)?;
+    let seen: u64 = std::fs::read_to_string(delegations_seen(root)).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+    if d.version < seen {
+        bail!("the mirror's key list is older ({}) than one seen before ({seen}): refusing it", d.version);
+    }
+    if d.version > seen {
+        let p = delegations_seen(root);
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let _ = std::fs::write(p, d.version.to_string());
+    }
+    Ok(d)
+}
+
+/// Check a channel file against its signature: a root key, or a key the (checked) delegation
+/// list vouches for on this channel and that hasn't expired.
+pub fn verify_with(root: &Path, manifest: &[u8], sig: &str, channel: &str, dl: Option<&Delegations>) -> Result<String> {
+    if let Ok(id) = verify(root, manifest, sig) {
+        return Ok(id);
+    }
+    let (s, kid) = parse_sig(sig)?;
+    let now = crate::containers::unix_now();
+    for d in dl.map(|d| d.keys.as_slice()).unwrap_or(&[]) {
+        let Some(k) = hex::decode(d.key.trim()).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok()) else { continue };
+        let id = key_id(&k);
+        if !kid.is_empty() && id != kid {
+            continue;
+        }
+        if d.not_after < now {
+            bail!("the release is signed by {} ({id}), whose delegation expired", d.name);
+        }
+        if !d.channels.iter().any(|c| c == channel) {
+            bail!("{} ({id}) may not sign the {channel} channel", d.name);
+        }
+        if k.verify_strict(manifest, &s).is_ok() {
+            return Ok(format!("{id} ({}, vouched for by a release key)", d.name));
+        }
+    }
+    bail!("the release isn't signed by a trusted key")
 }
 
 /// Check a channel file against its signature (`<hex sig>\n<key id>`).
@@ -173,7 +262,12 @@ pub async fn check(root: &Path) -> Result<Available> {
         let r = async {
             let body = c.get(format!("{base}/channels/{}.json", cfg.channel)).send().await?.error_for_status()?.bytes().await?;
             let sig = c.get(format!("{base}/channels/{}.json.sig", cfg.channel)).send().await?.error_for_status()?.text().await?;
-            let key = verify(root, &body, &sig)?;
+            // delegated (CI) keys, if the mirror publishes a list
+            let dl = match (c.get(format!("{base}/keys/delegations.json")).send().await, c.get(format!("{base}/keys/delegations.json.sig")).send().await) {
+                (Ok(a), Ok(b)) if a.status().is_success() && b.status().is_success() => Some(check_delegations(root, &a.bytes().await?, &b.text().await?)?),
+                _ => None,
+            };
+            let key = verify_with(root, &body, &sig, &cfg.channel, dl.as_ref())?;
             let man: Manifest = serde_json::from_slice(&body)?;
             if man.channel != cfg.channel {
                 bail!("the mirror's {} file is for channel {}", cfg.channel, man.channel);
@@ -210,6 +304,15 @@ fn targets() -> Vec<(&'static str, PathBuf)> {
 
 /// Download, check and install a release, then restart. Blocking (run as a task).
 pub fn install(root: &Path, task: &crate::tasks::Task, a: &Available) -> Result<()> {
+    stage_release(root, task, a)?;
+    task.log("restarting og-hostd (containers and VMs keep running)");
+    restart_soon();
+    Ok(())
+}
+
+/// Download, check and put a release's binaries in place (the previous ones kept, the start
+/// guard set); the caller restarts or reboots.
+pub fn stage_release(root: &Path, task: &crate::tasks::Task, a: &Available) -> Result<()> {
     let art = a.manifest.artifacts.iter().find(|x| x.arch == arch()).with_context(|| format!("release {} has no build for {}", a.manifest.version, arch()))?;
     if art.file.contains("..") || art.file.starts_with('/') {
         bail!("bad artifact path in the manifest");
@@ -264,8 +367,6 @@ pub fn install(root: &Path, task: &crate::tasks::Task, a: &Available) -> Result<
     // where to put things back: the guard runs from elsewhere, so it can't go by its own path
     std::fs::write(updates_dir(root).join("pending.json"), serde_json::to_vec(&json!({"from": VERSION, "to": a.manifest.version, "attempts": 0, "time": crate::containers::unix_now(), "bin": bin_dir()}))?)?;
     install_guard(root, task);
-    task.log("restarting og-hostd (containers and VMs keep running)");
-    restart_soon();
     Ok(())
 }
 
@@ -323,6 +424,10 @@ pub fn guard(root: &Path) {
     v["guarded"] = json!(true);
     let _ = std::fs::write(&p, serde_json::to_vec(&v).unwrap_or_default());
     if attempts <= 3 {
+        return;
+    }
+    // during a whole-system update: the whole system goes back (and the machine reboots)
+    if crate::sysupdate::guard_tripped() {
         return;
     }
     eprintln!("og-hostd update guard: {} didn't stay up; putting {} back", v["to"].as_str().unwrap_or("?"), v["from"].as_str().unwrap_or("?"));
@@ -470,6 +575,9 @@ pub fn router(d: Arc<Daemon>) -> Router {
         .route("/v1/update/install", post(install_now))
         .route("/v1/update/cluster", post(cluster_update))
         .route("/v1/update/packages", get(packages).post(packages_run))
+        .route("/v1/update/system", post(system_now))
+        .route("/v1/update/reboot", post(reboot_now))
+        .route("/v1/update/rollback", post(rollback_now))
         .with_state(d)
 }
 
@@ -481,7 +589,59 @@ async fn info(State(d): D) -> Json<Value> {
     v["config"] = json!(config(&d.root));
     v["keys"] = json!(keys);
     v["available"] = d.update_seen.lock().unwrap().clone().map(|a| json!(a)).unwrap_or(Value::Null);
+    v["system"] = json!(crate::sysupdate::state());
+    v["kernel"] = json!(crate::sysupdate::running_kernel());
+    v["root_snapshots"] = json!(crate::sysupdate::root_thin_lv().is_some());
     Json(v)
+}
+
+/// A whole-system update (packages + release) as a task.
+pub fn start_system(d: &Arc<Daemon>, user: &str, reboot: bool) -> Result<String> {
+    if d.tasks.busy("update", "system") || d.tasks.busy("update", "og-hostd") {
+        bail!("an update is running already");
+    }
+    let d2 = d.clone();
+    d.tasks.spawn("update", "system", user, move |t| {
+        let rel = if config(&d2.root).mirrors.is_empty() {
+            None
+        } else {
+            match tokio::runtime::Handle::current().block_on(check(&d2.root)) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    t.warn(format!("OG-Host release check: {e:#} (updating the system packages only)"));
+                    None
+                }
+            }
+        };
+        crate::sysupdate::run_update(&d2, t, rel.as_ref(), reboot).map(|_| ())
+    })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct SystemReq {
+    reboot: bool,
+}
+
+async fn system_now(State(d): D, Extension(w): Extension<Who>, Json(b): Json<SystemReq>) -> Response {
+    match start_system(&d, &w.label(), b.reboot) {
+        Ok(t) => Json(json!({"task": t})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+async fn reboot_now(State(_d): D) -> Response {
+    match crate::sysupdate::reboot_now() {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+async fn rollback_now(State(_d): D) -> Response {
+    match tokio::task::spawn_blocking(crate::sysupdate::manual_rollback).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad(e),
+    }
 }
 
 async fn set_config(State(d): D, Json(c): Json<Config>) -> Response {
@@ -597,29 +757,39 @@ async fn packages_run(State(d): D, Extension(w): Extension<Who>, Json(b): Json<P
     }
 }
 
-/// On the update schedule: check, then tell / download / install as configured.
+/// On the update schedule: check, then tell / download / install as configured. With
+/// `system` on and automatic installs, the operating system's packages are updated in the same
+/// transaction (also when there's no new OG-Host release).
 pub async fn auto(d: Arc<Daemon>) {
     let cfg = config(&d.root);
-    if cfg.mirrors.is_empty() {
-        return;
-    }
-    match check(&d.root).await {
-        Ok(a) => {
-            let fresh = d.update_seen.lock().unwrap().as_ref().map(|x| x.manifest.version.clone()) != Some(a.manifest.version.clone());
-            *d.update_seen.lock().unwrap() = Some(a.clone());
-            if !a.newer {
-                return;
-            }
-            if cfg.auto == "install" {
-                let _ = start_install(&d, "system");
-            } else if fresh {
-                if let Some(lab) = d.lab.clone() {
-                    let text = format!("OG-Host {}: version {} is available (now {VERSION})", crate::tls::hostname(), a.manifest.version);
-                    let _ = og_lab::notify::send_signal(&lab, &text).await;
-                }
+    let rel = if cfg.mirrors.is_empty() {
+        None
+    } else {
+        match check(&d.root).await {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("og-hostd: update check: {e:#}");
+                None
             }
         }
-        Err(e) => eprintln!("og-hostd: update check: {e:#}"),
+    };
+    if let Some(a) = &rel {
+        let fresh = d.update_seen.lock().unwrap().as_ref().map(|x| x.manifest.version.clone()) != Some(a.manifest.version.clone());
+        *d.update_seen.lock().unwrap() = Some(a.clone());
+        if a.newer && cfg.auto != "install" && fresh {
+            if let Some(lab) = d.lab.clone() {
+                let text = format!("OG-Host {}: version {} is available (now {VERSION})", crate::tls::hostname(), a.manifest.version);
+                let _ = og_lab::notify::send_signal(&lab, &text).await;
+            }
+        }
+    }
+    if cfg.auto != "install" {
+        return;
+    }
+    if cfg.system {
+        let _ = start_system(&d, "system", cfg.reboot == "auto");
+    } else if rel.as_ref().is_some_and(|a| a.newer) {
+        let _ = start_install(&d, "system");
     }
 }
 
@@ -635,5 +805,55 @@ fn durable_copy(src: &Path, dst: &Path) -> Result<()> {
 fn sync_dir(file: &Path) {
     if let Some(d) = file.parent() {
         let _ = std::fs::File::open(d).and_then(|f| f.sync_all());
+    }
+}
+
+#[cfg(test)]
+mod delegation_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn key(b: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[b; 32])
+    }
+    fn sig(k: &ed25519_dalek::SigningKey, data: &[u8]) -> String {
+        format!("{}\n{}\n", hex::encode(k.sign(data).to_bytes()), key_id(&k.verifying_key()))
+    }
+
+    #[test]
+    fn delegated_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        let (rk, ck) = (key(1), key(2));
+        std::fs::create_dir_all(root.join("trusted-keys")).unwrap();
+        std::fs::write(root.join("trusted-keys/root.pub"), hex::encode(rk.verifying_key().as_bytes())).unwrap();
+        let list = |version: u64, not_after: u64, channels: &[&str]| {
+            let d = Delegations { version, keys: vec![Delegation { key: hex::encode(ck.verifying_key().as_bytes()), name: "ci".into(), not_after, channels: channels.iter().map(|s| s.to_string()).collect() }] };
+            let b = serde_json::to_vec(&d).unwrap();
+            let s = sig(&rk, &b);
+            (b, s)
+        };
+        let now = crate::containers::unix_now();
+        let man = br#"{"channel":"stable","version":"9.9.9"}"#;
+        let msig = sig(&ck, man);
+        // not trusted without a list
+        assert!(verify_with(root, man, &msig, "stable", None).is_err());
+        // vouched for
+        let (b, s) = list(5, now + 3600, &["stable"]);
+        let d = check_delegations(root, &b, &s).unwrap();
+        assert!(verify_with(root, man, &msig, "stable", Some(&d)).is_ok());
+        // only its channels
+        assert!(verify_with(root, man, &msig, "dev", Some(&d)).is_err());
+        // expired
+        let (b, s) = list(6, now - 1, &["stable"]);
+        let d = check_delegations(root, &b, &s).unwrap();
+        assert!(verify_with(root, man, &msig, "stable", Some(&d)).is_err());
+        // an older list (replay) is refused
+        let (b, s) = list(5, now + 3600, &["stable"]);
+        assert!(check_delegations(root, &b, &s).is_err());
+        // a list not signed by a root key is refused
+        let d = Delegations { version: 99, keys: vec![] };
+        let b = serde_json::to_vec(&d).unwrap();
+        assert!(check_delegations(root, &b, &sig(&ck, &b)).is_err());
     }
 }

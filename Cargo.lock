@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "og-access"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "og-backup"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "og-compose"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "og-hostd"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1654,6 +1654,7 @@ dependencies = [
  "sha-crypt",
  "sha2",
  "tar",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tower",
@@ -1665,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "og-lab"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1684,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "og-net"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -1697,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "og-oci"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1718,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "og-runtime"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "oci-spec",
@@ -1732,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "og-shim"
-version = "0.2.3"
+version = "0.3.1-test.3"
 dependencies = [
  "anyhow",
  "clap",

@@ -237,16 +237,18 @@ fn install(a: &Answers) -> Result<()> {
     }
     let disk = a.disk.as_str();
     step(&format!("partitioning {disk}"));
+    // what an earlier attempt (or an older install on this disk) left mounted or active
     let _ = sh("swapoff", &["-a"]);
-    for v in ["og"] {
+    let _ = sh("umount", &["-R", TARGET]);
+    let _ = sh("umount", &["-R", "-l", TARGET]);
+    for v in ["og", "pve"] {
         let _ = sh("vgchange", &["-an", v]);
     }
+    let _ = sh("dmsetup", &["remove_all"]);
+    let _ = sh("udevadm", &["settle"]);
     sh("wipefs", &["-a", "-f", disk])?;
-    let root = if a.thin { format!("size={}GiB, ", a.root_gb) } else { String::new() };
-    let mut table = format!("label: gpt\nsize=1MiB, type=21686148-6449-6E6F-744E-656564454649, name=bios\nsize=512MiB, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=esp\n{root}type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=og-root\n");
-    if a.thin {
-        table.push_str("type=E6D6D379-F507-44C2-A23C-238F2A3DF928, name=og-data\n");
-    }
+    // GPT: BIOS boot, EFI, /boot (GRUB can't read thin volumes), the rest LVM
+    let table = "label: gpt\nsize=1MiB, type=21686148-6449-6E6F-744E-656564454649, name=bios\nsize=512MiB, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=esp\nsize=1GiB, type=BC13C2FF-59E6-4262-A352-B275FD6F7172, name=og-boot\ntype=E6D6D379-F507-44C2-A23C-238F2A3DF928, name=og-lvm\n";
     {
         let mut c = Command::new("sfdisk").args(["--quiet", "--wipe", "always", disk]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?;
         c.stdin.take().unwrap().write_all(table.as_bytes())?;
@@ -257,24 +259,51 @@ fn install(a: &Answers) -> Result<()> {
     }
     let _ = sh("partprobe", &[disk]);
     let _ = sh("udevadm", &["settle"]);
-    let (esp, rootp, datap) = (part(disk, 2), part(disk, 3), part(disk, 4));
+    let (esp, bootp, lvmp) = (part(disk, 2), part(disk, 3), part(disk, 4));
+    step("volumes: the system (og/root, with room for update snapshots), OG-Host's data (og/state), VM disks (og/data)");
+    sh("pvcreate", &["-ff", "-y", &lvmp])?;
+    sh("vgcreate", &["og", &lvmp])?;
+    let free_gib: u64 = sh("vgs", &["--noheadings", "--units", "g", "--nosuffix", "-o", "vg_free", "og"])?.trim().parse::<f64>().unwrap_or(0.0) as u64;
+    // the system's own pool: the root plus half again for the snapshot an update keeps
+    let root_gib = if a.thin { a.root_gb } else { (free_gib * 6 / 10).max(16) };
+    let sys_gib = if a.thin { (root_gib * 3 / 2).min(free_gib.saturating_sub(8)) } else { free_gib * 95 / 100 };
+    sh("lvcreate", &["-q", "-y", "-L", &format!("{sys_gib}G"), "-T", "og/sys"])?;
+    sh("lvcreate", &["-q", "-y", "-V", &format!("{root_gib}G"), "-T", "og/sys", "-n", "root"])?;
+    let state_pool = if a.thin {
+        sh("lvcreate", &["-q", "-y", "-l", "95%FREE", "-T", "og/data"])?;
+        "og/data"
+    } else {
+        "og/sys"
+    };
+    let state_gib = if a.thin { free_gib.saturating_sub(sys_gib) * 9 / 10 } else { free_gib * 3 / 10 };
+    sh("lvcreate", &["-q", "-y", "-V", &format!("{}G", state_gib.max(8)), "-T", state_pool, "-n", "state"])?;
+    let (rootp, statep) = ("/dev/og/root".to_string(), "/dev/og/state".to_string());
     step("making file systems");
     sh("mkfs.vfat", &["-F", "32", "-n", "OGEFI", &esp])?;
+    sh("mkfs.ext4", &["-q", "-F", "-L", "og-boot", &bootp])?;
     match a.fs.as_str() {
         "xfs" => sh("mkfs.xfs", &["-f", "-L", "og-root", &rootp])?,
         _ => sh("mkfs.ext4", &["-q", "-F", "-L", "og-root", &rootp])?,
     };
-    if a.thin {
-        step("thin pool for VM disks (og/data)");
-        sh("pvcreate", &["-ff", "-y", &datap])?;
-        sh("vgcreate", &["og", &datap])?;
-        sh("lvcreate", &["-q", "-y", "-l", "95%FREE", "-T", "og/data"])?;
-    }
+    sh("mkfs.ext4", &["-q", "-F", "-L", "og-state", &statep])?;
     std::fs::create_dir_all(TARGET)?;
     sh("mount", &[&rootp, TARGET])?;
-    std::fs::create_dir_all(format!("{TARGET}/boot/efi"))?;
     step("copying the system (a few minutes)");
+    // onto the root first (the image has hard links across what become separate volumes), then
+    // /boot and OG-Host's data move onto their own
     sh("unsquashfs", &["-f", "-q", "-n", "-d", TARGET, SQUASH])?;
+    for (dev, at) in [(&bootp, "boot"), (&statep, "var/lib/og-host")] {
+        let dir = format!("{TARGET}/{at}");
+        std::fs::create_dir_all(&dir)?;
+        let tmp = "/mnt/og-move";
+        std::fs::create_dir_all(tmp)?;
+        sh("mount", &[dev, tmp])?;
+        sh("cp", &["-a", &format!("{dir}/."), tmp])?;
+        sh("umount", &[tmp])?;
+        sh("find", &[&dir, "-mindepth", "1", "-delete"])?;
+        sh("mount", &[dev, &dir])?;
+    }
+    std::fs::create_dir_all(format!("{TARGET}/boot/efi"))?;
     sh("mount", &[&esp, &format!("{TARGET}/boot/efi")])?;
     for m in ["dev", "proc", "sys", "run"] {
         let p = format!("{TARGET}/{m}");
@@ -284,7 +313,7 @@ fn install(a: &Answers) -> Result<()> {
     if Path::new("/sys/firmware/efi/efivars").exists() {
         let _ = sh("mount", &["-t", "efivarfs", "efivarfs", &format!("{TARGET}/sys/firmware/efi/efivars")]);
     }
-    let r = configure(a, disk, &rootp, &esp);
+    let r = configure(a, disk, &rootp, &esp, &bootp, &statep);
     // unmount whatever happened
     let _ = sh("sync", &[]);
     let _ = sh("umount", &["-R", TARGET]);
@@ -292,12 +321,18 @@ fn install(a: &Answers) -> Result<()> {
     Ok(())
 }
 
-fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str) -> Result<()> {
+fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str, bootp: &str, statep: &str) -> Result<()> {
     step("configuring");
     let uuid = |p: &str| sh("blkid", &["-s", "UUID", "-o", "value", p]).map(|s| s.trim().to_string());
-    let (ru, eu) = (uuid(rootp)?, uuid(esp)?);
+    let (ru, eu, bu, su) = (uuid(rootp)?, uuid(esp)?, uuid(bootp)?, uuid(statep)?);
     let opts = if a.fs == "xfs" { "defaults" } else { "defaults,errors=remount-ro" };
-    std::fs::write(format!("{TARGET}/etc/fstab"), format!("# OG-Host\nUUID={ru} / {} {opts} 0 1\nUUID={eu} /boot/efi vfat umask=0077 0 1\n", if a.fs == "xfs" { "xfs" } else { "ext4" }))?;
+    std::fs::write(
+        format!("{TARGET}/etc/fstab"),
+        format!(
+            "# OG-Host: the system (og/root, snapshotted for updates), /boot, EFI, OG-Host's data (og/state, never rolled back)\nUUID={ru} / {} {opts} 0 1\nUUID={bu} /boot ext4 defaults 0 2\nUUID={eu} /boot/efi vfat umask=0077 0 1\nUUID={su} /var/lib/og-host ext4 defaults 0 2\n",
+            if a.fs == "xfs" { "xfs" } else { "ext4" }
+        ),
+    )?;
     let host = a.hostname.to_lowercase();
     std::fs::write(format!("{TARGET}/etc/hostname"), format!("{host}\n"))?;
     std::fs::write(format!("{TARGET}/etc/hosts"), format!("127.0.0.1\tlocalhost\n127.0.1.1\t{host}\n::1\tlocalhost ip6-localhost ip6-loopback\n"))?;
@@ -355,10 +390,11 @@ fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str) -> Result<()> {
     let _ = chroot(&["dpkg", "--purge", "live-boot", "live-boot-initramfs-tools"]);
     let _ = chroot(&["systemctl", "disable", "og-installer.service", "og-live-shell.service"]);
     chroot(&["update-initramfs", "-u", "-k", "all"])?;
-    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), "GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n").or_else(|_| {
-        std::fs::create_dir_all(format!("{TARGET}/etc/default/grub.d"))?;
-        std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), "GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n")
-    })?;
+    // GRUB boots the saved entry: an update tries a new kernel once before it becomes the default;
+    // a kernel that panics reboots (into the previous one) after 10 s
+    std::fs::create_dir_all(format!("{TARGET}/etc/default/grub.d"))?;
+    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), "GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n")?;
+    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host-saved.cfg"), "# OG-Host updates: boot the saved entry; a panicking kernel reboots after 10 s\nGRUB_DEFAULT=saved\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX panic=10\"\n")?;
     // UEFI (also at the fallback path, so it boots without an NVRAM entry) and BIOS
     let efi = Path::new("/sys/firmware/efi").exists();
     chroot(&["grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--bootloader-id=og-host", "--removable", "--no-nvram"])?;
@@ -416,6 +452,7 @@ pub fn run(auto: Option<PathBuf>) -> Result<()> {
             }
             Err(e) => {
                 println!("\n  \x1b[1;31mThe install didn't finish:\x1b[0m {e:#}");
+                step(&format!("FAILED: {e:#}"));
                 if auto.is_some() {
                     return Err(e);
                 }

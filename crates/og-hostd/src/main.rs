@@ -26,6 +26,7 @@ mod schedule;
 mod serve;
 mod stacks;
 mod stats;
+mod sysupdate;
 mod storage;
 mod tasks;
 mod release;
@@ -199,6 +200,9 @@ enum Cmd {
     /// (systemd ExecStartPre) count a start of an update on trial; roll back if it keeps failing.
     #[command(hide = true)]
     UpdateGuard,
+    /// (timer after boot) roll back a whole-system update nothing confirmed.
+    #[command(hide = true)]
+    UpdateBootCheck,
     /// Lab control plane maintenance.
     Lab {
         #[command(subcommand)]
@@ -282,6 +286,26 @@ fn ago(t: u64) -> String {
 enum ReleaseCmd {
     /// Make a release signing key in DIR.
     Keygen { dir: PathBuf },
+    /// Vouch for a signing key (a CI key) with a root release key, on a mirror directory; or
+    /// --revoke it. Servers accept releases it signs until it expires.
+    Delegate {
+        /// the root release key file
+        #[arg(long)]
+        root_key: PathBuf,
+        /// the key to vouch for: hex, or its .pub file
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value = "ci")]
+        name: String,
+        #[arg(long, default_value_t = 400)]
+        days: u64,
+        #[arg(long, value_delimiter = ',', default_value = "stable,beta,dev")]
+        channels: Vec<String>,
+        #[arg(long)]
+        mirror: PathBuf,
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Pack binaries into a signed release on a mirror directory.
     Make {
         #[arg(long)]
@@ -328,8 +352,13 @@ async fn main() -> Result<()> {
             update::guard(&cli.root);
             return Ok(());
         }
+        Cmd::UpdateBootCheck => {
+            sysupdate::boot_check();
+            return Ok(());
+        }
         Cmd::Installer { auto } => return installer::run(auto.clone()),
         Cmd::Release { cmd: ReleaseCmd::Keygen { dir } } => return release::keygen(dir),
+        Cmd::Release { cmd: ReleaseCmd::Delegate { root_key, key, name, days, channels, mirror, revoke } } => return release::delegate(root_key, key, name, *days, channels, mirror, *revoke),
         Cmd::Release { cmd: ReleaseCmd::Make { version, channel, notes, key, mirror, bins, arch, url } } => {
             return release::make(&release::MakeOpts { version: version.clone(), channel: channel.clone(), notes: notes.clone(), key: key.clone(), mirror: mirror.clone(), bins: bins.clone(), arch: arch.clone(), url: url.clone() })
         }
@@ -458,7 +487,7 @@ async fn main() -> Result<()> {
                 println!("account {id} saved; sign in on the web UI");
             }
         }
-        Cmd::Release { .. } | Cmd::UpdateGuard | Cmd::Installer { .. } => unreachable!("handled before the store opens"),
+        Cmd::Release { .. } | Cmd::UpdateGuard | Cmd::UpdateBootCheck | Cmd::Installer { .. } => unreachable!("handled before the store opens"),
         Cmd::Mirror { cmd } => match cmd {
             MirrorCmd::Sync { url, dir } => release::sync(&cli.root, &url, &dir).await?,
         },
@@ -487,6 +516,7 @@ async fn main() -> Result<()> {
         Cmd::Serve { listen, docker_scope, scope_label, listen_tls, tls_cert, tls_key, lab, cluster_port } => {
             // an update on trial: count this start, roll back if it keeps failing
             update::startup_check(&cli.root);
+            sysupdate::on_start(&cli.root);
             let tls = match listen_tls {
                 Some(addr) => Some((addr, tls::cert_files(&cli.root, tls_cert, tls_key)?)),
                 None => None,

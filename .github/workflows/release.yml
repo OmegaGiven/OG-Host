@@ -1,0 +1,89 @@
+# Build, test, sign and publish OG-Host releases to the update site (the `site` branch, served
+# by Cloudflare Pages at https://ogstudio.org/oghost/).
+#
+#   push to main        -> channel "dev"
+#   tag vX.Y.Z-beta.N   -> channel "beta"
+#   tag vX.Y.Z          -> channel "stable" (+ the install ISO on the GitHub release)
+#
+# Releases are signed with the CI key (secret OG_CI_SIGNING_KEY). Servers accept it because the
+# offline root release key vouches for it in site/oghost/keys/delegations.json (made with
+# `og-hostd release delegate`, never in CI).
+name: release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Channel and version
+        id: v
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag=${GITHUB_REF#refs/tags/v}
+            [ "$tag" = "$ver" ] || { echo "tag v$tag but Cargo.toml says $ver"; exit 1; }
+            if [[ "$tag" == *-* ]]; then ch=beta; else ch=stable; fi
+          else
+            ch=dev
+            # dev builds: the next version with the commit, e.g. 0.3.1-dev.42.ab12cd3
+            ver="${ver}-dev.${GITHUB_RUN_NUMBER}.${GITHUB_SHA::7}"
+            sed -i "0,/^version = \".*\"/s//version = \"$ver\"/" Cargo.toml
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "channel=$ch" >> "$GITHUB_OUTPUT"
+
+      - name: Build (Debian 13 toolchain) and test
+        run: |
+          docker build -q -t og-host-builder:trixie - <<'DOCKERFILE'
+          FROM rust:1-trixie
+          RUN apt-get update && apt-get install -y --no-install-recommends clang libelf-dev zlib1g-dev libseccomp-dev pkg-config && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
+          docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/src/.cargo-home -e CARGO_TARGET_DIR=/src/target-debian \
+            -v "$PWD":/src -w /src og-host-builder:trixie \
+            sh -c 'cargo test --release -p og-hostd -p og-backup -p og-oci -p og-net && cargo build --release --bin og-hostd --bin og-shim'
+          ./target-debian/release/og-hostd --version
+
+      - name: Sign and add to the update site
+        env:
+          OG_CI_SIGNING_KEY: ${{ secrets.OG_CI_SIGNING_KEY }}
+        run: |
+          [ -n "$OG_CI_SIGNING_KEY" ] || { echo "secret OG_CI_SIGNING_KEY is missing"; exit 1; }
+          git fetch origin site:site 2>/dev/null || true
+          git worktree add site site 2>/dev/null || { git worktree add --orphan -b site site; }
+          umask 077; printf '%s' "$OG_CI_SIGNING_KEY" > "$RUNNER_TEMP/ci.key"
+          ./target-debian/release/og-hostd release make --version "${{ steps.v.outputs.version }}" --channel "${{ steps.v.outputs.channel }}" \
+            --key "$RUNNER_TEMP/ci.key" --mirror site/oghost --url https://ogstudio.org/oghost \
+            --bin target-debian/release/og-hostd --bin target-debian/release/og-shim
+          rm -f "$RUNNER_TEMP/ci.key"
+          # keep the newest 10 releases (the rest only grow the site)
+          ls -1 site/oghost/releases | grep -v index | sort -V | head -n -10 | while read v; do git -C site rm -rq "oghost/releases/$v"; done
+          [ -f site/index.html ] || cp packaging/site-index.html site/index.html
+          cd site
+          git config user.name "OG-Host release"
+          git config user.email "45111226+OmegaGiven@users.noreply.github.com"
+          git add -A
+          git commit -qm "release ${{ steps.v.outputs.version }} (${{ steps.v.outputs.channel }})"
+          git push -q origin site
+
+      - name: Install ISO (stable and beta releases)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ./iso/build.sh
+          gh release create "v${{ steps.v.outputs.version }}" iso/out/og-host-*-amd64.iso \
+            --title "OG-Host ${{ steps.v.outputs.version }}" --notes "Signed update channel: https://ogstudio.org/oghost/" \
+            $([ "${{ steps.v.outputs.channel }}" = beta ] && echo --prerelease)
+        env:
+          GH_TOKEN: ${{ github.token }}

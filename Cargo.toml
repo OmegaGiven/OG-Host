@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/og-oci", "crates/og-runtime", "crates/og-net", "crates/og-compose", "crates/og-shim", "crates/og-hostd", "crates/og-lab", "crates/og-access", "crates/og-backup"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 license = "MPL-2.0"
 repository = "https://github.com/OmegaGiven/og-host"

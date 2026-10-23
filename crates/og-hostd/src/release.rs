@@ -55,6 +55,43 @@ pub fn keygen(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Vouch for a key with a root key: add it (or renew it) in the mirror's `keys/delegations.json`
+/// and re-sign the list with a higher version. `revoke`: drop it instead.
+pub fn delegate(root_key: &Path, key: &str, name: &str, days: u64, channels: &[String], mirror: &Path, revoke: bool) -> Result<()> {
+    let sk = read_key(root_key)?;
+    let hexkey = if Path::new(key).exists() { std::fs::read_to_string(key)?.trim().to_string() } else { key.trim().to_string() };
+    let b: [u8; 32] = hex::decode(&hexkey).ok().and_then(|v| v.try_into().ok()).context("the key is 64 hex characters (or a .pub file holding them)")?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&b)?;
+    let dir = mirror.join("keys");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("delegations.json");
+    let mut d: crate::update::Delegations = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    d.keys.retain(|x| x.key.trim() != hexkey);
+    if !revoke {
+        for c in channels {
+            if !["stable", "beta", "dev"].contains(&c.as_str()) {
+                bail!("channels are stable, beta, dev");
+            }
+        }
+        d.keys.push(crate::update::Delegation { key: hexkey.clone(), name: name.into(), not_after: crate::containers::unix_now() + days * 86400, channels: channels.to_vec() });
+    }
+    d.version += 1;
+    let rvk = sk.verifying_key();
+    std::fs::write(dir.join("og-host-release.pub"), format!("{}\n", hex::encode(rvk.as_bytes())))?;
+    std::fs::write(dir.join("og-host-release.pem"), spki_pem(&rvk))?;
+    std::fs::create_dir_all(dir.join("delegated"))?;
+    if !revoke {
+        std::fs::write(dir.join("delegated").join(format!("{}.pem", crate::update::key_id(&vk))), spki_pem(&vk))?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("delegated").join(format!("{}.pem", crate::update::key_id(&vk))));
+    }
+    let body = serde_json::to_vec_pretty(&d)?;
+    std::fs::write(&path, &body)?;
+    std::fs::write(path.with_extension("json.sig"), sign(&sk, &body))?;
+    println!("{} key {} ({name}); key list version {}", if revoke { "revoked" } else { "vouched for" }, crate::update::key_id(&vk), d.version);
+    Ok(())
+}
+
 fn sign(sk: &ed25519_dalek::SigningKey, data: &[u8]) -> String {
     format!("{}\n{}\n", hex::encode(sk.sign(data).to_bytes()), crate::update::key_id(&sk.verifying_key()))
 }
@@ -140,11 +177,19 @@ pub fn make(o: &MakeOpts) -> Result<()> {
     let ib = serde_json::to_vec_pretty(&idx)?;
     std::fs::write(&idx_path, &ib)?;
     std::fs::write(idx_path.with_extension("json.sig"), sign(&sk, &ib))?;
-    let keys = o.mirror.join("keys");
-    std::fs::create_dir_all(&keys)?;
+    // the signer's public key: a release (root) key, or a delegated key (published for install.sh;
+    // trusted only through the root-signed delegations.json)
     let vk = sk.verifying_key();
-    std::fs::write(keys.join("og-host-release.pub"), format!("{}\n", hex::encode(vk.as_bytes())))?;
-    std::fs::write(keys.join("og-host-release.pem"), spki_pem(&vk))?;
+    let root_signed = crate::update::BUILTIN_KEYS.iter().any(|h| *h == hex::encode(vk.as_bytes()));
+    let keys = o.mirror.join("keys");
+    let kdir = if root_signed { keys.clone() } else { keys.join("delegated") };
+    std::fs::create_dir_all(&kdir)?;
+    if root_signed {
+        std::fs::write(keys.join("og-host-release.pub"), format!("{}\n", hex::encode(vk.as_bytes())))?;
+        std::fs::write(keys.join("og-host-release.pem"), spki_pem(&vk))?;
+    } else {
+        std::fs::write(kdir.join(format!("{}.pem", crate::update::key_id(&vk))), spki_pem(&vk))?;
+    }
     std::fs::write(o.mirror.join("index.html"), SITE)?;
     std::fs::write(o.mirror.join("install.sh"), install_script(o.url.as_deref().unwrap_or("__MIRROR__")))?;
     std::fs::write(o.mirror.join("favicon.svg"), include_str!("../ui/favicon.svg"))?;
@@ -300,11 +345,23 @@ cd "$TMP"
 fetch() { curl -fsSL "$MIRROR/$1" -o "$2"; }
 fetch "channels/$CHANNEL.json" manifest.json
 fetch "channels/$CHANNEL.json.sig" manifest.sig
-fetch keys/og-host-release.pem key.pem
+fetch keys/og-host-release.pem root.pem
+# verify FILE (signature SIG: hex line + key id line) with PEM
+verify() { head -1 "$2" | xxd -r -p > sig.bin; openssl pkeyutl -verify -pubin -inkey "$1" -rawin -in "$3" -sigfile sig.bin >/dev/null 2>&1; }
 if command -v openssl >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
-  head -1 manifest.sig | xxd -r -p > sig.bin
-  openssl pkeyutl -verify -pubin -inkey key.pem -rawin -in manifest.json -sigfile sig.bin >/dev/null || { echo "signature check FAILED: not installing" >&2; exit 1; }
-  echo "signature ok"
+  if verify root.pem manifest.sig manifest.json; then
+    echo "signature ok (release key)"
+  else
+    # signed by a delegated (CI) key: the release key must vouch for it in keys/delegations.json
+    KID=$(sed -n 2p manifest.sig | tr -cd '0-9a-f')
+    fetch keys/delegations.json dl.json && fetch keys/delegations.json.sig dl.sig || { echo "signature check FAILED: not installing" >&2; exit 1; }
+    verify root.pem dl.sig dl.json || { echo "the key list isn't signed by the release key: not installing" >&2; exit 1; }
+    fetch "keys/delegated/$KID.pem" signer.pem
+    HEX=$(openssl pkey -pubin -in signer.pem -outform DER | tail -c 32 | xxd -p -c 64)
+    grep -q "\"$HEX\"" dl.json || { echo "the signing key isn't vouched for: not installing" >&2; exit 1; }
+    verify signer.pem manifest.sig manifest.json || { echo "signature check FAILED: not installing" >&2; exit 1; }
+    echo "signature ok (key $KID, vouched for by the release key)"
+  fi
 else
   echo "(openssl/xxd not found: skipping the signature check, using the checksum only)"
 fi
@@ -324,9 +381,6 @@ install -m 755 x/bin/og-hostd /usr/local/bin/og-hostd
 if command -v apt-get >/dev/null 2>&1; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends iproute2 nftables >/dev/null 2>&1 || true
 fi
-mkdir -p /etc/og-host/trusted-keys
-cp key.pem /etc/og-host/trusted-keys/og-host-release.pem
-curl -fsSL "$MIRROR/keys/og-host-release.pub" -o /etc/og-host/trusted-keys/og-host-release.pub
 cat > /etc/systemd/system/og-hostd.service <<'UNIT'
 [Unit]
 Description=OG-Host node daemon (containers, VMs, networking, API)
@@ -343,7 +397,7 @@ KillMode=process
 WantedBy=multi-user.target
 UNIT
 mkdir -p /var/lib/og-host
-[ -f /var/lib/og-host/update.json ] || printf '{"channel":"%s","mirrors":["%s"],"auto":"notify","schedule":"daily 03:15"}\n' "$CHANNEL" "$MIRROR" > /var/lib/og-host/update.json
+[ -f /var/lib/og-host/update.json ] || printf '{"channel":"%s","mirrors":["%s"],"auto":"install","schedule":"daily 03:15","system":true,"reboot":"auto"}\n' "$CHANNEL" "$MIRROR" > /var/lib/og-host/update.json
 systemctl daemon-reload
 systemctl enable --now og-hostd
 echo
