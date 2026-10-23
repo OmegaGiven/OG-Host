@@ -612,16 +612,18 @@ impl Node {
             });
         }
         cmd.spawn().context("starting og-shim")?;
-        // wait briefly for the shim to report running/failed
-        for _ in 0..1000 {
+        // wait for the shim to report running/failed: usually milliseconds, but createContainer
+        // hooks (e.g. NVIDIA's CDI hooks linking the driver libraries) can take a while on a busy disk
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(60) {
             let st = self.status(id);
             match st.state.as_str() {
                 "running" | "exited" => return Ok(()),
                 "failed" => bail!("container failed to start: {}", st.error.unwrap_or_default()),
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => std::thread::sleep(std::time::Duration::from_millis(if t0.elapsed().as_secs() < 5 { 5 } else { 100 })),
             }
         }
-        bail!("container did not report a state within 5s (see {})", dir.join("shim.log").display())
+        bail!("container did not report a state within 60s (see {})", dir.join("shim.log").display())
     }
 
     pub fn stop(&self, id: &str, timeout_s: u64) -> Result<Status> {
