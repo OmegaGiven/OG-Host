@@ -161,6 +161,7 @@ pub fn cli(root: &Path, file: &Path, pool: &str, name: &str) -> Result<()> {
     let r = open(file)?;
     let t0 = std::time::Instant::now();
     let mut last = std::time::Instant::now();
+    let made = std::cell::RefCell::new(Vec::<String>::new());
     let imp = import(
         r,
         |dev, size| {
@@ -168,6 +169,7 @@ pub fn cli(root: &Path, file: &Path, pool: &str, name: &str) -> Result<()> {
             let vol = format!("{pool}:vm-{name}-{short}");
             let gib = size.div_ceil(1 << 30);
             pools.create(&vol, gib).with_context(|| format!("making {vol}"))?;
+            made.borrow_mut().push(vol.clone());
             eprintln!("{dev}: {:.1} GiB -> {vol}", size as f64 / (1u64 << 30) as f64);
             Ok((vol.clone(), pools.path(&vol)?))
         },
@@ -177,7 +179,19 @@ pub fn cli(root: &Path, file: &Path, pool: &str, name: &str) -> Result<()> {
                 eprintln!("  {:.1} GiB of data written ({:.0} MB/s)", done as f64 / (1u64 << 30) as f64, done as f64 / 1e6 / t0.elapsed().as_secs_f64().max(1.0));
             }
         },
-    )?;
+    );
+    let imp = match imp {
+        Ok(i) => i,
+        Err(e) => {
+            // a half-written disk is no use: remove what this import made, so it can simply be run again
+            for vol in made.borrow().iter() {
+                if let Err(e2) = pools.delete(vol) {
+                    eprintln!("couldn't remove {vol}: {e2:#}");
+                }
+            }
+            return Err(e);
+        }
+    };
     let dir = root.join("imported").join(name);
     std::fs::create_dir_all(&dir)?;
     for (n, data) in &imp.configs {
