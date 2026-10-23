@@ -169,3 +169,54 @@ pub async fn run(d: Arc<Daemon>) {
 pub fn api_json(root: &Path) -> Value {
     load(root).map(|r| serde_json::to_value(r).unwrap_or_default()).unwrap_or_else(|| serde_json::json!({"pending": true}))
 }
+
+// ---- GPU power limits ----------------------------------------------------------------------
+// The driver forgets them at every boot; kept in <root>/gpu-power.json (UUID -> watts) and
+// applied when og-hostd starts. Measured on og-host2: RTX 2060 170 -> 125 W costs 4 % of LLM
+// speed, RTX 3070 220 -> 160 W 1.5 % of SDXL speed, for ~27 % less power under load.
+
+fn power_file(root: &Path) -> PathBuf {
+    root.join("gpu-power.json")
+}
+
+pub fn power_limits(root: &Path) -> std::collections::BTreeMap<String, u32> {
+    std::fs::read(power_file(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn set_limit(uuid: &str, watts: u32) -> anyhow::Result<()> {
+    let st = std::process::Command::new("nvidia-smi").args(["-i", uuid, "-pl", &watts.to_string()]).stdout(std::process::Stdio::null()).status()?;
+    anyhow::ensure!(st.success(), "nvidia-smi -pl {watts} failed for {uuid} (outside the card's allowed range?)");
+    Ok(())
+}
+
+pub fn apply_power_limits(root: &Path) {
+    for (uuid, w) in power_limits(root) {
+        match set_limit(&uuid, w) {
+            Ok(()) => eprintln!("og-hostd: GPU {uuid}: power limit {w} W"),
+            Err(e) => eprintln!("og-hostd: {e:#}"),
+        }
+    }
+}
+
+/// `og-hostd gpu-power [UUID WATTS]`: list, or set and remember (0 = back to the default).
+pub fn power_cli(root: &Path, uuid: Option<String>, watts: Option<u32>) -> anyhow::Result<()> {
+    let mut m = power_limits(root);
+    if let (Some(u), Some(w)) = (uuid, watts) {
+        if w == 0 {
+            let def = std::process::Command::new("nvidia-smi").args(["-i", &u, "--query-gpu=power.default_limit", "--format=csv,noheader,nounits"]).output()?;
+            let def: f64 = String::from_utf8_lossy(&def.stdout).trim().parse().unwrap_or(0.0);
+            set_limit(&u, def as u32)?;
+            m.remove(&u);
+        } else {
+            set_limit(&u, w)?;
+            m.insert(u, w);
+        }
+        std::fs::write(power_file(root), serde_json::to_vec_pretty(&m)?)?;
+    }
+    let o = std::process::Command::new("nvidia-smi").args(["--query-gpu=uuid,name,power.limit,power.default_limit,power.min_limit,power.max_limit", "--format=csv,noheader"]).output()?;
+    print!("{}", String::from_utf8_lossy(&o.stdout));
+    for (u, w) in &m {
+        println!("kept across boots: {u} {w} W");
+    }
+    Ok(())
+}

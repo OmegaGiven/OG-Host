@@ -95,6 +95,8 @@ enum Cmd {
     /// Check app data for silent corruption now (SHA-256 of every file under apps/ and volumes/,
     /// compared with the last scrub); also runs weekly in the background.
     Scrub,
+    /// GPU power limits, kept across boots: no arguments lists them; UUID WATTS sets one (0 = default)
+    GpuPower { uuid: Option<String>, watts: Option<u32> },
     /// Test free memory while the server runs; bad pages are taken out of service at once and
     /// remembered (<root>/badram.json). `--boot` also reserves them (2 MiB each) from the next boot.
     Memtest {
@@ -495,6 +497,7 @@ async fn main() -> Result<()> {
             let (root, file) = (cli.root.clone(), file.clone());
             tokio::task::spawn_blocking(move || vma::cli(&root, &file, &pool, &name)).await??;
         }
+        Cmd::GpuPower { uuid, watts } => hwhealth::power_cli(&cli.root, uuid, watts)?,
         Cmd::Scrub => {
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || integrity::cli(&root)).await??;

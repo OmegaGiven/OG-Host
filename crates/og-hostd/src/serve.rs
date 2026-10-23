@@ -162,6 +162,10 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     tokio::spawn(crate::omegaenv::run(app.clone()));
     // disks, kernel hardware errors, bad RAM: every 30 min
     tokio::spawn(crate::hwhealth::run(app.clone()));
+    {
+        let r = root.clone();
+        tokio::task::spawn_blocking(move || crate::hwhealth::apply_power_limits(&r));
+    }
 
     // supervisor + health loop
     {
