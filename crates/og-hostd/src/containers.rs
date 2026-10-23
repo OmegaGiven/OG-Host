@@ -547,6 +547,11 @@ impl Node {
                 }
             }
         }
+        // GPU device numbers (/dev/nvidiaN) can change between boots: point the container's
+        // devices at the GPUs it was given, as the CDI spec describes them now
+        if !meta.gpus.is_empty() {
+            refresh_gpu_devices(&dir.join("bundle/config.json"), &meta.gpus).with_context(|| format!("{}: updating GPU devices", meta.name))?;
+        }
         let _ = std::fs::remove_file(dir.join("status.json"));
         meta.desired = "running".into();
         self.save_meta(&meta)?;
@@ -855,6 +860,53 @@ impl Node {
 }
 
 /// Docker's `seccomp=unconfined` / `seccomp:unconfined` security option.
+/// Replace a bundle's per-GPU device nodes (/dev/nvidiaN, /dev/dri/*) with those the CDI
+/// registry gives for `gpus` now, in both the device list and the device cgroup rules.
+fn refresh_gpu_devices(config: &Path, gpus: &[String]) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    let edits = og_runtime::cdi::Registry::load().resolve(gpus)?;
+    let per_gpu = |p: &str| p.strip_prefix("/dev/nvidia").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) || p.starts_with("/dev/dri/");
+    let mut cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
+    let old: Vec<(i64, i64)> = cfg["linux"]["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["path"].as_str().is_some_and(per_gpu))
+        .filter_map(|d| Some((d["major"].as_i64()?, d["minor"].as_i64()?)))
+        .collect();
+    let mut new_devs = Vec::new();
+    for host in edits.device_paths() {
+        let h = host.to_string_lossy().into_owned();
+        if !per_gpu(&h) {
+            continue;
+        }
+        let md = std::fs::metadata(&host).with_context(|| format!("{h}"))?;
+        if !md.file_type().is_char_device() {
+            continue;
+        }
+        let (maj, min) = (libc::major(md.rdev()) as i64, libc::minor(md.rdev()) as i64);
+        new_devs.push(serde_json::json!({"path": h, "type": "c", "major": maj, "minor": min, "fileMode": 0o666, "uid": 0, "gid": 0}));
+    }
+    if new_devs.is_empty() {
+        return Ok(());
+    }
+    if let Some(devs) = cfg["linux"]["devices"].as_array_mut() {
+        devs.retain(|d| !d["path"].as_str().is_some_and(per_gpu));
+        devs.extend(new_devs.iter().cloned());
+    }
+    if let Some(rules) = cfg["linux"]["resources"]["devices"].as_array_mut() {
+        rules.retain(|r| !(r["type"] == "c" && old.iter().any(|(ma, mi)| r["major"].as_i64() == Some(*ma) && r["minor"].as_i64() == Some(*mi))));
+        for d in &new_devs {
+            rules.push(serde_json::json!({"allow": true, "type": "c", "major": d["major"], "minor": d["minor"], "access": "rwm"}));
+        }
+    }
+    let tmp = config.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&cfg)?)?;
+    std::fs::rename(&tmp, config)?;
+    Ok(())
+}
+
 pub fn is_seccomp_unconfined(opt: &str) -> bool {
     matches!(opt.trim(), "seccomp=unconfined" | "seccomp:unconfined")
 }

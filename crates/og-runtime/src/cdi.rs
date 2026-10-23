@@ -95,10 +95,12 @@ impl Registry {
                     Err(_) => continue,
                 };
                 let parsed: Option<Spec> = match f.extension().and_then(|e| e.to_str()) {
-                    Some("json") => serde_json::from_str(&text).ok(),
-                    Some("yaml") | Some("yml") => serde_yaml::from_str(&text).ok(),
-                    _ => None,
-                };
+                    Some("json") => serde_json::from_str(&text).map_err(|e| e.to_string()),
+                    Some("yaml") | Some("yml") => serde_yaml::from_str(&text).map_err(|e| e.to_string()),
+                    _ => continue,
+                }
+                .map_err(|e| eprintln!("og-runtime: ignoring CDI spec {}: {e}", f.display()))
+                .ok();
                 if let Some(s) = parsed {
                     specs.insert(s.kind.clone(), s); // later dirs (/var/run/cdi) override
                 }
@@ -220,3 +222,4 @@ containerEdits:
         assert!(r.resolve(&["bogus".into()]).is_err());
     }
 }
+

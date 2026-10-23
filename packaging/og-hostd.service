@@ -1,6 +1,6 @@
 [Unit]
 Description=OG-Host node daemon (containers, networking, restart policies, API)
-After=network-online.target
+After=network-online.target nvidia-cdi-refresh.service
 Wants=network-online.target
 
 [Service]

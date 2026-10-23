@@ -27,3 +27,21 @@ SD model, the same services take ~3.2 GB on OG-Host.
 CPU is a wash at idle (both under 1 %). During the first hours on OG-Host the CPU sat at ~7 %:
 that was the OmegaEnv log follower spinning on OG-Host's Docker logs endpoint (follow resent the
 log tail forever; fixed in d9d25ee), not the AI apps.
+
+## Update, 13:45 (an hour of og-host2 history, after the fixes)
+
+og-host2 now also runs workloads that weren't on proxmoxtwo: the liberate stack (qBittorrent,
+WireGuard jail), epic-browser and libby.
+
+| | Proxmox (4 VMs) | og-host2 |
+|---|---|---|
+| host CPU, median | 0.7 % (3 min) | 1.7 % over 1 h, all workloads; the original apps alone ≈ 0.1 % of the machine (qBittorrent is 4.5 % of one core) |
+| host RAM used | 29.0 GB | 13.7 GB with the extra workloads (liberate ~1.5 GB, epic-browser 0.5, libby 0.4) and SD resident |
+| koboldcpp, RTX 2060 | 52 tok/s (notes, 2026-09) | 53.5 tok/s (300 tokens, 2 runs) |
+| GPU idle power | 9.4 W / 19.8 W | 9.5 W / 19.6 W |
+| GPUs per workload | one VM per GPU (passthrough) | shared: Karaoke + koboldcpp both on the 2060 |
+
+Found while measuring: after the reboot the driver numbered the GPUs differently
+(/dev/nvidia0 ↔ 1) and containers kept the device nodes from when they were created, so
+SD and koboldcpp had swapped cards. Fixed: GPU devices are re-resolved from the CDI spec at
+every container start.
