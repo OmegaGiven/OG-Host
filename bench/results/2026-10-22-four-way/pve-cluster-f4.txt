@@ -1,0 +1,10 @@
+generating cloud-init ISO
+DIAG pve migrate to pve-bench2: rc=0 total=99.59 down=25 ssh-ok
+DIAG pve migrate to pve-bench: rc=0 total=109.34 down=30 ssh-ok
+DIAG pve migrate to pve-bench2: rc=0 total=89.89 down=64 ssh-ok
+DIAG pve migrate to pve-bench: rc=0 total=114.48 down=33 ssh-ok
+DIAG pve migrate to pve-bench2: rc=0 total=90.44 down=57 ssh-ok
+DIAG pve migrate to pve-bench: rc=0 total=114.41 down=19 ssh-ok
+RESULT migrate_live_s 104.47 s
+RESULT migrate_downtime_ms 31.50 ms
+RESULT ha_failover_s n/a (Proxmox HA needs shared storage or ZFS replication, and a third vote, for VMs on local disks)

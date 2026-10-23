@@ -1,0 +1,12 @@
+pve boot_to_ready_s 95.8
+pve boot_to_ready_s 96.7
+pve boot_to_ready_s 96.0
+og boot_to_ready_s 9.7
+og boot_to_ready_s 9.7
+og boot_to_ready_s 9.4
+incus boot_to_ready_s 21.0
+incus boot_to_ready_s 21.0
+incus boot_to_ready_s 21.1
+deb boot_to_ready_s 19.2
+deb boot_to_ready_s 19.2
+deb boot_to_ready_s 19.2

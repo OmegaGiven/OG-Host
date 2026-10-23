@@ -1,0 +1,10 @@
+DIAG og migrate to og-bench2: st="status":"error" total=48.44 down= SSH-FAILED
+DIAG og migrate to og-bench: st="status":"error" total=0.03 down= SSH-FAILED
+DIAG og migrate to og-bench2: st="status":"ok" total=20.25 down= SSH-FAILED
+DIAG og migrate to og-bench: st="status":"ok" total=19.12 down= SSH-FAILED
+DIAG og migrate to og-bench2: st="status":"ok" total=18.51 down= SSH-FAILED
+DIAG og migrate to og-bench: st="status":"ok" total=19.46 down= SSH-FAILED
+RESULT migrate_live_s 19.29 s
+RESULT migrate_downtime_ms 0.00 ms
+RESULT ha_failover_running_s 163.45 s
+RESULT ha_failover_ssh_s 174.77 s

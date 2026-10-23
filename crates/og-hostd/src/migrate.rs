@@ -241,6 +241,17 @@ pub async fn abort(State(d): State<Arc<Daemon>>, UrlPath(name): UrlPath<String>)
 
 // ---- source side ----
 
+/// POST JSON to a peer, once more if the connection failed before an answer came
+async fn post_retry(c: &reqwest::Client, url: &str, body: &Value) -> reqwest::Result<reqwest::Response> {
+    match c.post(url).json(body).send().await {
+        Err(e) if e.is_connect() || e.is_request() => {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            c.post(url).json(body).send().await
+        }
+        r => r,
+    }
+}
+
 #[derive(Deserialize)]
 pub struct MigrateReq {
     node: String,
@@ -300,7 +311,7 @@ async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq
     }
     t.log(format!("{} migration of {name} to {} ({host})", if live { "live" } else { "offline" }, node.name));
     let files = tar_b64(&d.vms.dir(name), &["efivars.fd", "tpm"])?;
-    let r = c.post(format!("{base}/prepare")).json(&json!({"vm": vm, "files": files, "sizes": sizes, "pool": b.pool, "live": live})).send().await?;
+    let r = post_retry(&c, &format!("{base}/prepare"), &json!({"vm": vm, "files": files, "sizes": sizes, "pool": b.pool, "live": live})).await?;
     let st = r.status();
     let prep: Value = r.json().await.unwrap_or_default();
     if !st.is_success() {
@@ -328,7 +339,7 @@ async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq
         let (me, to) = (d.cluster.me.clone(), node.name.clone());
         let n = name.to_string();
         let r0 = r.clone();
-        crate::ha::update(d, move |doc| {
+        if let Err(e) = crate::ha::update(d, move |doc| {
             if let Some(x) = doc.resources.get_mut(&n) {
                 x.owner = to.clone();
                 if r0.standby == to {
@@ -336,9 +347,11 @@ async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq
                 }
             }
             Ok(())
-        })?;
+        }) {
+            t.warn(format!("updating high availability: {e:#}"));
+        }
     }
-    let fin = c.post(format!("{base}/{name}/finish")).json(&json!({"live": live, "start": b.start})).send().await;
+    let fin = post_retry(&c, &format!("{base}/{name}/finish"), &json!({"live": live, "start": b.start})).await;
     let fin_err = match fin {
         Ok(r) if r.status().is_success() => None,
         Ok(r) => Some(r.json::<Value>().await.unwrap_or_default()["error"].as_str().unwrap_or("?").to_string()),
@@ -353,9 +366,12 @@ async fn run(d: &Arc<Daemon>, t: &crate::tasks::Task, name: &str, b: &MigrateReq
             });
         }
         // the VM never ran there: it carries on here
-        let _ = c.post(format!("{base}/{name}/abort")).json(&json!({})).send().await;
+        let _ = post_retry(&c, &format!("{base}/{name}/abort"), &json!({})).await;
         if live {
-            let _ = d.vms.qmp(name, "cont", json!({}));
+            live_cleanup(d, name, &vm);
+            if let Err(e) = d.vms.qmp(name, "cont", json!({})) {
+                t.warn(format!("resuming {name} here: {e:#}"));
+            }
         }
         bail!("finishing on {}: {e}", node.name);
     }

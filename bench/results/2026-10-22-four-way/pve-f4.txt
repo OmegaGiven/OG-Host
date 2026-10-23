@@ -1,0 +1,114 @@
+== footprint
+RESULT disk_used_mb 9529 MB
+RESULT packages 754 
+RESULT mem_used_idle_mb 1399 MB
+RESULT cpu_busy_idle_pct 0.83 %
+RESULT tcp_ports_external 6 
+RESULT root_processes 42 
+RESULT processes 54 
+== security
+RESULT lynis_hardening_index 62 /100
+RESULT tcp_ports_list 22,111,3128,8006, 
+RESULT suid_files 18 
+RESULT kernel_lockdown none/integrity/confidentiality 
+== api
+RESULT api_list_vms_ms 10.0 ms
+RESULT api_list_vms_max_ms 40.0 ms
+== containers
+RESULT container_create_to_http_s 3.90 s
+== density
+RESULT density_30_containers_s 120.35 s
+RESULT density_mem_per_container_mb 0 MB
+RESULT ctr_mem_cgroup_plus_supervisor_mb 9.7 MB
+RESULT density_remove_all_s 76.83 s
+== ctrnet
+RESULT ctr_to_ctr_gbit 65.73 Gbit/s
+RESULT host_to_ctr_gbit 67.16 Gbit/s
+== ctrbackup
+RESULT ctr_backup_s 2.23 s
+RESULT ctr_backup_size_mb 523 MB
+RESULT ctr_backup_again_s 2.21 s
+RESULT ctr_restore_to_http_s 4.13 s
+== pressure
+RESULT pressure_default_web_failures 0 /300
+RESULT pressure_default_web_max_latency_ms 1 ms
+RESULT pressure_default_killed stress:2  
+RESULT pressure_16g_web_failures 0 /300
+RESULT pressure_16g_web_max_latency_ms 12 ms
+RESULT pressure_16g_killed stress:1  
+== dockerlxc
+RESULT dockerlxc_platform_mem_mb 172 MB
+RESULT dockerlxc_container_create_to_http_s 0.23 s
+RESULT dockerlxc_density_30_containers_s 6.77 s
+RESULT dockerlxc_density_remove_all_s 0.84 s
+DIAG docker storage overlay2
+== vms
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+RESULT vm_linked_clone_s 2.25 s
+RESULT vm_full_clone_8g_s 5.72 s
+RESULT vm_start_to_ssh_s 14.20 s
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+RESULT vm_mem_per_fresh_1g_guest_mb 603 MB
+RESULT vm_mem_per_idle_1g_guest_mb 593 MB
+DIAG kernel 7.0.14-25-pve
+DIAG thp always [madvise] never defrag always defer defer+madvise [madvise] never
+DIAG ksm run=0 pages_sharing=0
+DIAG qemu 61740 Rss: 645 MB  Pss_Anon: 634 MB  Pss_File: 3 MB  AnonHugePages: 616 MB  Swap: 0 MB  
+DIAG qemu 61740 cmdline -cpu kvm64,enforce,+kvm_pv_eoi,+kvm_pv_unhalt,+lahf_lm,+sep -m 1024 -device pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e -device pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f -device pci-bridge,id=pci.3,chassis_nr=3,bus=pci.0,addr=0x5 -device vmgenid,guid=ace79346-9332-4007-a0e2-ef601311b274 -device piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2 -device isa-serial,chardev=serial0 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3,free-page-reporting=on -device ide-cd,bus=ide.1,unit=0,drive=drive-ide2,id=ide2 -device virtio-scsi-pci,id=virtioscsi0,bus=pci.3,addr=0x1,iothread=iothread-virtioscsi0 -device scsi-hd,bus=virtioscsi0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0,id=scsi0,device_id=drive-scsi0,bootindex=100,write-cache=on -netdev type=tap,id=net0,ifname=tap121i0,script=/usr/libexec/qemu-server/pve-bridge,downscript=/usr/libexec/qemu-server/pve-bridgedown,vhost=on -device virtio-net-pci,mac=BC:24:11:B4:2A:8A,netdev=net0,bus=pci.0,addr=0x12,id=net0,rx_queue_size=1024,tx_queue_size=256,host_mtu=1500,host_tunnel=off -machine smm=off,type=pc+pve0 
+DIAG qemu 61840 Rss: 662 MB  Pss_Anon: 652 MB  Pss_File: 3 MB  AnonHugePages: 634 MB  Swap: 0 MB  
+DIAG qemu 61840 cmdline -cpu kvm64,enforce,+kvm_pv_eoi,+kvm_pv_unhalt,+lahf_lm,+sep -m 1024 -device pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e -device pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f -device pci-bridge,id=pci.3,chassis_nr=3,bus=pci.0,addr=0x5 -device vmgenid,guid=7ddddd27-2a7e-49c4-8924-8108bbcef6d6 -device piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2 -device isa-serial,chardev=serial0 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3,free-page-reporting=on -device ide-cd,bus=ide.1,unit=0,drive=drive-ide2,id=ide2 -device virtio-scsi-pci,id=virtioscsi0,bus=pci.3,addr=0x1,iothread=iothread-virtioscsi0 -device scsi-hd,bus=virtioscsi0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0,id=scsi0,device_id=drive-scsi0,bootindex=100,write-cache=on -netdev type=tap,id=net0,ifname=tap122i0,script=/usr/libexec/qemu-server/pve-bridge,downscript=/usr/libexec/qemu-server/pve-bridgedown,vhost=on -device virtio-net-pci,mac=BC:24:11:1D:BD:EE,netdev=net0,bus=pci.0,addr=0x12,id=net0,rx_queue_size=1024,tx_queue_size=256,host_mtu=1500,host_tunnel=off -machine smm=off,type=pc+pve0 
+DIAG qemu 61965 Rss: 651 MB  Pss_Anon: 640 MB  Pss_File: 3 MB  AnonHugePages: 622 MB  Swap: 0 MB  
+DIAG qemu 61965 cmdline -cpu kvm64,enforce,+kvm_pv_eoi,+kvm_pv_unhalt,+lahf_lm,+sep -m 1024 -device pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e -device pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f -device pci-bridge,id=pci.3,chassis_nr=3,bus=pci.0,addr=0x5 -device vmgenid,guid=7c64682e-6947-4721-8df8-b5a7e2d0ccd1 -device piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2 -device isa-serial,chardev=serial0 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3,free-page-reporting=on -device ide-cd,bus=ide.1,unit=0,drive=drive-ide2,id=ide2 -device virtio-scsi-pci,id=virtioscsi0,bus=pci.3,addr=0x1,iothread=iothread-virtioscsi0 -device scsi-hd,bus=virtioscsi0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0,id=scsi0,device_id=drive-scsi0,bootindex=100,write-cache=on -netdev type=tap,id=net0,ifname=tap123i0,script=/usr/libexec/qemu-server/pve-bridge,downscript=/usr/libexec/qemu-server/pve-bridgedown,vhost=on -device virtio-net-pci,mac=BC:24:11:FC:01:91,netdev=net0,bus=pci.0,addr=0x12,id=net0,rx_queue_size=1024,tx_queue_size=256,host_mtu=1500,host_tunnel=off -machine smm=off,type=pc+pve0 
+== vmdensity
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+generating cloud-init ISO
+RESULT vm_density_1g_guests 16 (max 16)
+RESULT vm_density_host_used_mb 7316 MB
+RESULT vm_density_ksm_saved_mb 0 MB
+== vmdisk
+generating cloud-init ISO
+RESULT vm_fio_randread_4k_iops 57242 iops
+DIAG fio randread runs: 58191 57242 56485
+RESULT vm_fio_randwrite_4k_iops 21122 iops
+DIAG fio randwrite runs: 21739 21122 19802
+RESULT vm_fio_seqread_1m_mbs 2030 MB/s
+DIAG fio read runs: 3621474 2079688 1506538
+RESULT vm_fio_seqwrite_1m_mbs 98 MB/s
+DIAG fio write runs: 139183 74347 100790
+== vmnet
+generating cloud-init ISO
+generating cloud-init ISO
+RESULT vm_to_vm_gbit 13.55 Gbit/s
+RESULT vm_to_vm_ping_ms 0.349 ms
+DIAG guest nproc 1
+RESULT host_to_vm_gbit 23.80 Gbit/s
+== backup
+generating cloud-init ISO
+RESULT backup_vm_s 11.29 s
+RESULT backup_vm_size_mb 1377 MB
+RESULT restore_vm_s 5.65 s
+RESULT backup_vm_again_s 11.12 s
+== pbs
+generating cloud-init ISO
+RESULT pbs_backup_vm_s 9.37 s
+RESULT pbs_store_mb 3418 MB
+RESULT pbs_backup_vm_again_s 5.49 s
+RESULT pbs_restore_vm_s 6.26 s

@@ -2,8 +2,9 @@
 t() { date +%s.%N; }
 since() { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}'; }
 out() { echo "RESULT $1 $2 ${3:-}"; }
-# memory in use, not counting page cache and reclaimable slab (like free's "used")
-memused() { awk '/^MemTotal/{t=$2}/^MemFree/{f=$2}/^Buffers/{b=$2}/^Cached/{c=$2}/^SReclaimable/{r=$2}END{printf "%d", (t-f-b-c-r)/1024}' /proc/meminfo; }
+# memory in use, not counting page cache and reclaimable slab; shared memory (tmpfs, memfd:
+# some platforms back guest RAM with it) counts as used, though the kernel files it under Cached
+memused() { awk '/^MemTotal/{t=$2}/^MemFree/{f=$2}/^Buffers/{b=$2}/^Cached/{c=$2}/^SReclaimable/{r=$2}/^Shmem:/{sh=$2}END{printf "%d", (t-f-b-c-r+sh)/1024}' /proc/meminfo; }
 # the same after dropping clean caches (steadier for before/after deltas)
 memsettled() { sync; echo 3 > /proc/sys/vm/drop_caches; sleep 3; memused; }
 # wait until a command succeeds (max $1 s); returns 1 on timeout

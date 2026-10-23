@@ -1,0 +1,78 @@
+== footprint
+RESULT disk_used_mb 2157 MB
+RESULT packages 310 
+RESULT mem_used_idle_mb 171 MB
+RESULT cpu_busy_idle_pct 0.04 %
+RESULT tcp_ports_external 4 
+RESULT root_processes 17 
+RESULT processes 21 
+== security
+RESULT lynis_hardening_index 66 /100
+RESULT tcp_ports_list 22,8006,8007, 
+RESULT suid_files 13 
+RESULT kernel_lockdown none/integrity/confidentiality 
+== api
+RESULT api_list_vms_ms 10.0 ms
+RESULT api_list_vms_max_ms 20.0 ms
+== containers
+RESULT container_create_to_http_s 0.18 s
+== density
+RESULT density_30_containers_s 6.02 s
+RESULT density_mem_per_container_mb 3 MB
+RESULT ctr_mem_cgroup_plus_supervisor_mb 5.3 MB
+RESULT density_remove_all_s 2.97 s
+== ctrnet
+RESULT ctr_to_ctr_gbit 67.78 Gbit/s
+RESULT host_to_ctr_gbit 65.73 Gbit/s
+== ctrbackup
+RESULT ctr_backup_s 0.88 s
+RESULT ctr_backup_size_mb 500 MB
+RESULT ctr_backup_again_s 0.87 s
+RESULT ctr_restore_to_http_s 0.88 s
+== pressure
+RESULT pressure_default_web_failures 0 /300
+RESULT pressure_default_web_max_latency_ms 6 ms
+RESULT pressure_default_killed stress:1  
+RESULT pressure_16g_web_failures 0 /300
+RESULT pressure_16g_web_max_latency_ms 12 ms
+RESULT pressure_16g_killed stress:1  
+== dockerlxc
+== vms
+RESULT vm_linked_clone_s 0.44 s
+RESULT vm_full_clone_8g_s 2.85 s
+RESULT vm_start_to_ssh_s 13.87 s
+RESULT vm_mem_per_fresh_1g_guest_mb 687 MB
+RESULT vm_mem_per_idle_1g_guest_mb 361 MB
+DIAG kernel 7.2.9+deb13-amd64
+DIAG thp [always] madvise never defrag always defer defer+madvise [madvise] never
+DIAG ksm run=1 pages_sharing=237980
+DIAG qemu 40917 Rss: 674 MB  Pss_Anon: 353 MB  Pss_File: 3 MB  AnonHugePages: 78 MB  Swap: 0 MB  
+DIAG qemu 40917 cmdline -machine q35,accel=kvm,vmport=off,hpet=off -cpu host -m 1024M -device virtio-blk-pci,drive=drive-disk0,id=disk0,iothread=io-disk0,serial=og51391621767b,bootindex=1 -device ide-cd,bus=ide.0,drive=drive-cidata,id=cidata -netdev tap,id=nd-net0,ifname=ogtvm686b4710,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=nd-net0,id=net0,mac=52:54:00:c2:cb:15,rx_queue_size=1024 -vga none -device VGA -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 -device virtio-balloon-pci,id=balloon0,free-page-reporting=on -device virtio-rng-pci -device virtio-serial-pci,id=vserial0 -device virtserialport,bus=vserial0.0,chardev=qga0,name=org.qemu.guest_agent.0 
+DIAG qemu 40983 Rss: 666 MB  Pss_Anon: 348 MB  Pss_File: 3 MB  AnonHugePages: 74 MB  Swap: 0 MB  
+DIAG qemu 40983 cmdline -machine q35,accel=kvm,vmport=off,hpet=off -cpu host -m 1024M -device virtio-blk-pci,drive=drive-disk0,id=disk0,iothread=io-disk0,serial=oge643b775157f,bootindex=1 -device ide-cd,bus=ide.0,drive=drive-cidata,id=cidata -netdev tap,id=nd-net0,ifname=ogtvm686b4a10,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=nd-net0,id=net0,mac=52:54:00:81:d8:ed,rx_queue_size=1024 -vga none -device VGA -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 -device virtio-balloon-pci,id=balloon0,free-page-reporting=on -device virtio-rng-pci -device virtio-serial-pci,id=vserial0 -device virtserialport,bus=vserial0.0,chardev=qga0,name=org.qemu.guest_agent.0 
+DIAG qemu 41049 Rss: 662 MB  Pss_Anon: 342 MB  Pss_File: 3 MB  AnonHugePages: 78 MB  Swap: 0 MB  
+DIAG qemu 41049 cmdline -machine q35,accel=kvm,vmport=off,hpet=off -cpu host -m 1024M -device virtio-blk-pci,drive=drive-disk0,id=disk0,iothread=io-disk0,serial=og323f3df5f62c,bootindex=1 -device ide-cd,bus=ide.0,drive=drive-cidata,id=cidata -netdev tap,id=nd-net0,ifname=ogtvm686b4910,script=no,downscript=no,vhost=on -device virtio-net-pci,netdev=nd-net0,id=net0,mac=52:54:00:34:4d:0b,rx_queue_size=1024 -vga none -device VGA -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 -device virtio-balloon-pci,id=balloon0,free-page-reporting=on -device virtio-rng-pci -device virtio-serial-pci,id=vserial0 -device virtserialport,bus=vserial0.0,chardev=qga0,name=org.qemu.guest_agent.0 
+== vmdensity
+RESULT vm_density_1g_guests 16 (max 16)
+RESULT vm_density_host_used_mb 3899 MB
+RESULT vm_density_ksm_saved_mb 3551 MB
+== vmdisk
+RESULT vm_fio_randread_4k_iops 141485 iops
+DIAG fio randread runs: 145622 141485 139306
+RESULT vm_fio_randwrite_4k_iops 48109 iops
+DIAG fio randwrite runs: 67072 48109 30077
+RESULT vm_fio_seqread_1m_mbs 1526 MB/s
+DIAG fio read runs: 2714728 1563513 1527451
+RESULT vm_fio_seqwrite_1m_mbs 92 MB/s
+DIAG fio write runs: 100667 94722 88996
+== vmnet
+RESULT vm_to_vm_gbit 12.62 Gbit/s
+RESULT vm_to_vm_ping_ms 0.311 ms
+DIAG guest nproc 1
+RESULT host_to_vm_gbit 29.40 Gbit/s
+== backup
+RESULT backup_vm_s 4.30 s
+RESULT backup_vm_size_mb 1322 MB
+RESULT restore_vm_s 11.08 s
+RESULT backup_vm_again_s 3.11 s
+== pbs

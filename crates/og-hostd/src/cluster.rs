@@ -220,7 +220,9 @@ impl Cluster {
     fn build_client(&self) -> Result<()> {
         let ca = reqwest::Certificate::from_pem(self.read("ca.pem")?.as_bytes())?;
         let ident = reqwest::Identity::from_pem(format!("{}\n{}", self.read("node.pem")?, self.read("node.key")?).as_bytes())?;
-        let c = reqwest::Client::builder().use_rustls_tls().tls_built_in_root_certs(false).add_root_certificate(ca).identity(ident).connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(600)).build()?;
+        let c = reqwest::Client::builder().use_rustls_tls().tls_built_in_root_certs(false).add_root_certificate(ca).identity(ident).connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(600))
+            // an idle pooled connection the peer has dropped fails with 'connection reset' on reuse
+            .pool_idle_timeout(Duration::from_secs(10)).tcp_keepalive(Duration::from_secs(15)).build()?;
         *self.client.write().unwrap() = Some(c);
         Ok(())
     }

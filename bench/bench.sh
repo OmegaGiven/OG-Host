@@ -4,35 +4,96 @@
 # the nginx:alpine image pulled. Sections: footprint containers density vms vmdisk vmnet backup
 set -u
 . "$(dirname "$0")/lib.sh"
-if command -v pveversion >/dev/null; then P=pve; NODE=$(hostname); else P=og; fi
+if command -v pveversion >/dev/null; then P=pve; NODE=$(hostname)
+elif command -v og-hostd >/dev/null; then P=og
+elif command -v incus >/dev/null; then P=incus
+else P=deb; fi
+# self-built Debian: libvirt (default NAT network) + qcow2 files; Incus: btrfs pool, its cloud image
+LV=/var/lib/libvirt/images
+CI_USER="#cloud-config
+users:
+  - name: bench
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys: [\"$(cat /root/key.pub 2>/dev/null)\"]"
 GSSH="ssh -q -i /root/key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=3"
 RUNS=${RUNS:-3}
 
 # ---- platform primitives ----
 pve_wait() { local u; u=$(grep -o 'UPID:[^ ]*' | tail -1); while pvesh get "/nodes/$NODE/tasks/$u/status" --output-format json | grep -q '"status":"running"'; do sleep 0.2; done; }
-ctr_create_start() { # N -> prints IP when serving HTTP
-  if [ $P = pve ]; then
-    pct create $((300+$1)) local:vztmpl/nginx_alpine.tar --hostname c$1 --rootfs local-lvm:1 --memory 256 --swap 0 \
+ctr_ip_wait() { # incus/docker name -> IP once it has one
+  local ip i
+  for i in $(seq 600); do
+    if [ $P = incus ]; then ip=$(incus list "$1" -c 4 -f csv | grep -o '^[0-9.]*'); else ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1" 2>/dev/null); fi
+    [ -n "$ip" ] && { echo "$ip"; return; }
+    sleep 0.05
+  done
+}
+ctr_create_start() { # N -> prints IP (then the caller waits for HTTP)
+  case $P in
+  pve) pct create $((300+$1)) local:vztmpl/nginx_alpine.tar --hostname c$1 --rootfs local-lvm:1 --memory 256 --swap 0 \
       --net0 name=eth0,bridge=vmbr0,ip=10.0.2.$((100+$1))/24,gw=10.0.2.2 --unprivileged 1 >/dev/null 2>&1
-    pct start $((300+$1)); echo 10.0.2.$((100+$1))
-  else
-    og-hostd run --name c$1 --memory 256m nginx:alpine | sed -n 's/.* ip \([0-9.]*\).*/\1/p'
-  fi
+    pct start $((300+$1)); echo 10.0.2.$((100+$1)) ;;
+  og) og-hostd run --name c$1 --memory 256m nginx:alpine | sed -n 's/.* ip \([0-9.]*\).*/\1/p' ;;
+  incus) incus launch docker:nginx:alpine c$1 -c limits.memory=256MiB -q >/dev/null; ctr_ip_wait c$1 ;;
+  deb) docker run -d -q --name c$1 -m 256m nginx:alpine >/dev/null; ctr_ip_wait c$1 ;;
+  esac
 }
-ctr_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd rm -f c$1 >/dev/null 2>&1; fi; }
+ctr_rm() {
+  case $P in
+  pve) pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1 ;;
+  og) og-hostd rm -f c$1 >/dev/null 2>&1 ;;
+  incus) incus delete -f c$1 >/dev/null 2>&1 ;;
+  deb) docker rm -f c$1 >/dev/null 2>&1 ;;
+  esac
+}
+deb_seed() { # N: a NoCloud seed ISO for VM vN
+  local d; d=$(mktemp -d)
+  printf '%s\n' "$CI_USER" > $d/user-data; printf 'instance-id: v%s-%s\nlocal-hostname: v%s\n' $1 $RANDOM $1 > $d/meta-data
+  genisoimage -quiet -output $LV/v$1-seed.iso -volid cidata -joliet -rock $d/user-data $d/meta-data; rm -rf $d
+}
 vm_clone() { # N linked(1/0)
-  if [ $P = pve ]; then
-    local full=1; [ "$2" = 1 ] && full=0
+  case $P in
+  pve) local full=1; [ "$2" = 1 ] && full=0
     qm clone 9000 $((100+$1)) --name v$1 --full $full >/dev/null 2>&1
-    qm set $((100+$1)) --ipconfig0 ip=10.0.2.$((50+$1))/24,gw=10.0.2.2 --nameserver 10.0.2.3 >/dev/null
-  else
-    local tk; tk=$(ogapi POST /v1/vms/tpl/clone "{\"name\":\"v$1\",\"linked\":$([ "$2" = 1 ] && echo true || echo false)}" | sed -n 's/.*"task":"\([^"]*\)".*/\1/p')
-    ogtask "$tk" >/dev/null
-  fi
+    qm set $((100+$1)) --ipconfig0 ip=10.0.2.$((50+$1))/24,gw=10.0.2.2 --nameserver 10.0.2.3 >/dev/null ;;
+  og) local tk; tk=$(ogapi POST /v1/vms/tpl/clone "{\"name\":\"v$1\",\"linked\":$([ "$2" = 1 ] && echo true || echo false)}" | sed -n 's/.*"task":"\([^"]*\)".*/\1/p')
+    ogtask "$tk" >/dev/null ;;
+  incus) # from the image: a btrfs snapshot (linked); "full": a copy of a stopped VM (also copy-on-write on btrfs)
+    if [ "$2" = 1 ]; then incus init tplssh v$1 --vm -c limits.cpu=1 -c limits.memory=1GiB -d root,size=8GiB -c cloud-init.user-data="$CI_USER" -q >/dev/null
+    else incus copy vbase v$1 -q; incus config set v$1 cloud-init.user-data="$CI_USER"; fi ;;
+  deb) if [ "$2" = 1 ]; then qemu-img create -q -f qcow2 -F qcow2 -b $LV/tpl.qcow2 $LV/v$1.qcow2; else qemu-img convert -O qcow2 $LV/tpl.qcow2 $LV/v$1.qcow2; fi
+    deb_seed $1
+    virt-install --name v$1 --memory 1024 --vcpus 1 --import --disk $LV/v$1.qcow2,bus=virtio --disk $LV/v$1-seed.iso,device=cdrom \
+      --network network=default,model=virtio --cpu host-passthrough --boot uefi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no --osinfo debian12 --graphics none --noautoconsole --print-xml > /tmp/v$1.xml 2>/dev/null
+    virsh define /tmp/v$1.xml >/dev/null ;;
+  esac
 }
-vm_start() { if [ $P = pve ]; then qm start $((100+$1)); else ogapi POST /v1/vms/v$1/start >/dev/null; fi; }
-vm_ip() { if [ $P = pve ]; then echo 10.0.2.$((50+$1)); else ogapi GET /v1/vms/v$1 | grep -o '"ip":"[0-9.]*"' | head -1 | cut -d'"' -f4; fi; }
-vm_rm() { if [ $P = pve ]; then qm stop $((100+$1)) >/dev/null 2>&1; qm destroy $((100+$1)) --purge >/dev/null 2>&1; else ogapi POST /v1/vms/v$1/stop >/dev/null; sleep 1; ogapi DELETE /v1/vms/v$1 >/dev/null; fi; }
+vm_start() { case $P in pve) qm start $((100+$1)) ;; og) ogapi POST /v1/vms/v$1/start >/dev/null ;; incus) incus start v$1 ;; deb) virsh start v$1 >/dev/null ;; esac; }
+vm_ip() {
+  case $P in
+  pve) echo 10.0.2.$((50+$1)) ;;
+  og) ogapi GET /v1/vms/v$1 | grep -o '"ip":"[0-9.]*"' | head -1 | cut -d'"' -f4 ;;
+  incus) incus list v$1 -c 4 -f csv | grep -o '^[0-9.]*' | head -1 ;;
+  deb) virsh domifaddr v$1 --source lease 2>/dev/null | awk '/ipv4/{print $4}' | cut -d/ -f1 | head -1 ;;
+  esac
+}
+vm_rm() {
+  case $P in
+  pve) qm stop $((100+$1)) >/dev/null 2>&1; qm destroy $((100+$1)) --purge >/dev/null 2>&1 ;;
+  og) ogapi POST /v1/vms/v$1/stop >/dev/null; sleep 1; ogapi DELETE /v1/vms/v$1 >/dev/null ;;
+  incus) incus delete -f v$1 >/dev/null 2>&1 ;;
+  deb) virsh destroy v$1 >/dev/null 2>&1; virsh undefine v$1 --nvram >/dev/null 2>&1 || virsh undefine v$1 >/dev/null 2>&1; rm -f $LV/v$1.qcow2 $LV/v$1-seed.iso ;;
+  esac
+}
+vm_shutdown() { # N: clean shutdown, wait until off
+  case $P in
+  pve) qm shutdown $((100+$1)) --timeout 60 >/dev/null 2>&1 ;;
+  og) ogapi POST /v1/vms/v$1/shutdown >/dev/null; waitfor 60 sh -c "ogapi GET /v1/vms/v$1 | grep -q '\"state\":\"stopped\"'" ;;
+  incus) incus stop v$1 --timeout 60 >/dev/null 2>&1 ;;
+  deb) virsh shutdown v$1 >/dev/null; waitfor 60 sh -c "virsh domstate v$1 | grep -q 'shut off'" ;;
+  esac
+}
 vm_ready() { local ip; ip=$(vm_ip $1); [ -n "$ip" ] && $GSSH bench@"$ip" true; }
 
 cleanup() { # leftovers of an interrupted run
@@ -44,7 +105,18 @@ cleanup() { # leftovers of an interrupted run
     for c in $(og-hostd ps | awk 'NR>1 && $2 ~ /^(c[0-9]+|i[0-9]+|hog|cb-web-1)$/ {print $2}'); do og-hostd stop $c >/dev/null 2>&1; og-hostd rm $c >/dev/null 2>&1; done
     rm -rf /var/lib/og-host/bench-store # an earlier run's backups (they'd count as disk used, and dedup the next backup)
   fi
+  if [ $P = incus ]; then
+    for i in $(incus list -c n -f csv | grep -E '^(v[0-9]+|c[0-9]+|i[0-9]+|hog)$'); do incus delete -f $i >/dev/null 2>&1; done
+    rm -f /root/bk-*
+  fi
+  if [ $P = deb ]; then
+    for v in $(virsh list --all --name | grep -E '^v[0-9]+$'); do virsh destroy $v >/dev/null 2>&1; virsh undefine $v --nvram >/dev/null 2>&1 || virsh undefine $v >/dev/null 2>&1; done
+    rm -f $LV/v[0-9]*.qcow2 $LV/v[0-9]*-seed.iso
+    docker rm -f $(docker ps -aq) >/dev/null 2>&1; docker volume rm cb_data >/dev/null 2>&1; rm -rf /root/bk-*
+  fi
 }
+# Incus: a stopped VM to copy ("full clone")
+if [ $P = incus ] && ! incus info vbase >/dev/null 2>&1; then incus init tplssh vbase --vm -c limits.cpu=1 -c limits.memory=1GiB -d root,size=8GiB -q; fi
 
 # what the host does for its VMs, for comparing the two (DIAG lines; not results)
 diag_host() {
@@ -83,11 +155,12 @@ s_density() { # 30 nginx containers: time, and memory per container
   sync; echo 3 > /proc/sys/vm/drop_caches; sleep 2
   local tot=0 c sup
   for i in $(seq $n); do
-    if [ $P = pve ]; then
-      c=$(cat /sys/fs/cgroup/lxc/$((310+i))/memory.current); sup=$(pgrep -f "^/usr/bin/lxc-start -F -n $((310+i))\$")
-    else
-      c=$(cat /sys/fs/cgroup/og-host/c$((10+i))/memory.current); sup=$(pgrep -f "og-shim run --id $(og-hostd ps | awk -v n=c$((10+i)) '$2==n{print $1}')")
-    fi
+    case $P in
+    pve) c=$(cat /sys/fs/cgroup/lxc/$((310+i))/memory.current); sup=$(pgrep -f "^/usr/bin/lxc-start -F -n $((310+i))\$") ;;
+    og) c=$(cat /sys/fs/cgroup/og-host/c$((10+i))/memory.current); sup=$(pgrep -f "og-shim run --id $(og-hostd ps | awk -v n=c$((10+i)) '$2==n{print $1}')") ;;
+    incus) c=$(cat /sys/fs/cgroup/lxc.payload.c$((10+i))/memory.current 2>/dev/null || echo 0); sup=$(pgrep -f "^\[lxc monitor\] /var/lib/incus/containers c$((10+i))\$") ;;
+    deb) local id; id=$(docker inspect -f '{{.Id}}' c$((10+i))); c=$(cat /sys/fs/cgroup/system.slice/docker-$id.scope/memory.current 2>/dev/null || echo 0); sup=$(pgrep -f "containerd-shim.*-id $id") ;;
+    esac
     tot=$(( tot + c + $(awk '/^Pss:/{print $2*1024}' /proc/$sup/smaps_rollup 2>/dev/null || echo 0) ))
   done
   out ctr_mem_cgroup_plus_supervisor_mb "$(awk -v x=$tot -v n=$n 'BEGIN{printf "%.1f", x/n/1048576}')" MB
@@ -171,9 +244,28 @@ s_vmnet() {
 s_backup() { # back up a stopped VM with 1 GB of random data written into it, then restore it
   vm_clone 51 0; vm_start 51; waitfor 180 vm_ready 51
   $GSSH bench@"$(vm_ip 51)" 'sudo dd if=/dev/urandom of=/var/tmp/blob bs=1M count=1024 status=none; sync'
-  vm_rm_keep() { if [ $P = pve ]; then qm shutdown 151 --timeout 60 >/dev/null 2>&1; else ogapi POST /v1/vms/v51/shutdown >/dev/null; waitfor 60 sh -c "ogapi GET /v1/vms/v51 | grep -q '\"state\":\"stopped\"'"; fi; }
-  vm_rm_keep; sleep 2
+  vm_shutdown 51; sleep 2
   local s; s=$(t)
+  if [ $P = incus ]; then
+    # incus export (its default compression), import back
+    incus export v51 /root/bk-v51.tar.gz -q; out backup_vm_s "$(since $s)" s
+    out backup_vm_size_mb "$(( $(stat -c %s /root/bk-v51.tar.gz) / 1048576 ))" MB
+    incus delete -f v51; s=$(t); incus import /root/bk-v51.tar.gz -q; out restore_vm_s "$(since $s)" s
+    rm -f /root/bk-v51.tar.gz; s=$(t); incus export v51 /root/bk-v51.tar.gz -q; out backup_vm_again_s "$(since $s)" s
+    incus delete -f v51; rm -f /root/bk-v51.tar.gz
+    return
+  fi
+  if [ $P = deb ]; then
+    # what people script by hand: the disk image compressed with zstd, plus the libvirt XML
+    mkdir -p /root/bk-v51; virsh dumpxml v51 > /root/bk-v51/v51.xml
+    zstd -q -T0 $LV/v51.qcow2 -o /root/bk-v51/v51.qcow2.zst; out backup_vm_s "$(since $s)" s
+    out backup_vm_size_mb "$(( $(du -sb /root/bk-v51 | cut -f1) / 1048576 ))" MB
+    virsh undefine v51 --nvram >/dev/null 2>&1 || virsh undefine v51 >/dev/null; rm -f $LV/v51.qcow2
+    s=$(t); zstd -q -d -T0 /root/bk-v51/v51.qcow2.zst -o $LV/v51.qcow2; virsh define /root/bk-v51/v51.xml >/dev/null; out restore_vm_s "$(since $s)" s
+    rm -f /root/bk-v51/v51.qcow2.zst; s=$(t); zstd -q -T0 $LV/v51.qcow2 -o /root/bk-v51/v51.qcow2.zst; out backup_vm_again_s "$(since $s)" s
+    vm_rm 51; rm -rf /root/bk-v51
+    return
+  fi
   if [ $P = pve ]; then
     vzdump 151 --storage local --mode stop --compress zstd >/tmp/vzdump.log 2>&1
     out backup_vm_s "$(since $s)" s
@@ -207,9 +299,13 @@ s_security() {
   out kernel_lockdown "$(cat /sys/kernel/security/lockdown 2>/dev/null | tr -d '[]' | tr ' ' '/' )"
 }
 
-api_get() { # one "list the VMs" call over HTTPS with an API token
-  if [ $P = pve ]; then curl -sk -o /dev/null -H "Authorization: PVEAPIToken=$PVETOKEN" "https://127.0.0.1:8006/api2/json/nodes/$NODE/qemu"
-  else curl -sk -o /dev/null -H "Authorization: Bearer $(cat /var/lib/og-host/api-token)" https://127.0.0.1:8006/v1/vms; fi
+api_get() { # one "list the VMs" call over HTTPS with an API token (Incus: its local socket; Debian: virsh)
+  case $P in
+  pve) curl -sk -o /dev/null -H "Authorization: PVEAPIToken=$PVETOKEN" "https://127.0.0.1:8006/api2/json/nodes/$NODE/qemu" ;;
+  og) curl -sk -o /dev/null -H "Authorization: Bearer $(cat /var/lib/og-host/api-token)" https://127.0.0.1:8006/v1/vms ;;
+  incus) curl -s -o /dev/null --unix-socket /var/lib/incus/unix.socket "http://x/1.0/instances?recursion=1" ;;
+  deb) virsh list --all >/dev/null ;;
+  esac
 }
 s_api() {
   if [ $P = pve ]; then
@@ -229,13 +325,19 @@ iperf_ctr() {
       --net0 name=eth0,bridge=vmbr0,ip=10.0.2.$((100+$1))/24,gw=10.0.2.2 --unprivileged 1 >/dev/null 2>&1
     pct set $((300+$1)) --entrypoint 'iperf3 -s' >/dev/null 2>&1
     pct start $((300+$1)); echo 10.0.2.$((100+$1))
+  elif [ $P = incus ]; then
+    incus init docker:networkstatic/iperf3 i$1 -q >/dev/null; incus config set i$1 oci.entrypoint="iperf3 -s"; incus start i$1; ctr_ip_wait i$1
+  elif [ $P = deb ]; then
+    docker run -d -q --name i$1 networkstatic/iperf3 -s >/dev/null; ctr_ip_wait i$1
   else
     og-hostd run --name i$1 networkstatic/iperf3 -- -s | sed -n 's/.* ip \([0-9.]*\).*/\1/p'
   fi
 }
-iperf_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd stop i$1 >/dev/null 2>&1; og-hostd rm i$1 >/dev/null 2>&1; fi; }
+iperf_rm() { case $P in pve) pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1 ;; og) og-hostd rm -f i$1 >/dev/null 2>&1 ;; incus) incus delete -f i$1 >/dev/null 2>&1 ;; deb) docker rm -f i$1 >/dev/null 2>&1 ;; esac; }
 ctr_iperf_client() { # N SERVER-IP: iperf3 from inside container N, Gbit/s
   if [ $P = pve ]; then pct exec $((300+$1)) -- iperf3 -c "$2" -t 8 -P 2 -J
+  elif [ $P = incus ]; then incus exec i$1 -- iperf3 -c "$2" -t 8 -P 2 -J
+  elif [ $P = deb ]; then docker exec i$1 iperf3 -c "$2" -t 8 -P 2 -J
   else
     local id; id=$(og-hostd ps | awk -v n=i$1 '$2==n{print $1}')
     local e; e=$(curl -s --unix-socket /run/og-host/docker.sock -H content-type:application/json -d "{\"AttachStdout\":true,\"Cmd\":[\"sh\",\"-c\",\"iperf3 -c $2 -t 8 -P 2 -J > /tmp/r.json\"]}" http://x/containers/$id/exec | sed -n 's/.*"Id":"\([^"]*\)".*/\1/p')
@@ -255,6 +357,30 @@ s_ctrnet() {
 
 s_ctrbackup() { # a running web container with 500 MB of data: back up, remove, restore, serving again
   local ip s tk snap
+  if [ $P = incus ]; then
+    ip=$(ctr_create_start 71); waitfor 60 http_up "$ip"
+    incus exec c71 -- sh -c 'head -c 524288000 /dev/urandom > /data.bin; sync'
+    s=$(t); incus export c71 /root/bk-c71.tar.gz -q; out ctr_backup_s "$(since $s)" s
+    out ctr_backup_size_mb "$(( $(stat -c %s /root/bk-c71.tar.gz) / 1048576 ))" MB
+    rm -f /root/bk-c71b.tar.gz; s=$(t); incus export c71 /root/bk-c71b.tar.gz -q; out ctr_backup_again_s "$(since $s)" s
+    ctr_rm 71; s=$(t); incus import /root/bk-c71.tar.gz -q; incus start c71; ip=$(ctr_ip_wait c71); waitfor 60 http_up "$ip" || echo "WARN restored ct not serving"; out ctr_restore_to_http_s "$(since $s)" s
+    incus exec c71 -- test -s /data.bin || echo "WARN restored data missing"
+    ctr_rm 71; rm -f /root/bk-c71*.tar.gz
+    return
+  fi
+  if [ $P = deb ]; then
+    # Docker: a named volume, backed up the usual way (a throwaway container tars it)
+    docker volume create cb_data >/dev/null; docker run -d -q --name c71 -v cb_data:/data nginx:alpine >/dev/null; ip=$(ctr_ip_wait c71); waitfor 60 http_up "$ip"
+    head -c 500M /dev/urandom > /var/lib/docker/volumes/cb_data/_data/data.bin; sync; mkdir -p /root/bk-c71
+    s=$(t); docker run --rm -v cb_data:/d -v /root/bk-c71:/b alpine tar czf /b/data.tgz -C /d .; out ctr_backup_s "$(since $s)" s
+    out ctr_backup_size_mb "$(( $(du -sb /root/bk-c71 | cut -f1) / 1048576 ))" MB
+    s=$(t); docker run --rm -v cb_data:/d -v /root/bk-c71:/b alpine tar czf /b/data2.tgz -C /d .; out ctr_backup_again_s "$(since $s)" s
+    docker rm -f c71 >/dev/null; docker volume rm cb_data >/dev/null
+    s=$(t); docker volume create cb_data >/dev/null; docker run --rm -v cb_data:/d -v /root/bk-c71:/b alpine tar xzf /b/data.tgz -C /d
+    docker run -d -q --name c71 -v cb_data:/data nginx:alpine >/dev/null; ip=$(ctr_ip_wait c71); waitfor 60 http_up "$ip" || echo "WARN restored ct not serving"; out ctr_restore_to_http_s "$(since $s)" s
+    docker rm -f c71 >/dev/null; docker volume rm cb_data >/dev/null; rm -rf /root/bk-c71
+    return
+  fi
   if [ $P = pve ]; then
     ip=$(ctr_create_start 71); waitfor 60 http_up "$ip"
     pct exec 371 -- sh -c 'head -c 524288000 /dev/urandom > /data.bin; sync'
@@ -289,12 +415,18 @@ hog_start() {
     pct create $((300+$1)) local:vztmpl/stress_latest.tar --hostname hog --rootfs local-lvm:1 $mem --net0 name=eth0,bridge=vmbr0,ip=10.0.2.$((100+$1))/24 --unprivileged 1 >/dev/null 2>&1
     pct set $((300+$1)) --entrypoint 'stress --vm 4 --vm-bytes 2500M --vm-keep' >/dev/null 2>&1
     pct start $((300+$1))
+  elif [ $P = incus ]; then
+    incus init docker:polinux/stress hog -q >/dev/null; [ "$2" != 0 ] && incus config set hog limits.memory=${2}MiB
+    incus config set hog oci.entrypoint="stress --vm 4 --vm-bytes 2500M --vm-keep"; incus start hog
+  elif [ $P = deb ]; then
+    local mem=""; [ "$2" != 0 ] && mem="-m ${2}m"
+    docker run -d -q --name hog $mem polinux/stress stress --vm 4 --vm-bytes 2500M --vm-keep >/dev/null
   else
     local mem=""; [ "$2" != 0 ] && mem="--memory ${2}m"
     og-hostd run --name hog $mem --entrypoint stress polinux/stress -- --vm 4 --vm-bytes 2500M --vm-keep >/dev/null
   fi
 }
-hog_rm() { if [ $P = pve ]; then pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1; else og-hostd stop hog >/dev/null 2>&1; og-hostd rm hog >/dev/null 2>&1; fi; }
+hog_rm() { case $P in pve) pct stop $((300+$1)) >/dev/null 2>&1; pct destroy $((300+$1)) --purge >/dev/null 2>&1 ;; og) og-hostd rm -f hog >/dev/null 2>&1 ;; incus) incus delete -f hog >/dev/null 2>&1 ;; deb) docker rm -f hog >/dev/null 2>&1 ;; esac; }
 s_pressure() { # a protected web service while another container eats memory: defaults, then a 16 GB limit
   local ip; ip=$(ctr_create_start 81); waitfor 60 http_up "$ip"
   for lim in 0 16384; do

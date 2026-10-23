@@ -1,0 +1,76 @@
+/root/bench/bench.sh: line 104: ogapi: command not found
+/root/bench/bench.sh: line 105: og-hostd: command not found
+== footprint
+RESULT disk_used_mb 8170 MB
+RESULT packages 607 
+RESULT mem_used_idle_mb 242 MB
+RESULT cpu_busy_idle_pct 0.02 %
+RESULT tcp_ports_external 6 
+RESULT root_processes 20 
+RESULT processes 25 
+== security
+RESULT lynis_hardening_index 64 /100
+RESULT tcp_ports_list 22,53,5355, 
+RESULT suid_files 13 
+RESULT kernel_lockdown none/integrity/confidentiality 
+== api
+RESULT api_list_vms_ms 10.0 ms
+RESULT api_list_vms_max_ms 10.0 ms
+== containers
+RESULT container_create_to_http_s 3.06 s
+== density
+RESULT density_30_containers_s 94.66 s
+RESULT density_mem_per_container_mb 38 MB
+RESULT ctr_mem_cgroup_plus_supervisor_mb 17.0 MB
+RESULT density_remove_all_s 26.04 s
+== ctrnet
+RESULT ctr_to_ctr_gbit 72.80 Gbit/s
+RESULT host_to_ctr_gbit 62.05 Gbit/s
+== ctrbackup
+RESULT ctr_backup_s 20.48 s
+RESULT ctr_backup_size_mb 524 MB
+RESULT ctr_backup_again_s 21.12 s
+RESULT ctr_restore_to_http_s 6.93 s
+== pressure
+RESULT pressure_default_web_failures 0 /300
+RESULT pressure_default_web_max_latency_ms 6 ms
+RESULT pressure_default_killed stress:1  
+RESULT pressure_16g_web_failures 0 /300
+RESULT pressure_16g_web_max_latency_ms 5 ms
+RESULT pressure_16g_killed stress:1  
+== dockerlxc
+== vms
+RESULT vm_linked_clone_s 10.63 s
+RESULT vm_full_clone_8g_s 0.38 s
+RESULT vm_start_to_ssh_s 42.60 s
+RESULT vm_mem_per_fresh_1g_guest_mb 576 MB
+RESULT vm_mem_per_idle_1g_guest_mb 643 MB
+DIAG kernel 6.12.113+deb13-amd64
+DIAG thp [always] madvise never defrag always defer defer+madvise [madvise] never
+DIAG ksm run=0 pages_sharing=0
+== vmdensity
+RESULT vm_density_1g_guests 16 (max 16)
+RESULT vm_density_host_used_mb 7340 MB
+RESULT vm_density_ksm_saved_mb 0 MB
+== vmdisk
+RESULT vm_fio_randread_4k_iops 38970 iops
+DIAG fio randread runs: 38970 38886 39206
+RESULT vm_fio_randwrite_4k_iops 23641 iops
+DIAG fio randwrite runs: 23903 19739 23641
+RESULT vm_fio_seqread_1m_mbs 14693 MB/s
+DIAG fio read runs: 14152405 15045903 16235783
+RESULT vm_fio_seqwrite_1m_mbs 401 MB/s
+DIAG fio write runs: 623427 411115 253968
+== vmnet
+RESULT vm_to_vm_gbit 11.95 Gbit/s
+RESULT vm_to_vm_ping_ms 0.301 ms
+DIAG guest nproc 1
+RESULT host_to_vm_gbit 29.56 Gbit/s
+== backup
+Error: Failed to parse instance UUID from volatile.uuid: invalid UUID length: 0
+Try `incus info --show-log v51` for more info
+RESULT backup_vm_s 68.83 s
+RESULT backup_vm_size_mb 416 MB
+RESULT restore_vm_s 71.24 s
+RESULT backup_vm_again_s 70.79 s
+== pbs

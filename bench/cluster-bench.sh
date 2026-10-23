@@ -21,7 +21,9 @@ if [ $K = pve ]; then
   for i in $(seq $R); do
     for dir in "22201 pve-bench2" "22203 pve-bench"; do set -- $dir
       o=$(./pssh $1 'cd /root/bench; . ./lib.sh; s=$(t); qm migrate 160 '$2' --online --with-local-disks --targetstorage local-lvm --migration_network 10.10.10.0/24 > /tmp/mig.log 2>&1; echo "rc=$? total=$(since $s) down=$(sed -n "s/.*downtime \([0-9]*\) ms.*/\1/p" /tmp/mig.log | tail -1)"')
-      echo "DIAG pve migrate to $2: $o"; tot+=("$(echo "$o" | sed -n 's/.*total=\([0-9.]*\).*/\1/p')"); down+=("$(echo "$o" | sed -n 's/.*down=\([0-9]*\).*/\1/p')")
+      tp=$([ $1 = 22201 ] && echo 22203 || echo 22201)
+      ok=$(./pssh $tp "$LIB; P=pve; NODE=\$(hostname); $GS; waitfor 60 vm_ready 60 && echo ssh-ok || echo SSH-FAILED")
+      echo "DIAG pve migrate to $2: $o $ok"; tot+=("$(echo "$o" | sed -n 's/.*total=\([0-9.]*\).*/\1/p')"); down+=("$(echo "$o" | sed -n 's/.*down=\([0-9]*\).*/\1/p')")
     done
   done
   echo "RESULT migrate_live_s $(printf '%s\n' "${tot[@]}" | med) s"
