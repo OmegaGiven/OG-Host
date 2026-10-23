@@ -20,6 +20,7 @@ mod installer;
 mod idmap;
 mod labnode;
 mod logidx;
+mod memcheck;
 mod migrate;
 mod pools;
 mod resources;
@@ -85,6 +86,27 @@ enum Cmd {
         pool: String,
         #[arg(long)]
         name: String,
+    },
+    /// Test free memory while the server runs; bad pages are taken out of service at once and
+    /// remembered (<root>/badram.json). `--boot` also reserves them (2 MiB each) from the next boot.
+    Memtest {
+        /// GiB to test (0 = all available memory except --leave-free)
+        #[arg(long, default_value_t = 0)]
+        gib: u64,
+        #[arg(long, default_value_t = 1)]
+        passes: u32,
+        /// GiB to leave for everything else
+        #[arg(long, default_value_t = 4)]
+        leave_free: u64,
+        /// write the memmap= boot reservations for every known bad page (GRUB)
+        #[arg(long)]
+        boot: bool,
+        /// how many patterns the kernel's own memtest runs over all RAM at boot (1-17)
+        #[arg(long)]
+        boot_memtest: Option<u32>,
+        /// list what's known and exit
+        #[arg(long)]
+        list: bool,
     },
     /// Load images from a `docker save` / OCI archive (FILE, or - for stdin), like docker load.
     Load {
@@ -464,6 +486,23 @@ async fn main() -> Result<()> {
         Cmd::ImportVma { file, pool, name } => {
             let (root, file) = (cli.root.clone(), file.clone());
             tokio::task::spawn_blocking(move || vma::cli(&root, &file, &pool, &name)).await??;
+        }
+        Cmd::Memtest { gib, passes, leave_free, boot, boot_memtest, list } => {
+            if list {
+                let b = memcheck::load(&cli.root);
+                for p in &b.pages {
+                    println!("{:#014x}\t{}\t{}\t{}", p.addr, p.by, p.pattern, p.bits);
+                }
+                for (s, l) in memcheck::reservations(&b) {
+                    println!("reserve {}K at {s:#x}", l / 1024);
+                }
+                for (t, bytes, n) in &b.scans {
+                    println!("scan {t}: {} GiB tested, {n} bad", bytes >> 30);
+                }
+            } else {
+                let root = cli.root.clone();
+                tokio::task::spawn_blocking(move || memcheck::cli(&root, gib, passes, leave_free, boot, boot_memtest)).await??;
+            }
         }
         Cmd::Load { file, tag } => {
             for (name, digest) in load_archive(&cli.root, &file, tag.as_deref())? {
