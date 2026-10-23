@@ -1,5 +1,6 @@
-//! Metric history (OmegaEnv's metrics.db, same schema): raw samples for 48 h, 1-minute
-//! rollups for 30 days, 1-hour rollups for a year. Writes are buffered and flushed every 10 s.
+//! Metric history (OmegaEnv's metrics.db, same schema): raw samples, 1-minute rollups and
+//! 1-hour rollups, each kept for a configurable time (by default 2 days, 30 days and forever).
+//! Writes are buffered and flushed every 10 s.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,15 +13,45 @@ use serde_json::{json, Value};
 const MIN: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 86_400_000;
-const KEEP_RAW: i64 = 2 * DAY;
-const KEEP_M1: i64 = 30 * DAY;
-const KEEP_H1: i64 = 365 * DAY;
+
+/// How long each resolution is kept, in days; `hour_days` 0 = forever.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+pub struct Retention {
+    pub raw_days: i64,
+    pub minute_days: i64,
+    pub hour_days: i64,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention { raw_days: 2, minute_days: 30, hour_days: 0 }
+    }
+}
+
+impl Retention {
+    fn check(&self) -> Result<()> {
+        if !(1..=90).contains(&self.raw_days) || !(1..=3650).contains(&self.minute_days) || !(0..=36500).contains(&self.hour_days) {
+            anyhow::bail!("raw: 1-90 days, minutes: 1-3650 days, hours: 0 (forever) to 36500 days");
+        }
+        if self.minute_days < self.raw_days || (self.hour_days != 0 && self.hour_days < self.minute_days) {
+            anyhow::bail!("each resolution has to be kept at least as long as the finer one");
+        }
+        Ok(())
+    }
+    fn raw(&self) -> i64 {
+        self.raw_days * DAY
+    }
+    fn m1(&self) -> i64 {
+        self.minute_days * DAY
+    }
+}
 
 /// What each metric is, for pickers and axis formatting.
 pub const METRICS: &[(&str, &str, &str)] = &[
     ("cpu", "CPU", "pct"), ("load1", "Load (1 min)", "num"), ("mem_used_pct", "Memory used", "pct"), ("mem_used", "Memory used (bytes)", "bytes"),
     ("swap_used_pct", "Swap used", "pct"), ("temp", "CPU temperature", "C"), ("net_rx", "Network in", "Bps"), ("net_tx", "Network out", "Bps"),
     ("gpu_util", "GPU utilisation", "pct"), ("gpu_mem_used", "GPU memory used", "bytes"), ("gpu_temp", "GPU temperature", "C"), ("gpu_power", "GPU power", "W"),
+    ("disk_read", "Disk read", "Bps"), ("disk_write", "Disk write", "Bps"), ("swap_used", "Swap used (bytes)", "bytes"), ("ksm_saved", "Memory saved by KSM", "bytes"),
     ("disk_used_pct", "Disk used", "pct"), ("disk_free", "Disk free", "bytes"), ("ctr_cpu", "Container CPU", "pct"), ("ctr_mem", "Container memory", "bytes"),
     ("ctr_running", "Containers running", "num"), ("guest_cpu", "VM/LXC CPU", "pct"), ("guest_mem", "VM/LXC memory", "bytes"),
     ("app_up", "App up (1) / down (0)", "bool"), ("app_ms", "App response time", "ms"), ("log_errors", "Log errors per minute", "num"),
@@ -39,6 +70,8 @@ pub struct Metrics {
     db: Mutex<Connection>,
     buffer: Mutex<Vec<(String, String, String, i64, f64)>>,
     sids: Mutex<std::collections::HashMap<(String, String, String), i64>>,
+    keep: Mutex<Retention>,
+    path: std::path::PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,7 +104,33 @@ impl Metrics {
         if schema.unwrap_or(1) < 2 {
             db.execute_batch("DELETE FROM m1; DELETE FROM h1; DELETE FROM meta; INSERT INTO meta (k, v) VALUES ('schema', 2)")?;
         }
-        Ok(Metrics { db: Mutex::new(db), buffer: Mutex::new(Vec::new()), sids: Default::default() })
+        let g = |k: &str| -> Option<i64> { db.query_row("SELECT v FROM meta WHERE k=?1", [k], |r| r.get(0)).optional().ok().flatten() };
+        let d = Retention::default();
+        let keep = Retention { raw_days: g("keep_raw_days").unwrap_or(d.raw_days), minute_days: g("keep_minute_days").unwrap_or(d.minute_days), hour_days: g("keep_hour_days").unwrap_or(d.hour_days) };
+        Ok(Metrics { db: Mutex::new(db), buffer: Mutex::new(Vec::new()), sids: Default::default(), keep: Mutex::new(keep), path: path.to_path_buf() })
+    }
+
+    pub fn retention(&self) -> Retention {
+        *self.keep.lock().unwrap()
+    }
+
+    /// Change how long history is kept; shortening it drops the older data at the next prune.
+    pub fn set_retention(&self, r: Retention) -> Result<()> {
+        r.check()?;
+        let db = self.db.lock().unwrap();
+        for (k, v) in [("keep_raw_days", r.raw_days), ("keep_minute_days", r.minute_days), ("keep_hour_days", r.hour_days)] {
+            db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?1, ?2)", params![k, v])?;
+        }
+        *self.keep.lock().unwrap() = r;
+        Ok(())
+    }
+
+    /// Size on disk and the oldest point kept (ms).
+    pub fn usage(&self) -> Value {
+        let db = self.db.lock().unwrap();
+        let oldest: Option<i64> = ["h1", "m1", "raw"].iter().filter_map(|t| db.query_row(&format!("SELECT min(ts) FROM {t}"), [], |r| r.get::<_, Option<i64>>(0)).ok().flatten()).min();
+        let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        json!({"bytes": size, "oldest": oldest})
     }
 
     pub fn record(&self, host: &str, metric: &str, label: &str, ts: i64, v: Option<f64>) {
@@ -187,7 +246,8 @@ impl Metrics {
         let r = (|| -> rusqlite::Result<()> {
             let get = |k: &str| -> rusqlite::Result<Option<i64>> { db.query_row("SELECT v FROM meta WHERE k=?1", [k], |r| r.get(0)).optional() };
             let cur_min = now / MIN * MIN;
-            let from_m = get("m1_done")?.unwrap_or(cur_min - KEEP_RAW);
+            let keep = *self.keep.lock().unwrap();
+            let from_m = get("m1_done")?.unwrap_or(cur_min - keep.raw());
             if cur_min > from_m {
                 db.execute(
                     &format!("INSERT OR REPLACE INTO m1 (sid, ts, avg, min, max) SELECT sid, CAST(ts / {MIN} AS INTEGER) * {MIN} AS t, avg(v), min(v), max(v) FROM raw WHERE ts >= ?1 AND ts < ?2 GROUP BY sid, t"),
@@ -196,7 +256,7 @@ impl Metrics {
                 db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('m1_done', ?1)", [cur_min])?;
             }
             let cur_hour = now / HOUR * HOUR;
-            let from_h = get("h1_done")?.unwrap_or(cur_hour - KEEP_M1);
+            let from_h = get("h1_done")?.unwrap_or(cur_hour - keep.m1());
             if cur_hour > from_h {
                 db.execute(
                     &format!("INSERT OR REPLACE INTO h1 (sid, ts, avg, min, max) SELECT sid, CAST(ts / {HOUR} AS INTEGER) * {HOUR} AS t, avg(avg), min(min), max(max) FROM m1 WHERE ts >= ?1 AND ts < ?2 GROUP BY sid, t"),
@@ -211,12 +271,15 @@ impl Metrics {
         }
     }
 
-    fn prune(&self) {
+    pub fn prune(&self) {
         let db = self.db.lock().unwrap();
         let now = crate::now_ms() as i64;
-        let _ = db.execute("DELETE FROM raw WHERE ts < ?1", [now - KEEP_RAW]);
-        let _ = db.execute("DELETE FROM m1 WHERE ts < ?1", [now - KEEP_M1]);
-        let _ = db.execute("DELETE FROM h1 WHERE ts < ?1", [now - KEEP_H1]);
+        let keep = *self.keep.lock().unwrap();
+        let _ = db.execute("DELETE FROM raw WHERE ts < ?1", [now - keep.raw()]);
+        let _ = db.execute("DELETE FROM m1 WHERE ts < ?1", [now - keep.m1()]);
+        if keep.hour_days > 0 {
+            let _ = db.execute("DELETE FROM h1 WHERE ts < ?1", [now - keep.hour_days * DAY]);
+        }
     }
 
     pub fn list_series(&self, host: Option<&str>, metric: Option<&str>) -> Vec<Series> {
@@ -253,9 +316,10 @@ impl Metrics {
         let Some(id) = id else { return empty };
         let now = crate::now_ms() as i64;
         let span = (to - from).max(1);
-        let (table, res) = if from >= now - KEEP_RAW && span <= 12 * HOUR {
+        let keep = *self.keep.lock().unwrap();
+        let (table, res) = if from >= now - keep.raw() && span <= 12 * HOUR {
             ("raw", 10_000)
-        } else if from >= now - KEEP_M1 && span <= 14 * DAY {
+        } else if from >= now - keep.m1() && span <= 14 * DAY {
             ("m1", MIN)
         } else {
             ("h1", HOUR)

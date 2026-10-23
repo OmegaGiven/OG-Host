@@ -382,3 +382,10 @@ pub fn node_info(root: &Path) -> Value {
         "root": root, "virtual": crate::desktop::host_is_virtual(),
     })
 }
+
+/// This node's hostname (the `host` of its metric series).
+pub fn hostname() -> String {
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    unsafe { libc::uname(&mut uts) };
+    unsafe { std::ffi::CStr::from_ptr(uts.nodename.as_ptr()) }.to_string_lossy().into_owned()
+}

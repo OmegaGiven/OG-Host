@@ -46,6 +46,8 @@ pub struct Daemon {
     pub ha: Mutex<crate::ha::State>,
     /// The lab control plane, when enabled (--lab).
     pub lab: Option<Arc<og_lab::Lab>>,
+    /// This node's own metric history (<root>/metrics.db), kept as long as configured.
+    pub metrics: Arc<og_lab::metrics::Metrics>,
     log_shipper: crate::labnode::LogShipper,
 }
 
@@ -124,7 +126,9 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
 pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>, lab: bool, cluster_port: u16) -> Result<()> {
     let lab = if lab { Some(og_lab::Lab::open(&root.join("lab")).await.context("starting the lab control plane")?) } else { None };
     let token = if listen.is_some() || tls.is_some() { Some(load_or_create_token(&root)?) } else { None };
-    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::auth::Sessions::load(&root), access: og_access::Access::open(&root), storage: Arc::new(crate::storage::Storage::new(&root)), tasks: Arc::new(crate::tasks::Tasks::open(&root)), vms: crate::vms::Vms::new(&root), dhcp: Default::default(), cluster: crate::cluster::Cluster::open(&root, cluster_port), update_seen: Mutex::new(None), ai: Default::default(), hostnet: crate::hostnet::HostNet::open(&root), vmbrain: Default::default(), ha: Default::default(), firewall: crate::firewall::Firewall::open(&root, [listen.as_deref(), tls.as_ref().map(|t| t.0.as_str())].into_iter().flatten().filter_map(|a| a.rsplit_once(':').and_then(|(_, p)| p.parse().ok())).chain([cluster_port]).collect()), lab: lab.clone(), log_shipper: Default::default() });
+    let metric_store = Arc::new(og_lab::metrics::Metrics::open(&root.join("metrics.db")).context("opening the metrics history")?);
+    og_lab::metrics::start(metric_store.clone());
+    let app: App = Arc::new(Daemon { node, root: root.clone(), token, restarts: Mutex::new(HashMap::new()), health: Mutex::new(HashMap::new()), brain: Mutex::new(Default::default()), hub: Default::default(), sessions: crate::auth::Sessions::load(&root), access: og_access::Access::open(&root), storage: Arc::new(crate::storage::Storage::new(&root)), tasks: Arc::new(crate::tasks::Tasks::open(&root)), vms: crate::vms::Vms::new(&root), dhcp: Default::default(), cluster: crate::cluster::Cluster::open(&root, cluster_port), update_seen: Mutex::new(None), ai: Default::default(), hostnet: crate::hostnet::HostNet::open(&root), vmbrain: Default::default(), ha: Default::default(), firewall: crate::firewall::Firewall::open(&root, [listen.as_deref(), tls.as_ref().map(|t| t.0.as_str())].into_iter().flatten().filter_map(|a| a.rsplit_once(':').and_then(|(_, p)| p.parse().ok())).chain([cluster_port]).collect()), lab: lab.clone(), metrics: metric_store, log_shipper: Default::default() });
     if let Some(l) = &lab {
         l.set_local(Arc::new(crate::labnode::LabNode { d: app.clone() }));
         eprintln!("og-hostd: lab control plane on (data in {})", root.join("lab").display());
@@ -181,6 +185,9 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/info", get(info))
         .route("/v1/events", get(events))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/metrics/history", get(metrics_history))
+        .route("/v1/metrics/series", get(metrics_series))
+        .route("/v1/metrics/retention", get(metrics_retention).put(set_metrics_retention))
         .route("/v1/containers/{id}/restart", post(restart))
         .route("/v1/containers/{id}/kill", post(kill))
         .route("/v1/containers/{id}/logs/stream", get(logs_stream))
@@ -293,6 +300,10 @@ impl Daemon {
             .collect();
         let snap = self.hub.sample(&running);
         let gpus = self.brain.lock().unwrap().last_gpus.clone();
+        static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5 == 1 {
+            self.record_metrics(&snap, &running, &gpus);
+        }
         self.hub.publish("stats", json!({ "stats": snap, "gpus": gpus }).to_string());
         let containers: Vec<serde_json::Value> = list.iter().filter_map(|(m, _)| self.container_json(&m.id)).collect();
         self.hub.publish_if_changed("containers", serde_json::to_string(&containers).unwrap_or_default());
@@ -300,6 +311,71 @@ impl Daemon {
             if let Some(host) = lab.local_name() {
                 self.log_shipper.ship(self, lab, &host);
             }
+        }
+    }
+
+    /// Every 10 s: node, containers, VMs and GPUs into the metric history.
+    fn record_metrics(&self, snap: &serde_json::Value, running: &[(String, String, Option<String>)], gpus: &[crate::brain::Gpu]) {
+        let m = &self.metrics;
+        let host = crate::stats::hostname();
+        let ts = (crate::containers::unix_now() * 1000) as i64;
+        let r = |metric: &str, label: &str, v: Option<f64>| m.record(&host, metric, label, ts, v);
+        let n = &snap["node"];
+        let f = |v: &serde_json::Value| v.as_f64();
+        r("cpu", "", f(&n["cpu"]));
+        r("load1", "", f(&n["load"][0]));
+        if let (Some(total), Some(used)) = (f(&n["mem"]["total"]), f(&n["mem"]["used"])) {
+            r("mem_used", "", Some(used));
+            if total > 0.0 {
+                r("mem_used_pct", "", Some(100.0 * used / total));
+            }
+        }
+        r("swap_used", "", f(&n["mem"]["swap_used"]));
+        r("net_rx", "", f(&n["net"]["rx"]));
+        r("net_tx", "", f(&n["net"]["tx"]));
+        r("disk_read", "", f(&n["disk"]["r"]));
+        r("disk_write", "", f(&n["disk"]["w"]));
+        for fs in n["fs"].as_array().into_iter().flatten() {
+            if let (Some(t), Some(u), Some(mnt)) = (f(&fs["total"]), f(&fs["used"]), fs["mount"].as_str()) {
+                if t > 0.0 {
+                    r("disk_used_pct", mnt, Some(100.0 * u / t));
+                    r("disk_free", mnt, Some(t - u));
+                }
+            }
+        }
+        r("ctr_running", "", Some(running.len() as f64));
+        for (id, name, _) in running {
+            let c = &snap["containers"][id];
+            r("ctr_cpu", name, f(&c["cpu"]));
+            r("ctr_mem", name, f(&c["mem"]));
+        }
+        // VMs: CPU from the QEMU process's CPU time since the last sample
+        static VMCPU: Mutex<Option<HashMap<String, (f64, Instant)>>> = Mutex::new(None);
+        let mut prev = VMCPU.lock().unwrap();
+        let prev = prev.get_or_insert_with(HashMap::new);
+        let mut seen = std::collections::HashSet::new();
+        for vm in self.vms.list() {
+            let Some(pid) = self.vms.status(&vm.name).pid else { continue };
+            let Some((secs, rss)) = crate::vmrun::usage(pid) else { continue };
+            r("guest_mem", &vm.name, Some(rss as f64));
+            if let Some((p, t)) = prev.get(&vm.name) {
+                let dt = t.elapsed().as_secs_f64();
+                if dt > 1.0 && secs >= *p {
+                    r("guest_cpu", &vm.name, Some(100.0 * (secs - p) / dt));
+                }
+            }
+            prev.insert(vm.name.clone(), (secs, Instant::now()));
+            seen.insert(vm.name.clone());
+        }
+        prev.retain(|k, _| seen.contains(k));
+        let ksm = self.vmbrain.lock().unwrap().ksm.saved_mib;
+        r("ksm_saved", "", Some((ksm * 1024 * 1024) as f64));
+        for g in gpus {
+            let l = if gpus.len() > 1 { format!("{}: {}", g.index, g.name) } else { g.name.clone() };
+            r("gpu_util", &l, g.util_pct);
+            r("gpu_mem_used", &l, Some((g.mem_used_mib * 1024 * 1024) as f64));
+            r("gpu_temp", &l, g.temp_c);
+            r("gpu_power", &l, g.power_w);
         }
     }
 
@@ -528,18 +604,107 @@ async fn events(State(app): State<App>) -> axum::response::sse::Sse<impl futures
 
 #[derive(Deserialize)]
 struct MetricsQ {
+    /// seconds back from now; 0 = everything kept
     range: Option<u64>,
+    /// or an explicit window, unix seconds
+    from: Option<u64>,
+    to: Option<u64>,
 }
 
-/// Node history, column-wise: {t: [...], cpu: [...], mem, rx, tx, dr, dw}.
+/// Node history, column-wise: {t: [...], cpu: [...], mem, rx, tx, dr, dw}. Up to a day back from
+/// memory (2 s / 1 min points); longer or older windows from the metric history on disk.
 async fn metrics(State(app): State<App>, Query(q): Query<MetricsQ>) -> Json<serde_json::Value> {
-    let pts = app.hub.history.lock().unwrap().node(q.range.unwrap_or(3600).clamp(60, 86400));
+    let range = q.range.unwrap_or(3600);
+    if q.from.is_some() || range == 0 || range > 86400 {
+        let a = app.clone();
+        return Json(tokio::task::spawn_blocking(move || stored_node_metrics(&a, q)).await.unwrap_or_default());
+    }
+    let pts = app.hub.history.lock().unwrap().node(range.max(60));
     Json(json!({
         "t": pts.iter().map(|p| p.t).collect::<Vec<_>>(), "cpu": pts.iter().map(|p| p.cpu).collect::<Vec<_>>(),
         "mem": pts.iter().map(|p| p.mem).collect::<Vec<_>>(), "rx": pts.iter().map(|p| p.rx).collect::<Vec<_>>(),
         "tx": pts.iter().map(|p| p.tx).collect::<Vec<_>>(), "dr": pts.iter().map(|p| p.dr).collect::<Vec<_>>(),
         "dw": pts.iter().map(|p| p.dw).collect::<Vec<_>>(),
     }))
+}
+
+fn stored_node_metrics(app: &App, q: MetricsQ) -> serde_json::Value {
+    let m = &app.metrics;
+    let host = crate::stats::hostname();
+    let now = crate::containers::unix_now();
+    let to = q.to.unwrap_or(now);
+    let from = match (q.from, q.range.unwrap_or(3600)) {
+        (Some(f), _) => f,
+        (None, 0) => m.usage()["oldest"].as_i64().map(|t| (t / 1000) as u64).unwrap_or(now - 3600),
+        (None, r) => now.saturating_sub(r),
+    };
+    let (from_ms, to_ms) = ((from * 1000) as i64, (to * 1000) as i64);
+    let cols = [("cpu", "cpu"), ("mem", "mem_used"), ("rx", "net_rx"), ("tx", "net_tx"), ("dr", "disk_read"), ("dw", "disk_write")];
+    let series: Vec<serde_json::Value> = cols.iter().map(|(_, metric)| m.query(&host, metric, "", Some(from_ms), Some(to_ms), 720)).collect();
+    // align on the cpu series' timestamps
+    let t: Vec<i64> = series[0]["t"].as_array().into_iter().flatten().filter_map(|v| v.as_i64()).collect();
+    let mut out = serde_json::Map::new();
+    out.insert("t".into(), json!(t.iter().map(|x| x / 1000).collect::<Vec<_>>()));
+    for ((key, _), s) in cols.iter().zip(&series) {
+        let by_t: HashMap<i64, f64> = s["t"].as_array().into_iter().flatten().zip(s["avg"].as_array().into_iter().flatten()).filter_map(|(a, b)| Some((a.as_i64()?, b.as_f64()?))).collect();
+        out.insert((*key).into(), json!(t.iter().map(|x| by_t.get(x).copied()).collect::<Vec<_>>()));
+    }
+    out.insert("resolution".into(), series[0]["resolution"].clone());
+    out.insert("from".into(), json!(from));
+    out.insert("to".into(), json!(to));
+    serde_json::Value::Object(out)
+}
+
+/// Any stored series: /v1/metrics/history?metric=ctr_mem&label=mealie&range=604800
+#[derive(Deserialize)]
+struct HistQ {
+    metric: String,
+    #[serde(default)]
+    label: String,
+    range: Option<u64>,
+    from: Option<u64>,
+    to: Option<u64>,
+    points: Option<i64>,
+}
+
+async fn metrics_history(State(app): State<App>, Query(q): Query<HistQ>) -> Json<serde_json::Value> {
+    let a = app.clone();
+    Json(
+        tokio::task::spawn_blocking(move || {
+            let now = crate::containers::unix_now();
+            let to = q.to.unwrap_or(now);
+            let from = q.from.unwrap_or_else(|| match q.range.unwrap_or(3600) {
+                0 => a.metrics.usage()["oldest"].as_i64().map(|t| (t / 1000) as u64).unwrap_or(now - 3600),
+                r => now.saturating_sub(r),
+            });
+            a.metrics.query(&crate::stats::hostname(), &q.metric, &q.label, Some((from * 1000) as i64), Some((to * 1000) as i64), q.points.unwrap_or(720))
+        })
+        .await
+        .unwrap_or_default(),
+    )
+}
+
+async fn metrics_series(State(app): State<App>) -> Json<serde_json::Value> {
+    let a = app.clone();
+    Json(tokio::task::spawn_blocking(move || json!(a.metrics.list_series(Some(&crate::stats::hostname()), None))).await.unwrap_or_default())
+}
+
+async fn metrics_retention(State(app): State<App>) -> Json<serde_json::Value> {
+    let a = app.clone();
+    Json(tokio::task::spawn_blocking(move || json!({"retention": a.metrics.retention(), "usage": a.metrics.usage()})).await.unwrap_or_default())
+}
+
+async fn set_metrics_retention(State(app): State<App>, Json(r): Json<og_lab::metrics::Retention>) -> ApiResult<Json<serde_json::Value>> {
+    let a = app.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        a.metrics.set_retention(r)?;
+        a.metrics.prune();
+        Ok(())
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(metrics_retention(State(app)).await)
 }
 
 async fn restart(State(app): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult<Json<serde_json::Value>> {
