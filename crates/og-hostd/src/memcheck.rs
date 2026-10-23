@@ -145,6 +145,26 @@ pub fn apply_boot(b: &BadRam, patterns: Option<u32>) -> Result<Vec<String>> {
     Ok(args)
 }
 
+/// At daemon start: take in what this boot's kernel memtest found; when that's new, extend
+/// the boot reservations (only if they're managed here already, or the kernel found something).
+pub fn on_start(root: &Path) {
+    let found = from_boot_log();
+    if found.is_empty() {
+        return;
+    }
+    match remember(root, &found, None) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("og-hostd: this boot's memory test found {n} new bad memory location(s)");
+            match apply_boot(&load(root), None) {
+                Ok(args) => eprintln!("og-hostd: reserved from the next boot on: {}", args.join(" ")),
+                Err(e) => eprintln!("og-hostd: updating the boot reservations: {e:#}"),
+            }
+        }
+        Err(e) => eprintln!("og-hostd: recording bad memory: {e:#}"),
+    }
+}
+
 /// At daemon start: offline every known bad page that this boot's reservations don't cover.
 pub fn reapply(root: &Path) {
     let b = load(root);

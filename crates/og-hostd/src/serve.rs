@@ -126,6 +126,7 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
 pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>, lab: bool, cluster_port: u16) -> Result<()> {
     let lab = if lab { Some(og_lab::Lab::open(&root.join("lab")).await.context("starting the lab control plane")?) } else { None };
     let token = if listen.is_some() || tls.is_some() { Some(load_or_create_token(&root)?) } else { None };
+    crate::memcheck::on_start(&root);
     crate::memcheck::reapply(&root);
     let metric_store = Arc::new(og_lab::metrics::Metrics::open(&root.join("metrics.db")).context("opening the metrics history")?);
     og_lab::metrics::start(metric_store.clone());
