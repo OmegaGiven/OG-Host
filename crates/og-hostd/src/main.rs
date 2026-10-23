@@ -18,6 +18,7 @@ mod firewall;
 mod ha;
 mod hostnet;
 mod installer;
+mod integrity;
 mod idmap;
 mod labnode;
 mod logidx;
@@ -89,6 +90,9 @@ enum Cmd {
         #[arg(long)]
         name: String,
     },
+    /// Check app data for silent corruption now (SHA-256 of every file under apps/ and volumes/,
+    /// compared with the last scrub); also runs weekly in the background.
+    Scrub,
     /// Test free memory while the server runs; bad pages are taken out of service at once and
     /// remembered (<root>/badram.json). `--boot` also reserves them (2 MiB each) from the next boot.
     Memtest {
@@ -488,6 +492,10 @@ async fn main() -> Result<()> {
         Cmd::ImportVma { file, pool, name } => {
             let (root, file) = (cli.root.clone(), file.clone());
             tokio::task::spawn_blocking(move || vma::cli(&root, &file, &pool, &name)).await??;
+        }
+        Cmd::Scrub => {
+            let root = cli.root.clone();
+            tokio::task::spawn_blocking(move || integrity::cli(&root)).await??;
         }
         Cmd::Memtest { gib, passes, leave_free, boot, boot_memtest, list } => {
             if list {

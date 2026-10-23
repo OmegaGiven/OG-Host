@@ -369,6 +369,7 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
     match seg.as_slice() {
         ["version" | "info" | "node" | "brain" | "metrics" | "events"] => r("/".into(), "Sys.Audit"),
         ["metrics", ..] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
+        ["integrity"] => r("/".into(), "Sys.Audit"),
         ["containers"] => r("/containers".into(), if get { "Container.Audit" } else { "Container.Allocate" }),
         ["containers", id] => r(format!("/containers/{}", ctr_name(d, id)), if get { "Container.Audit" } else { "Container.Allocate" }),
         ["containers", id, "start" | "stop" | "restart" | "kill" | "wake"] => r(format!("/containers/{}", ctr_name(d, id)), "Container.PowerMgmt"),
