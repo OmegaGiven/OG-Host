@@ -24,6 +24,7 @@ mod labnode;
 mod logidx;
 mod memcheck;
 mod memtune;
+mod omegaenv;
 mod migrate;
 mod pools;
 mod resources;

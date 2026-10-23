@@ -158,6 +158,8 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     tokio::spawn(crate::memtune::reclaimer(app.clone()));
     // weekly integrity scrub of app data
     tokio::spawn(crate::integrity::scheduler(root.clone()));
+    // report to an OmegaEnv dashboard natively (replaces its Python agent)
+    tokio::spawn(crate::omegaenv::run(app.clone()));
 
     // supervisor + health loop
     {
