@@ -18,7 +18,17 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 const TARGET: &str = "/mnt/og-target";
-const SQUASH: &str = "/run/live/medium/live/filesystem.squashfs";
+const SQUASH_CD: &str = "/run/live/medium/live/filesystem.squashfs";
+
+/// The system image: on the install medium, or wherever live-boot put one it fetched over
+/// the network (`fetch=` on the kernel command line, for remote installs).
+fn squash() -> String {
+    if Path::new(SQUASH_CD).exists() {
+        return SQUASH_CD.into();
+    }
+    let out = Command::new("find").args(["/run/live", "-maxdepth", "4", "-name", "filesystem.squashfs"]).output().ok();
+    out.and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(String::from)).unwrap_or_else(|| SQUASH_CD.into())
+}
 
 #[derive(Debug, Clone)]
 struct Answers {
@@ -37,6 +47,8 @@ struct Answers {
     admin_password: String,
     root_password: String,
     ssh_key: String,
+    /// extra kernel options for the installed system (e.g. memtest=4)
+    kernel_args: String,
     reboot: bool,
 }
 
@@ -187,11 +199,25 @@ fn interactive() -> Result<Answers> {
     if ask("Type yes to install", "") != "yes" {
         bail!("cancelled");
     }
-    Ok(Answers { disk, fs, root_gb, thin: root_gb > 0, hostname, net, iface, address, gateway, dns, timezone, admin_user, admin_password, root_password, ssh_key, reboot: true })
+    Ok(Answers { disk, fs, root_gb, thin: root_gb > 0, hostname, net, iface, address, gateway, dns, timezone, admin_user, admin_password, root_password, ssh_key, kernel_args: String::new(), reboot: true })
 }
 
 fn from_file(p: &Path) -> Result<Answers> {
-    let text = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+    let ps = p.to_string_lossy();
+    let text = if ps.starts_with("http://") || ps.starts_with("https://") {
+        // remote installs: the answers come from a URL (retried while the network comes up)
+        let mut got = None;
+        for _ in 0..30 {
+            if let Ok(t) = sh("curl", &["-fsSL", "--max-time", "20", &ps]) {
+                got = Some(t);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        got.with_context(|| format!("fetching the answers from {ps}"))?
+    } else {
+        std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
+    };
     let kv: BTreeMap<String, String> = text.lines().filter(|l| !l.trim().starts_with('#')).filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches('"').to_string()))).collect();
     let g = |k: &str, d: &str| kv.get(k).cloned().unwrap_or_else(|| d.to_string());
     let disk = match g("disk", "auto").as_str() {
@@ -199,6 +225,15 @@ fn from_file(p: &Path) -> Result<Answers> {
         d => d.to_string(),
     };
     let root_gb = g("root_gb", "24").parse().unwrap_or(24);
+    // the install system itself takes SSH logins with this key (watch a remote install)
+    let live_key = g("live_ssh_key", "");
+    if !live_key.is_empty() {
+        let _ = std::fs::create_dir_all("/root/.ssh");
+        let _ = std::fs::write("/root/.ssh/authorized_keys", format!("{live_key}\n"));
+        let _ = sh("ssh-keygen", &["-A"]);
+        let _ = sh("systemctl", &["restart", "ssh"]);
+        step("SSH into the install system is open for the given key");
+    }
     Ok(Answers {
         disk,
         fs: g("fs", "ext4"),
@@ -206,7 +241,11 @@ fn from_file(p: &Path) -> Result<Answers> {
         thin: root_gb > 0 && g("thin", "yes") == "yes",
         hostname: g("hostname", "og-host"),
         net: g("net", "dhcp"),
-        iface: g("iface", nics().first().map(String::as_str).unwrap_or("eth0")),
+        // `mac = aa:bb:..`: the card with that address (names differ between systems)
+        iface: match kv.get("mac").map(|m| m.to_lowercase()) {
+            Some(m) => nics().into_iter().find(|n| std::fs::read_to_string(format!("/sys/class/net/{n}/address")).is_ok_and(|a| a.trim() == m)).with_context(|| format!("no network card with address {m}"))?,
+            None => g("iface", nics().first().map(String::as_str).unwrap_or("eth0")),
+        },
         address: g("address", ""),
         gateway: g("gateway", ""),
         dns: g("dns", "").split_whitespace().map(String::from).collect(),
@@ -215,6 +254,7 @@ fn from_file(p: &Path) -> Result<Answers> {
         admin_password: g("admin_password", ""),
         root_password: g("root_password", ""),
         ssh_key: g("ssh_key", ""),
+        kernel_args: g("kernel_args", "").chars().filter(|c| c.is_ascii_graphic() || *c == ' ').filter(|c| !"\"'`$\\".contains(*c)).collect(),
         reboot: g("reboot", "yes") == "yes",
     })
 }
@@ -226,14 +266,18 @@ fn step(msg: &str) {
 }
 
 fn install(a: &Answers) -> Result<()> {
-    if !Path::new(SQUASH).exists() {
-        bail!("this isn't the OG-Host install system ({SQUASH} missing)");
+    let squash = squash();
+    if !Path::new(&squash).exists() {
+        bail!("this isn't the OG-Host install system ({squash} missing)");
     }
     if !crate::vms::valid_name(&a.hostname.to_lowercase()) {
         bail!("server names are letters, digits and -");
     }
-    if a.admin_password.chars().count() < 10 || a.root_password.is_empty() {
-        bail!("passwords missing (admin: 10+ characters)");
+    // key-only installs (remote): no passwords; root signs in with the SSH key and makes the
+    // web account afterwards (og-hostd passwd)
+    let key_only = a.admin_password.is_empty() && a.root_password.is_empty() && !a.ssh_key.is_empty();
+    if !key_only && (a.admin_password.chars().count() < 10 || a.root_password.is_empty()) {
+        bail!("passwords missing (admin: 10+ characters), or give an ssh_key and no passwords");
     }
     let disk = a.disk.as_str();
     step(&format!("partitioning {disk}"));
@@ -291,7 +335,7 @@ fn install(a: &Answers) -> Result<()> {
     step("copying the system (a few minutes)");
     // onto the root first (the image has hard links across what become separate volumes), then
     // /boot and OG-Host's data move onto their own
-    sh("unsquashfs", &["-f", "-q", "-n", "-d", TARGET, SQUASH])?;
+    sh("unsquashfs", &["-f", "-q", "-n", "-d", TARGET, &squash])?;
     for (dev, at) in [(&bootp, "boot"), (&statep, "var/lib/og-host")] {
         let dir = format!("{TARGET}/{at}");
         std::fs::create_dir_all(&dir)?;
@@ -370,14 +414,22 @@ fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str, bootp: &str, state
         }
     }
     let _ = chroot(&["ssh-keygen", "-A"]);
-    chroot_input(&["chpasswd"], &format!("root:{}\n", a.root_password))?;
+    if a.root_password.is_empty() {
+        let _ = chroot(&["passwd", "-l", "root"]);
+    } else {
+        chroot_input(&["chpasswd"], &format!("root:{}\n", a.root_password))?;
+    }
     if !a.ssh_key.is_empty() {
         std::fs::create_dir_all(format!("{TARGET}/root/.ssh"))?;
         std::fs::write(format!("{TARGET}/root/.ssh/authorized_keys"), format!("{}\n", a.ssh_key))?;
         chroot(&["chmod", "-R", "go-rwx", "/root/.ssh"])?;
     }
-    step("first OG-Host account");
-    chroot_input(&["/usr/local/bin/og-hostd", "passwd", &a.admin_user], &format!("{}\n", a.admin_password))?;
+    if a.admin_password.is_empty() {
+        step("no web account yet: sign in over SSH and run 'og-hostd passwd <name>' to make the first one");
+    } else {
+        step("first OG-Host account");
+        chroot_input(&["/usr/local/bin/og-hostd", "passwd", &a.admin_user], &format!("{}\n", a.admin_password))?;
+    }
     std::fs::create_dir_all(format!("{TARGET}/var/lib/og-host/images"))?;
     if a.thin {
         std::fs::write(format!("{TARGET}/var/lib/og-host/pools.json"), serde_json::to_vec_pretty(&serde_json::json!([
@@ -393,7 +445,7 @@ fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str, bootp: &str, state
     // GRUB boots the saved entry: an update tries a new kernel once before it becomes the default;
     // a kernel that panics reboots (into the previous one) after 10 s
     std::fs::create_dir_all(format!("{TARGET}/etc/default/grub.d"))?;
-    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), "GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"\n")?;
+    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), format!("GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet{}\"\n", if a.kernel_args.is_empty() { String::new() } else { format!(" {}", a.kernel_args) }))?;
     std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host-saved.cfg"), "# OG-Host updates: boot the saved entry; a panicking kernel reboots after 10 s\nGRUB_DEFAULT=saved\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX panic=10\"\n")?;
     // UEFI (also at the fallback path, so it boots without an NVRAM entry) and BIOS
     let efi = Path::new("/sys/firmware/efi").exists();
