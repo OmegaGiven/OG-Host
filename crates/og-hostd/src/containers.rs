@@ -45,6 +45,9 @@ pub struct Meta {
     /// Bind mounts as requested (before id-mapping), so they can be rebuilt after a reboot.
     #[serde(default)]
     pub binds: Vec<(PathBuf, PathBuf, bool)>,
+    /// Runs in the host's user namespace (`userns_mode: host`).
+    #[serde(default)]
+    pub userns_host: bool,
     #[serde(default)]
     pub healthcheck: Option<og_compose::Healthcheck>,
     #[serde(default)]
@@ -83,6 +86,10 @@ pub struct Extra {
     pub dns: Vec<String>,
     pub dns_search: Vec<String>,
     pub dns_opt: Vec<String>,
+    /// `userns_mode: host`: run in the host's user namespace (no id-mapping: binds of
+    /// filesystems that can't be id-mapped, like NFS, work). Capabilities, seccomp, read-only
+    /// root and `user:` still apply.
+    pub userns_host: bool,
     /// Other services already running in the project (name, ip): known from the start.
     pub peers: Vec<(String, String)>,
     pub healthcheck: Option<og_compose::Healthcheck>,
@@ -239,6 +246,9 @@ impl Node {
         let mut opts = RunOptions::new(name.clone(), rootfs.clone(), PathBuf::from(format!("/og-host/{name}")));
         opts.userns = Some(map);
         opts_in(&mut opts);
+        if extra.userns_host {
+            opts.userns = None;
+        }
         // og.vram: place on the GPU with the most free VRAM (batch work is refused when none fits)
         if let Some(need) = extra.labels.get("og.vram").and_then(|v| parse_size(v).ok()) {
             if opts.cdi_devices.iter().any(|d| d == "nvidia.com/gpu=all") {
@@ -275,7 +285,7 @@ impl Node {
         }
         // own sandbox (user + network namespace) unless sharing another container's or the host's
         let sandbox = dir.join("sandbox");
-        if matches!(net_choice, NetChoice::Network(_) | NetChoice::None) {
+        if !extra.userns_host && matches!(net_choice, NetChoice::Network(_) | NetChoice::None) {
             self.create_sandbox(&id, &sandbox, map)?;
             opts.userns_path = Some(sandbox.join("user"));
         }
@@ -301,7 +311,10 @@ impl Node {
                 let ns = o.net.as_ref().map(|a| a.netns.clone()).context("that container has no network namespace to share")?;
                 opts.network = og_runtime::Network::Join(ns);
                 // join its user namespace too: a netns can only be entered from the userns owning it
-                opts.userns_path = Some(self.dir(&o.id).join("sandbox/user"));
+                // (or from the host's, which owns every user namespace: userns_mode host)
+                if !extra.userns_host {
+                    opts.userns_path = Some(self.dir(&o.id).join("sandbox/user"));
+                }
                 (None, format!("container:{}", o.id), o.net.as_ref().and_then(|a| a.ip))
             }
         };
@@ -420,6 +433,7 @@ impl Node {
             restart: extra.restart,
             desired: if extra.no_start { "created".into() } else { "running".into() },
             binds: requested_binds,
+            userns_host: extra.userns_host,
             healthcheck: extra.healthcheck,
             labels: extra.labels,
             auto_remove: extra.auto_remove,
@@ -501,7 +515,7 @@ impl Node {
         let dir = self.dir(&meta.id);
         let mounted = mounted_paths();
         let sandbox = dir.join("sandbox");
-        let own_sandbox = meta.network_mode == "none" || (meta.net.as_ref().is_some_and(|a| a.network.is_some()) && !meta.network_mode.starts_with("container:"));
+        let own_sandbox = !meta.userns_host && (meta.network_mode == "none" || (meta.net.as_ref().is_some_and(|a| a.network.is_some()) && !meta.network_mode.starts_with("container:")));
         if own_sandbox && !mounted.contains(&sandbox.join("user")) {
             let _ = self.net.detach_netns_only(&meta.id);
             self.create_sandbox(&meta.id, &sandbox, IdMap::default())?;
@@ -525,7 +539,7 @@ impl Node {
             sandbox.join("user")
         };
         let staging_dir = PathBuf::from("/run/og-host/idmap").join(&meta.id);
-        if userns_file.exists() {
+        if userns_file.exists() && !meta.userns_host {
             for (n, (src, _, _)) in meta.binds.iter().enumerate() {
                 let staging = staging_dir.join(n.to_string());
                 if !mounted.contains(&staging) {

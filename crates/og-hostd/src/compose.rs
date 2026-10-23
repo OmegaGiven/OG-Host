@@ -159,6 +159,7 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
             dns: s.dns.clone(),
             dns_search: s.dns_search.clone(),
             dns_opt: s.dns_opt.clone(),
+            userns_host: s.userns_host,
             peers: project_peers(node, &p.name)?,
             healthcheck: s.healthcheck.clone(),
             labels: {

@@ -521,6 +521,12 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
     if seccomp_unconfined && ctx.scope.is_some() {
         return Err(DErr(StatusCode::FORBIDDEN, "seccomp=unconfined is not allowed on this socket".into()));
     }
+    let userns_host = match hc["UsernsMode"].as_str().unwrap_or("") {
+        "" => false,
+        "host" if ctx.scope.is_some() => return Err(DErr(StatusCode::FORBIDDEN, "userns_mode host is not allowed on this socket".into())),
+        "host" => true,
+        other => return Err(DErr(StatusCode::BAD_REQUEST, format!("UsernsMode {other:?} isn't supported"))),
+    };
     let seccomp_profile = crate::containers::seccomp_profile(&str_vec(&hc["SecurityOpt"]), &ctx.d.root).map_err(|e| DErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if seccomp_profile.is_some() && ctx.scope.is_some() {
         // a client's own profile could allow what the default refuses
@@ -687,6 +693,7 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
         dns: str_vec(&hc["Dns"]),
         dns_search: str_vec(&hc["DnsSearch"]),
         dns_opt: str_vec(&hc["DnsOptions"]),
+        userns_host,
         labels,
         auto_remove: hc["AutoRemove"].as_bool().unwrap_or(false),
         no_start: true,

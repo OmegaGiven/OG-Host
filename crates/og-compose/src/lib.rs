@@ -94,6 +94,8 @@ pub struct Service {
     pub dns_opt: Vec<String>,
     /// `read_only: true`: the container's root filesystem is mounted read-only
     pub read_only: bool,
+    /// `userns_mode: host`
+    pub userns_host: bool,
     /// `tmpfs:` entries, `/path[:options]` (e.g. `/run:size=64m,mode=0755`)
     pub tmpfs: Vec<String>,
     pub devices: Vec<String>,
@@ -141,7 +143,7 @@ pub struct Project {
 
 const SUPPORTED_SERVICE_KEYS: &[&str] = &[
     "image", "build", "container_name", "command", "entrypoint", "environment", "env_file", "ports", "volumes",
-    "restart", "depends_on", "networks", "network_mode", "hostname", "extra_hosts", "dns", "dns_search", "dns_opt", "read_only", "tmpfs", "devices", "cap_add",
+    "restart", "depends_on", "networks", "network_mode", "hostname", "extra_hosts", "dns", "dns_search", "dns_opt", "read_only", "userns_mode", "tmpfs", "devices", "cap_add",
     "cap_drop", "shm_size", "mem_limit", "mem_reservation", "cpus", "cpuset", "cpu_shares", "pids_limit",
     "blkio_config", "user", "working_dir", "healthcheck", "security_opt", "labels",
     "privileged", "deploy", "runtime", "stop_grace_period", "expose", "tty", "stdin_open", "init",
@@ -587,6 +589,11 @@ pub fn load(file: &Path, project_name: Option<&str>, env: &interp::Vars) -> Resu
             dns_search: str_list(get("dns_search")),
             dns_opt: str_list(get("dns_opt")),
             read_only: matches!(get("read_only"), Some(Value::Bool(true))),
+            userns_host: match get("userns_mode").and_then(s).as_deref() {
+                None | Some("") => false,
+                Some("host") => true,
+                Some(other) => return Err(Error::Invalid(format!("{svc_name}: userns_mode {other:?} isn't supported (only \"host\")"))),
+            },
             tmpfs: str_list(get("tmpfs")),
             devices: str_list(get("devices")),
             cap_add: str_list(get("cap_add")),
