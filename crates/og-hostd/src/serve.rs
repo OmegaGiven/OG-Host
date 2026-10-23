@@ -160,6 +160,8 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     tokio::spawn(crate::integrity::scheduler(root.clone()));
     // report to an OmegaEnv dashboard natively (replaces its Python agent)
     tokio::spawn(crate::omegaenv::run(app.clone()));
+    // disks, kernel hardware errors, bad RAM: every 30 min
+    tokio::spawn(crate::hwhealth::run(app.clone()));
 
     // supervisor + health loop
     {
@@ -208,6 +210,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/metrics", get(metrics))
         .route("/v1/wake/{name}", get(wake_state))
         .route("/v1/integrity", get(integrity_report))
+        .route("/v1/hardware", get(hardware_report))
         .route("/v1/metrics/history", get(metrics_history))
         .route("/v1/metrics/series", get(metrics_series))
         .route("/v1/metrics/retention", get(metrics_retention).put(set_metrics_retention))
@@ -736,6 +739,10 @@ async fn set_metrics_retention(State(app): State<App>, Json(r): Json<og_lab::met
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(metrics_retention(State(app)).await)
+}
+
+async fn hardware_report(State(app): State<App>) -> Json<serde_json::Value> {
+    Json(crate::hwhealth::api_json(&app.root))
 }
 
 async fn integrity_report(State(app): State<App>) -> Json<serde_json::Value> {

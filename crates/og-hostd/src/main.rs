@@ -17,6 +17,7 @@ mod dockerapi;
 mod firewall;
 mod ha;
 mod hostnet;
+mod hwhealth;
 mod installer;
 mod integrity;
 mod idmap;
