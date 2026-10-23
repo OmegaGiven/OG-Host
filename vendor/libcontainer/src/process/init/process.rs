@@ -796,10 +796,6 @@ fn set_supplementary_gids(
     syscall: &dyn Syscall,
 ) -> Result<()> {
     if let Some(additional_gids) = user.additional_gids() {
-        if additional_gids.is_empty() {
-            return Ok(());
-        }
-
         let mut setgroups = String::new();
         ProcfsHandle::new()?
             .open(ProcfsBase::ProcSelf, "setgroups", OpenFlags::O_RDONLY)?
@@ -808,6 +804,18 @@ fn set_supplementary_gids(
                 tracing::error!(?err, "failed to read setgroups");
                 InitProcessError::Io(err)
             })?;
+
+        // OG-Host: an empty list still clears the supplementary groups (as runc does);
+        // skipping setgroups left the process with the runtime's own groups (gid 0 = root's)
+        if additional_gids.is_empty() {
+            if setgroups.trim() != "deny" {
+                syscall.set_groups(&[]).map_err(|err| {
+                    tracing::error!(?err, "failed to clear supplementary gids");
+                    InitProcessError::SyscallOther(err)
+                })?;
+            }
+            return Ok(());
+        }
 
         if setgroups.trim() == "deny" {
             tracing::error!("cannot set supplementary gids, setgroup is disabled");

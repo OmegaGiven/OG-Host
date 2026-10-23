@@ -130,6 +130,12 @@ fn write_status(path: &PathBuf, s: &Status) {
 }
 
 fn main() {
+    // containers and exec'd processes must not inherit our supplementary groups (root's gid 0
+    // when og-hostd runs as root): the runtime only sets groups that a container asks for
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        eprintln!("og-shim: clearing supplementary groups: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
     let args = match Cli::parse() {
         Cli::Run(a) => a,
         Cli::Sandbox(a) => {

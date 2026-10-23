@@ -810,8 +810,13 @@ impl Node {
                 (ids.uid, ids.gid, ids.additional_gids)
             }
             None => {
+                // the container's own user, with the supplementary groups its process has
                 let (u, g) = self.process_user(id).unwrap_or((0, 0));
-                (u, g, Vec::new())
+                let extra = serde_json::from_slice::<serde_json::Value>(&std::fs::read(self.dir(id).join("bundle/config.json")).unwrap_or_default())
+                    .ok()
+                    .and_then(|c| c["process"]["user"]["additionalGids"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()))
+                    .unwrap_or_default();
+                (u, g, extra)
             }
         };
         let shim = std::env::current_exe()?.with_file_name("og-shim");
