@@ -93,9 +93,104 @@ pub fn default_profile(caps: &[Capability], nested: bool) -> LinuxSeccomp {
     .expect("static seccomp profile is valid")
 }
 
+/// A profile in Docker's seccomp JSON format (what `--security-opt seccomp=profile.json` takes)
+/// for a container holding `caps`: entries are kept or dropped by their `includes` / `excludes`
+/// (capabilities, architectures, minimum kernel) the way Docker does, and the architectures
+/// come from `archMap` for this machine when the profile doesn't list them.
+pub fn from_docker(p: &Value, caps: &[Capability]) -> Result<LinuxSeccomp, String> {
+    let host_arch = architectures().first().copied().unwrap_or("");
+    let cap_names: Vec<String> = caps.iter().filter_map(|c| serde_json::to_value(c).ok()?.as_str().map(String::from)).collect();
+    let kernel = kernel_version();
+    let arches: Vec<Value> = match p.get("architectures").and_then(Value::as_array) {
+        Some(a) if !a.is_empty() => a.clone(),
+        _ => p.get("archMap").and_then(Value::as_array).into_iter().flatten().filter(|m| m["architecture"] == host_arch).flat_map(|m| {
+            std::iter::once(m["architecture"].clone()).chain(m["subArchitectures"].as_array().cloned().unwrap_or_default())
+        }).collect(),
+    };
+    let short_arch = |a: &str| a.trim_start_matches("SCMP_ARCH_").to_ascii_lowercase();
+    let host_short = match std::env::consts::ARCH { "x86_64" => "amd64", "aarch64" => "arm64", a => a };
+    let arch_matches = |list: &Value| list.as_array().is_some_and(|l| l.iter().filter_map(Value::as_str).any(|a| a == host_short || short_arch(a) == short_arch(host_arch)));
+    let mut syscalls = Vec::new();
+    for e in p.get("syscalls").and_then(Value::as_array).into_iter().flatten() {
+        let inc = &e["includes"];
+        let exc = &e["excludes"];
+        let list = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect() };
+        if !list(&inc["caps"]).iter().all(|c| cap_names.contains(c)) {
+            continue;
+        }
+        if inc.get("arches").is_some_and(|a| a.as_array().is_some_and(|l| !l.is_empty())) && !arch_matches(&inc["arches"]) {
+            continue;
+        }
+        if let Some(min) = inc["minKernel"].as_str() {
+            if kernel < parse_version(min) {
+                continue;
+            }
+        }
+        if list(&exc["caps"]).iter().any(|c| cap_names.contains(c)) || arch_matches(&exc["arches"]) {
+            continue;
+        }
+        let mut names = list(&e["names"]);
+        if let Some(n) = e["name"].as_str() {
+            names.push(n.to_string());
+        }
+        if names.is_empty() {
+            continue;
+        }
+        let mut r = json!({ "names": names, "action": e["action"] });
+        for k in ["errnoRet", "args"] {
+            if !e[k].is_null() {
+                r[k] = e[k].clone();
+            }
+        }
+        syscalls.push(r);
+    }
+    let mut out = json!({ "defaultAction": p.get("defaultAction").cloned().unwrap_or(json!("SCMP_ACT_ERRNO")), "architectures": arches, "syscalls": syscalls });
+    if let Some(d) = p.get("defaultErrnoRet") {
+        out["defaultErrnoRet"] = d.clone();
+    }
+    if let Some(f) = p.get("flags") {
+        out["flags"] = f.clone();
+    }
+    serde_json::from_value(out).map_err(|e| e.to_string())
+}
+
+fn parse_version(v: &str) -> (u32, u32) {
+    let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty()).map(|x| x.parse().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+fn kernel_version() -> (u32, u32) {
+    parse_version(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_profile() {
+        let p = json!({
+            "defaultAction": "SCMP_ACT_ERRNO", "defaultErrnoRet": 1,
+            "archMap": [{ "architecture": "SCMP_ARCH_X86_64", "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"] },
+                        { "architecture": "SCMP_ARCH_AARCH64", "subArchitectures": ["SCMP_ARCH_ARM"] }],
+            "syscalls": [
+                { "names": ["read", "write", "exit_group"], "action": "SCMP_ACT_ALLOW" },
+                { "names": ["mount"], "action": "SCMP_ACT_ALLOW", "includes": { "caps": ["CAP_SYS_ADMIN"] } },
+                { "names": ["chown"], "action": "SCMP_ACT_ALLOW", "excludes": { "caps": ["CAP_SYS_ADMIN"] } },
+                { "names": ["personality"], "action": "SCMP_ACT_ALLOW", "args": [{ "index": 0, "value": 0, "op": "SCMP_CMP_EQ" }] }
+            ]
+        });
+        let s = from_docker(&p, &[Capability::Chown]).unwrap();
+        let names: Vec<String> = s.syscalls().as_ref().unwrap().iter().flat_map(|r| r.names().clone()).collect();
+        assert!(names.contains(&"read".into()) && names.contains(&"chown".into()) && names.contains(&"personality".into()));
+        assert!(!names.contains(&"mount".into()));
+        if std::env::consts::ARCH == "x86_64" {
+            assert_eq!(s.architectures().as_ref().unwrap().len(), 3);
+        }
+        let admin = from_docker(&p, &[Capability::SysAdmin]).unwrap();
+        let names: Vec<String> = admin.syscalls().as_ref().unwrap().iter().flat_map(|r| r.names().clone()).collect();
+        assert!(names.contains(&"mount".into()) && !names.contains(&"chown".into()));
+    }
 
     #[test]
     fn caps_lift_rules() {

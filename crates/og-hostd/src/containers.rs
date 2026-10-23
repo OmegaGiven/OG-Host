@@ -79,6 +79,10 @@ pub struct Extra {
     /// Named volumes: (volume dir on host, target in container, read-only).
     pub volumes: Vec<(PathBuf, String, bool)>,
     pub extra_hosts: Vec<(String, String)>,
+    /// DNS servers, search domains and resolver options for the container's /etc/resolv.conf
+    pub dns: Vec<String>,
+    pub dns_search: Vec<String>,
+    pub dns_opt: Vec<String>,
     /// Other services already running in the project (name, ip): known from the start.
     pub peers: Vec<(String, String)>,
     pub healthcheck: Option<og_compose::Healthcheck>,
@@ -361,7 +365,7 @@ impl Node {
         // per-container /etc/resolv.conf, /etc/hosts, /etc/hostname (bind-mounted read-only)
         let etc = dir.join("etc");
         std::fs::create_dir_all(&etc)?;
-        std::fs::write(etc.join("resolv.conf"), og_net::container_resolv_conf())?;
+        std::fs::write(etc.join("resolv.conf"), og_net::container_resolv_conf_with(&extra.dns, &extra.dns_search, &extra.dns_opt))?;
         let gateway = attachment.as_ref().and_then(|a| a.gateway).map(|g| g.to_string()).unwrap_or_else(|| "127.0.0.1".into());
         let extra_hosts: Vec<(String, String)> =
             extra.extra_hosts.iter().map(|(h, ip)| (h.clone(), if ip == "host-gateway" { gateway.clone() } else { ip.clone() })).collect();
@@ -834,6 +838,45 @@ impl Node {
 /// Docker's `seccomp=unconfined` / `seccomp:unconfined` security option.
 pub fn is_seccomp_unconfined(opt: &str) -> bool {
     matches!(opt.trim(), "seccomp=unconfined" | "seccomp:unconfined")
+}
+
+/// A custom seccomp profile from `security_opt`: `seccomp=<file>` (relative to `base`) or the
+/// profile's JSON itself (what the docker CLI sends). Unreadable or invalid = an error, never a
+/// silent fallback to a different profile.
+pub fn seccomp_profile(opts: &[String], base: &Path) -> Result<Option<serde_json::Value>> {
+    for o in opts {
+        let o = o.trim();
+        let Some(v) = o.strip_prefix("seccomp=").or_else(|| o.strip_prefix("seccomp:")) else { continue };
+        if v == "unconfined" || v == "builtin" {
+            continue;
+        }
+        let text = if v.trim_start().starts_with('{') {
+            v.to_string()
+        } else {
+            let p = base.join(v);
+            std::fs::read_to_string(&p).with_context(|| format!("reading seccomp profile {}", p.display()))?
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).context("seccomp profile isn't valid JSON")?;
+        return Ok(Some(json));
+    }
+    Ok(None)
+}
+
+/// `/path[:opt,opt,...]` (compose `tmpfs:` / docker `--tmpfs`) -> (target, size, other options).
+pub fn parse_tmpfs(spec: &str) -> Result<(PathBuf, Option<u64>, Vec<String>)> {
+    let (target, opts) = spec.split_once(':').unwrap_or((spec, ""));
+    let mut size = None;
+    let mut rest = Vec::new();
+    for o in opts.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+        match o.strip_prefix("size=") {
+            Some(v) => size = Some(parse_size(v).with_context(|| format!("tmpfs {target}: size {v:?}"))?.max(0) as u64),
+            None => rest.push(o.to_string()),
+        }
+    }
+    if !target.starts_with('/') {
+        bail!("tmpfs target {target:?} must be an absolute path");
+    }
+    Ok((PathBuf::from(target), size, rest))
 }
 
 /// `/host/path:/container/path[:ro|:rw]`

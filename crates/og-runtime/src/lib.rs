@@ -161,8 +161,8 @@ pub struct RunOptions {
     /// `uid`, `uid:gid`, `name` or `name:group`; resolved inside the rootfs.
     pub user: Option<String>,
     pub mounts: Vec<BindMount>,
-    /// tmpfs mounts (target, size in bytes).
-    pub tmpfs: Vec<(PathBuf, Option<u64>)>,
+    /// tmpfs mounts (target, size in bytes, extra mount options such as `mode=0700`, `noexec`).
+    pub tmpfs: Vec<(PathBuf, Option<u64>, Vec<String>)>,
     /// Host device nodes passed through at the same path (e.g. /dev/net/tun).
     pub devices: Vec<PathBuf>,
     /// CDI devices, e.g. `nvidia.com/gpu=all` (resolved from /etc/cdi, /var/run/cdi).
@@ -175,6 +175,10 @@ pub struct RunOptions {
     pub userns_path: Option<PathBuf>,
     pub cap_add: Vec<Capability>,
     pub cap_drop: Vec<Capability>,
+    /// Start from no capabilities at all (`cap_drop: [ALL]`); `cap_add` still applies.
+    pub cap_drop_all: bool,
+    /// A seccomp profile in Docker's JSON format instead of the default one.
+    pub seccomp_profile: Option<serde_json::Value>,
     /// Run without the default seccomp profile (Docker's `--security-opt seccomp=unconfined`).
     pub seccomp_unconfined: bool,
     pub read_only_root: bool,
@@ -221,6 +225,8 @@ impl RunOptions {
             userns_path: None,
             cap_add: Vec::new(),
             cap_drop: Vec::new(),
+            cap_drop_all: false,
+            seccomp_profile: None,
             seccomp_unconfined: false,
             read_only_root: false,
             memory_max: None,
@@ -324,7 +330,7 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
     let ids = users::resolve(&opts.rootfs, user_spec.as_deref()).map_err(|e| Error::Invalid(e.to_string()))?;
 
     // capabilities: Docker default + add - drop; the same set for every capability list
-    let mut caps: Vec<Capability> = DOCKER_DEFAULT_CAPS.to_vec();
+    let mut caps: Vec<Capability> = if opts.cap_drop_all { Vec::new() } else { DOCKER_DEFAULT_CAPS.to_vec() };
     for c in &opts.cap_add {
         if !caps.contains(c) {
             caps.push(*c);
@@ -423,13 +429,23 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
             );
         }
     }
-    for (target, size) in &opts.tmpfs {
+    for (target, size, extra) in &opts.tmpfs {
         if !target.is_absolute() {
             return Err(Error::Invalid(format!("tmpfs target {} must be absolute", target.display())));
         }
         let mut o = vec!["nosuid".to_string(), "nodev".to_string(), "mode=1777".to_string()];
         if let Some(sz) = size {
             o.push(format!("size={sz}"));
+        }
+        for x in extra {
+            let key = x.split('=').next().unwrap_or(x);
+            if !matches!(key, "mode" | "uid" | "gid" | "nr_inodes" | "noexec" | "exec" | "nosuid" | "suid" | "nodev" | "dev" | "ro" | "rw" | "noatime" | "relatime" | "strictatime" | "size") {
+                return Err(Error::Invalid(format!("tmpfs {}: option {x:?} isn't supported", target.display())));
+            }
+            // a later option wins over the default with the same key (mode=), or its opposite (exec)
+            let opposite = |a: &str| match a { "exec" => Some("noexec"), "noexec" => Some("exec"), "suid" => Some("nosuid"), "nosuid" => Some("suid"), "dev" => Some("nodev"), "nodev" => Some("dev"), "ro" => Some("rw"), "rw" => Some("ro"), _ => None };
+            o.retain(|y| y.split('=').next() != Some(key) && Some(y.as_str()) != opposite(key));
+            o.push(x.clone());
         }
         mounts.push(MountBuilder::default().destination(target.clone()).typ("tmpfs".to_string()).source(PathBuf::from("tmpfs")).options(o).build()?);
     }
@@ -548,7 +564,11 @@ pub fn build_spec(image: &ImageConfig, opts: &RunOptions) -> Result<Spec> {
         linux = linux.uid_mappings(vec![m]).gid_mappings(vec![m]);
     }
     if !opts.seccomp_unconfined {
-        linux = linux.seccomp(seccomp::default_profile(&caps, opts.desktop));
+        let profile = match &opts.seccomp_profile {
+            Some(p) => seccomp::from_docker(p, &caps).map_err(|e| Error::Invalid(format!("seccomp profile: {e}")))?,
+            None => seccomp::default_profile(&caps, opts.desktop),
+        };
+        linux = linux.seccomp(profile);
     }
 
     // CDI hooks (e.g. nvidia-cdi-hook update-ldcache / create-symlinks)

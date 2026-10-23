@@ -4,6 +4,9 @@ set -eu
 R=$1
 install -m 0755 /src/target-debian/release/og-hostd /src/target-debian/release/og-shim "$R/usr/local/bin/"
 install -m 0644 /src/packaging/og-hostd.service "$R/etc/systemd/system/og-hostd.service"
+# BuildKit (fetched and checked by build.sh): buildkitd, buildctl and its runc
+tar -xzf /out/cache/buildkit-*.linux-amd64.tar.gz -C "$R/usr/local" bin/buildkitd bin/buildctl bin/buildkit-runc
+install -m 0644 /src/packaging/og-buildkitd.service "$R/etc/systemd/system/og-buildkitd.service"
 cp -r /src/iso/overlay/. "$R/"
 
 # apt: Debian trixie with security and point-release updates
@@ -50,7 +53,7 @@ echo 'LANG=C.UTF-8' > "$R/etc/default/locale"
 ln -sf /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
 # NFS v4 needs no portmapper: rpcbind stays off (port 111); an NFS v3 mount still starts it
 chroot "$R" systemctl disable rpcbind.service rpcbind.socket >/dev/null 2>&1 || true
-chroot "$R" systemctl enable systemd-networkd systemd-resolved systemd-timesyncd ssh og-hostd og-installer og-live-shell >/dev/null 2>&1
+chroot "$R" systemctl enable systemd-networkd systemd-resolved systemd-timesyncd ssh og-hostd og-buildkitd og-installer og-live-shell >/dev/null 2>&1
 # the install medium's root is locked; the installer sets a password
 chroot "$R" passwd -l root >/dev/null
 # fresh identity per install (and per live boot)

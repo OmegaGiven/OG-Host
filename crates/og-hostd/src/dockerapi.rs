@@ -521,6 +521,11 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
     if seccomp_unconfined && ctx.scope.is_some() {
         return Err(DErr(StatusCode::FORBIDDEN, "seccomp=unconfined is not allowed on this socket".into()));
     }
+    let seccomp_profile = crate::containers::seccomp_profile(&str_vec(&hc["SecurityOpt"]), &ctx.d.root).map_err(|e| DErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if seccomp_profile.is_some() && ctx.scope.is_some() {
+        // a client's own profile could allow what the default refuses
+        return Err(DErr(StatusCode::FORBIDDEN, "custom seccomp profiles are not allowed on this socket".into()));
+    }
     if b.tty == Some(true) {
         warnings.push("TTY is not supported yet; output is captured as plain logs".to_string());
     }
@@ -592,13 +597,23 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
         match typ {
             "bind" => binds.push(og_runtime::BindMount { source: PathBuf::from(src), target: PathBuf::from(dst), read_only: ro }),
             "volume" => volumes.push((ctx.d.root.join("volumes").join(if src.is_empty() { "anon" } else { src }), dst.to_string(), ro)),
-            "tmpfs" => tmpfs.push((PathBuf::from(dst), mnt["TmpfsOptions"]["SizeBytes"].as_u64())),
+            "tmpfs" => {
+                let mut o = Vec::new();
+                if let Some(m) = mnt["TmpfsOptions"]["Mode"].as_u64() {
+                    o.push(format!("mode={m:o}"));
+                }
+                tmpfs.push((PathBuf::from(dst), mnt["TmpfsOptions"]["SizeBytes"].as_u64(), o))
+            }
             other => warnings.push(format!("mount type {other} not supported")),
         }
     }
     if let Some(t) = hc["Tmpfs"].as_object() {
-        for k in t.keys() {
-            tmpfs.push((PathBuf::from(k), None));
+        for (k, v) in t {
+            let spec = match v.as_str().filter(|o| !o.is_empty()) {
+                Some(o) => format!("{k}:{o}"),
+                None => k.clone(),
+            };
+            tmpfs.push(crate::containers::parse_tmpfs(&spec).map_err(|e| DErr(StatusCode::BAD_REQUEST, format!("{e:#}")))?);
         }
     }
 
@@ -637,6 +652,7 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
     };
     let cap_add = caps("CapAdd")?;
     let cap_drop = caps("CapDrop")?;
+    let cap_drop_all = str_vec(&hc["CapDrop"]).iter().any(|c| c.eq_ignore_ascii_case("all"));
     let restart = hc["RestartPolicy"]["Name"].as_str().filter(|n| !n.is_empty() && *n != "no").map(|n| {
         let max = hc["RestartPolicy"]["MaximumRetryCount"].as_u64().unwrap_or(0);
         if n == "on-failure" && max > 0 { format!("on-failure:{max}") } else { n.to_string() }
@@ -668,6 +684,9 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
         restart,
         volumes,
         extra_hosts,
+        dns: str_vec(&hc["Dns"]),
+        dns_search: str_vec(&hc["DnsSearch"]),
+        dns_opt: str_vec(&hc["DnsOptions"]),
         labels,
         auto_remove: hc["AutoRemove"].as_bool().unwrap_or(false),
         no_start: true,
@@ -710,6 +729,8 @@ async fn container_create(State(ctx): State<Ctx>, Query(q): Query<NameQ>, Json(b
             o.seccomp_unconfined = seccomp_unconfined;
             o.cap_add = cap_add;
             o.cap_drop = cap_drop;
+            o.cap_drop_all = cap_drop_all;
+            o.seccomp_profile = seccomp_profile;
             o.memory_max = memory;
             o.memory_low = memory_low;
             o.shm_size = shm;

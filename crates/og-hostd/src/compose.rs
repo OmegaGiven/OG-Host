@@ -110,14 +110,16 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
                     binds.push(og_runtime::BindMount { source: std::fs::canonicalize(&src)?, target: PathBuf::from(&m.target), read_only: m.read_only });
                 }
                 MountKind::Volume => volumes.push((volume_dir(root, p, &m.source), m.target.clone(), m.read_only)),
-                MountKind::Tmpfs => tmpfs.push((PathBuf::from(&m.target), None)),
+                MountKind::Tmpfs => tmpfs.push((PathBuf::from(&m.target), None, Vec::new())),
             }
         }
+        for t in &s.tmpfs {
+            tmpfs.push(crate::containers::parse_tmpfs(t).with_context(|| format!("service {}", s.name))?);
+        }
+        let seccomp_profile = crate::containers::seccomp_profile(&s.security_opt, &p.dir).with_context(|| format!("service {}", s.name))?;
         let cap_add = s.cap_add.iter().map(|c| capability(c)).collect::<Result<Vec<_>>>()?;
         let cap_drop = s.cap_drop.iter().filter(|c| c.to_ascii_uppercase() != "ALL").map(|c| capability(c)).collect::<Result<Vec<_>>>()?;
-        if s.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("all")) {
-            eprintln!("warning: {}: cap_drop ALL not supported yet, using the default set", s.name);
-        }
+        let cap_drop_all = s.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("all"));
         let devices: Vec<PathBuf> = s.devices.iter().filter(|d| d.starts_with('/')).map(|d| PathBuf::from(d.split(':').next().unwrap_or(d))).collect();
         let memory = s.mem_limit.as_deref().map(parse_size).transpose()?;
         let mut io_limits: Vec<og_runtime::IoLimit> = Vec::new();
@@ -154,6 +156,9 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
             restart: s.restart.clone(),
             volumes,
             extra_hosts: s.extra_hosts.clone(),
+            dns: s.dns.clone(),
+            dns_search: s.dns_search.clone(),
+            dns_opt: s.dns_opt.clone(),
             peers: project_peers(node, &p.name)?,
             healthcheck: s.healthcheck.clone(),
             labels: {
@@ -197,6 +202,9 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
                 }
                 o.cap_add = cap_add;
                 o.cap_drop = cap_drop;
+                o.cap_drop_all = cap_drop_all;
+                o.read_only_root = svc.read_only;
+                o.seccomp_profile = seccomp_profile.clone();
                 o.memory_max = memory;
                 o.memory_low = svc.mem_reservation.as_deref().and_then(|v| crate::containers::parse_size(v).ok());
                 o.cpu_quota = svc.cpus.map(|c| ((c * 100_000.0).round() as i64, 100_000));
