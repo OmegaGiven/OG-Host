@@ -1171,6 +1171,8 @@ struct LogsQ {
     follow: Option<String>,
     tail: Option<String>,
     timestamps: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
 }
 
 /// Docker's multiplexed stream framing: [stream, 0, 0, 0, len(u32 BE)] + payload.
@@ -1186,21 +1188,42 @@ async fn container_logs(State(ctx): State<Ctx>, UrlPath(id): UrlPath<String>, Qu
     let m = find(&ctx, &id)?;
     let path = ctx.d.node.log_path(&m.id);
     let text = std::fs::read(&path).unwrap_or_default();
-    let lines: Vec<&[u8]> = text.split_inclusive(|b| *b == b'\n').collect();
+    // each line with the time it was written (from the log index, ~2 s resolution)
+    let recs = crate::logidx::read(&path);
+    let now = crate::logidx::now_ns();
+    let since = q.since.as_deref().and_then(crate::logidx::parse_time).filter(|t| *t > 0);
+    let until = q.until.as_deref().and_then(crate::logidx::parse_time).filter(|t| *t > 0);
+    let mut lines: Vec<(u64, &[u8])> = Vec::new();
+    let mut off = 0u64;
+    for l in text.split_inclusive(|b| *b == b'\n') {
+        let t = crate::logidx::time_at(&recs, off, now);
+        off += l.len() as u64;
+        if since.is_some_and(|s| t < s) || until.is_some_and(|u| t > u) {
+            continue;
+        }
+        lines.push((t, l));
+    }
     let start = match q.tail.as_deref() {
         Some("all") | None => 0,
         Some(n) => lines.len().saturating_sub(n.parse().unwrap_or(lines.len())),
     };
-    let _ = truthy(&q.timestamps); // timestamps aren't recorded per line yet
+    let stamps = truthy(&q.timestamps);
     let mut first = Vec::new();
-    for l in &lines[start..] {
-        first.extend(frame(1, l));
+    for (t, l) in &lines[start..] {
+        if stamps {
+            let mut v = format!("{} ", crate::logidx::rfc3339(*t)).into_bytes();
+            v.extend_from_slice(l);
+            first.extend(frame(1, &v));
+        } else {
+            first.extend(frame(1, l));
+        }
     }
-    let follow = truthy(&q.follow);
+    // docker doesn't follow past `until`
+    let follow = truthy(&q.follow) && until.is_none_or(|u| u > now);
     let offset = text.len() as u64;
     let d = ctx.d.clone();
     let mid = m.id.clone();
-    let stream = async_stream(first, follow, path, offset, d, mid);
+    let stream = async_stream(first, follow, path, offset, d, mid, stamps);
     Ok(Response::builder().header(header::CONTENT_TYPE, "application/vnd.docker.multiplexed-stream").body(Body::from_stream(stream)).unwrap())
 }
 
@@ -1209,17 +1232,20 @@ fn async_stream(
     first: Vec<u8>,
     follow: bool,
     path: PathBuf,
-    mut offset: u64,
+    offset: u64,
     d: Arc<Daemon>,
     id: String,
+    stamps: bool,
 ) -> impl futures_util::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>> {
-    futures_util::stream::unfold((Some(first), follow), move |(pending, follow)| {
+    // the read position lives in the stream's state: a captured `mut` would be copied into each
+    // future, so every poll would resend everything since the start (it did: MBs per second)
+    futures_util::stream::unfold((Some(first), follow, true, offset), move |(pending, follow, mut line_start, mut offset)| {
         let path = path.clone();
         let d = d.clone();
         let id = id.clone();
         async move {
             if let Some(p) = pending {
-                return Some((Ok(axum::body::Bytes::from(p)), (None, follow)));
+                return Some((Ok(axum::body::Bytes::from(p)), (None, follow, line_start, offset)));
             }
             if !follow {
                 return None;
@@ -1233,7 +1259,23 @@ fn async_stream(
                     let mut buf = Vec::new();
                     f.read_to_end(&mut buf).ok()?;
                     offset += buf.len() as u64;
-                    return Some((Ok(axum::body::Bytes::from(frame(1, &buf))), (None, true)));
+                    if !stamps {
+                        return Some((Ok(axum::body::Bytes::from(frame(1, &buf))), (None, true, line_start, offset)));
+                    }
+                    // one frame per line, each with the time it showed up
+                    let ts = crate::logidx::rfc3339(crate::logidx::now_ns());
+                    let mut out = Vec::new();
+                    for l in buf.split_inclusive(|b| *b == b'\n') {
+                        let mut v = Vec::with_capacity(l.len() + 32);
+                        if line_start {
+                            v.extend_from_slice(ts.as_bytes());
+                            v.push(b' ');
+                        }
+                        v.extend_from_slice(l);
+                        line_start = l.ends_with(b"\n");
+                        out.extend(frame(1, &v));
+                    }
+                    return Some((Ok(axum::body::Bytes::from(out)), (None, true, line_start, offset)));
                 }
                 if d.node.status(&id).state != "running" {
                     return None;

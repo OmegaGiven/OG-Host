@@ -299,6 +299,14 @@ impl Daemon {
             .map(|(m, _)| (m.id.clone(), m.name.clone(), m.net.as_ref().and_then(|a| a.host_veth.clone())))
             .collect();
         let snap = self.hub.sample(&running);
+        // when each part of every running container's log appeared (Docker API since= / timestamps=)
+        let mut logs = std::collections::HashSet::new();
+        for (m, st) in list.iter().filter(|(_, st)| st.state == "running") {
+            let p = self.node.log_path(&m.id);
+            crate::logidx::observe(&p, st.started_at.unwrap_or(0) * 1_000_000_000);
+            logs.insert(p);
+        }
+        crate::logidx::retain(&logs);
         let gpus = self.brain.lock().unwrap().last_gpus.clone();
         static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 5 == 1 {

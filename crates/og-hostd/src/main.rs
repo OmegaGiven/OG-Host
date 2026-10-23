@@ -19,6 +19,7 @@ mod hostnet;
 mod installer;
 mod idmap;
 mod labnode;
+mod logidx;
 mod migrate;
 mod pools;
 mod resources;
