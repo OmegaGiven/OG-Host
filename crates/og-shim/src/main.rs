@@ -130,6 +130,10 @@ fn write_status(path: &PathBuf, s: &Status) {
 }
 
 fn main() {
+    // OG_SHIM_DEBUG=1 (inherited from og-hostd): the runtime's own diagnostics go to shim.log
+    if std::env::var_os("OG_SHIM_DEBUG").is_some() {
+        let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).with_env_filter(tracing_subscriber::EnvFilter::new("debug")).try_init();
+    }
     // containers and exec'd processes must not inherit our supplementary groups (root's gid 0
     // when og-hostd runs as root): the runtime only sets groups that a container asks for
     if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {

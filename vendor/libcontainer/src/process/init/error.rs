@@ -32,7 +32,7 @@ pub enum InitProcessError {
     Tty(#[source] tty::TTYError),
     #[error("failed to run hooks")]
     Hooks(#[from] hooks::HookError),
-    #[error("failed to prepare rootfs")]
+    #[error("failed to prepare rootfs: {0:?}")]
     RootFS(#[source] rootfs::RootfsError),
     #[error("failed syscall")]
     SyscallOther(#[source] SyscallError),

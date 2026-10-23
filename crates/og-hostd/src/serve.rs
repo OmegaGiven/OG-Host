@@ -126,6 +126,16 @@ fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::
 pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_scopes: Vec<String>, scope_labels: Vec<String>, tls: Option<(String, crate::tls::CertFiles)>, lab: bool, cluster_port: u16) -> Result<()> {
     let lab = if lab { Some(og_lab::Lab::open(&root.join("lab")).await.context("starting the lab control plane")?) } else { None };
     let token = if listen.is_some() || tls.is_some() { Some(load_or_create_token(&root)?) } else { None };
+    // /run/og-host must be searchable by containers' (unprivileged) setup processes: their
+    // id-mapped bind mounts are staged under it. Whoever creates it first (og-buildkitd makes
+    // it 0770 for its socket) mustn't decide that; the sockets in it are 0600/0660 themselves.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::create_dir_all("/run/og-host");
+        if let Err(e) = std::fs::set_permissions("/run/og-host", std::fs::Permissions::from_mode(0o755)) {
+            eprintln!("og-hostd: /run/og-host permissions: {e}");
+        }
+    }
     crate::memcheck::on_start(&root);
     crate::memcheck::reapply(&root);
     let metric_store = Arc::new(og_lab::metrics::Metrics::open(&root.join("metrics.db")).context("opening the metrics history")?);

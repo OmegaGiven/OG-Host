@@ -3,6 +3,8 @@ Description=BuildKit for OG-Host image builds (unix:///run/og-host/buildkit.sock
 After=network-online.target
 
 [Service]
+# /run/og-host is og-hostd's; created here with og-hostd's mode in case this starts first
+ExecStartPre=/usr/bin/install -d -m 0755 /run/og-host
 ExecStart=/usr/local/bin/buildkitd --addr unix:///run/og-host/buildkit.sock --root /var/lib/og-host/buildkit --oci-worker=true --containerd-worker=false --oci-worker-net=host
 Restart=always
 
