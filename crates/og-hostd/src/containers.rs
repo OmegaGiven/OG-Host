@@ -516,6 +516,10 @@ impl Node {
         let mounted = mounted_paths();
         let sandbox = dir.join("sandbox");
         let own_sandbox = !meta.userns_host && (meta.network_mode == "none" || (meta.net.as_ref().is_some_and(|a| a.network.is_some()) && !meta.network_mode.starts_with("container:")));
+        // userns_mode host + network none: a host-owned netns (it lives in /run: gone after a reboot)
+        if meta.userns_host && meta.network_mode == "none" {
+            self.net.create_netns(&meta.id)?;
+        }
         if own_sandbox && !mounted.contains(&sandbox.join("user")) {
             let _ = self.net.detach_netns_only(&meta.id);
             self.create_sandbox(&meta.id, &sandbox, IdMap::default())?;
