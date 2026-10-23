@@ -137,6 +137,18 @@ enum Cmd {
     Ps,
     /// Print a container's output.
     Logs { container: String },
+    /// Run a command in a running container (stdin, stdout and stderr are passed through), like docker exec -i
+    Exec {
+        #[arg(short, long)]
+        user: Option<String>,
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        #[arg(short = 'w', long)]
+        workdir: Option<String>,
+        container: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
     /// Stop a container (SIGTERM, then SIGKILL after the timeout).
     Stop {
         container: String,
@@ -518,6 +530,11 @@ async fn main() -> Result<()> {
         Cmd::Logs { container } => {
             let m = node.find(&container)?;
             print!("{}", String::from_utf8_lossy(&std::fs::read(node.log_path(&m.id)).unwrap_or_default()));
+        }
+        Cmd::Exec { user, env, workdir, container, command } => {
+            let m = node.find(&container)?;
+            let status = node.exec_command(&m.id, &command, user.as_deref(), &env, workdir.as_deref())?.status()?;
+            std::process::exit(status.code().unwrap_or(1));
         }
         Cmd::Stop { container, timeout } => {
             let m = node.find(&container)?;
