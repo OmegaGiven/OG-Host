@@ -374,12 +374,12 @@ let chartData = null;
 async function drawHistory() {
   const range = S.hist_range;
   let pts;
-  if (range <= 3600) {
+  if (range && range <= 3600) {
     const cut = now() - range;
     pts = S.hist.filter((p) => p.t >= cut);
   } else {
     const m = await api(`/v1/metrics?range=${range}`);
-    pts = m.t.map((t, i) => ({ t, cpu: m.cpu[i], mem: m.mem[i], rx: m.rx[i], tx: m.tx[i], dr: m.dr[i], dw: m.dw[i] }));
+    pts = m.t.map((t, i) => ({ t, cpu: m.cpu[i], mem: m.mem[i], rx: m.rx[i], tx: m.tx[i], dr: m.dr[i], dw: m.dw[i] })).filter((p) => p.cpu != null);
   }
   chartData = pts;
   renderChart();
@@ -412,7 +412,8 @@ function renderChart(hoverX) {
   const X = (t) => padL + ((t - t0) / span) * w;
   const Y = (v) => padT + h - clamp(v / max, 0, 1) * h;
   g.textAlign = 'center';
-  for (let i = 0; i <= 4; i++) { const t = t0 + (span * i) / 4; g.fillText(clock(t), clamp(X(t), padL + 20, W - padR - 20), H - 5); }
+  const tl = (t) => (span > 2 * 86400 ? new Date(t * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', ...(span > 300 * 86400 ? { year: '2-digit' } : {}) }) : clock(t));
+  for (let i = 0; i <= 4; i++) { const t = t0 + (span * i) / 4; g.fillText(tl(t), clamp(X(t), padL + 24, W - padR - 24), H - 5); }
   ser.keys.forEach((k, si) => {
     const c = si ? col.b : col.a;
     g.beginPath();
@@ -431,7 +432,7 @@ function renderChart(hoverX) {
   const x = X(best.t);
   g.strokeStyle = col.text; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, padT + h); g.stroke(); g.setLineDash([]);
   tip.hidden = false;
-  tip.innerHTML = `${clock(best.t)}<br>${ser.keys.map((k, i) => `${ser.names ? ser.names[i] + ' ' : ''}<b>${ser.fmt(best[k])}</b>`).join('<br>')}`;
+  tip.innerHTML = `${span > 2 * 86400 ? new Date(best.t * 1000).toLocaleString() : clock(best.t)}<br>${ser.keys.map((k, i) => `${ser.names ? ser.names[i] + ' ' : ''}<b>${ser.fmt(best[k])}</b>`).join('<br>')}`;
   tip.style.left = `${clamp(x + 14, 0, W - 140)}px`; tip.style.top = '18px';
 }
 $('#histChart').addEventListener('mousemove', (e) => renderChart(e.offsetX));
@@ -504,7 +505,7 @@ function paintOverview() {
       <div class="chips">${Object.entries(counts).map(([k, v]) => `<span class="chip ${k === 'running' ? 'good' : /failed|memory|exited \(|unhealthy/.test(k) ? 'crit' : k === 'evicted' ? 'warn' : ''}">${v} ${esc(k)}</span>`).join('')}</div></div>`;
   paintGpus();
   paintTop();
-  if (S.hist_range <= 3600) { const cut = now() - S.hist_range; chartData = S.hist.filter((p) => p.t >= cut); renderChart(); }
+  if (S.hist_range && S.hist_range <= 3600) { const cut = now() - S.hist_range; chartData = S.hist.filter((p) => p.t >= cut); renderChart(); }
 }
 
 function paintGpus() {

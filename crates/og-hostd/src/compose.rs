@@ -118,7 +118,7 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
         if s.cap_drop.iter().any(|c| c.eq_ignore_ascii_case("all")) {
             eprintln!("warning: {}: cap_drop ALL not supported yet, using the default set", s.name);
         }
-        let devices: Vec<PathBuf> = s.devices.iter().map(|d| PathBuf::from(d.split(':').next().unwrap_or(d))).collect();
+        let devices: Vec<PathBuf> = s.devices.iter().filter(|d| d.starts_with('/')).map(|d| PathBuf::from(d.split(':').next().unwrap_or(d))).collect();
         let memory = s.mem_limit.as_deref().map(parse_size).transpose()?;
         let mut io_limits: Vec<og_runtime::IoLimit> = Vec::new();
         for (path, kind, rate) in &s.blkio_devices {
@@ -187,7 +187,13 @@ pub async fn up(node: &Node, root: &Path, store: &Store, p: &Project, rebuild: b
                 o.devices = devices;
                 o.seccomp_unconfined = svc.security_opt.iter().any(|x| crate::containers::is_seccomp_unconfined(x));
                 if svc.gpus {
-                    o.cdi_devices = vec!["nvidia.com/gpu=all".into()];
+                    o.cdi_devices = if svc.gpu_ids.is_empty() { vec!["nvidia.com/gpu=all".into()] } else { svc.gpu_ids.iter().map(|i| format!("nvidia.com/gpu={i}")).collect() };
+                }
+                // CDI names in `devices:` (as Docker accepts them), e.g. nvidia.com/gpu=0
+                for d in &svc.devices {
+                    if d.split_once('=').is_some_and(|(k, _)| k.contains('/') && !k.starts_with('/')) {
+                        o.cdi_devices.push(d.clone());
+                    }
                 }
                 o.cap_add = cap_add;
                 o.cap_drop = cap_drop;

@@ -12,6 +12,7 @@ const TABS = [
   ['audit', 'note', 'Audit log', 'Access.Audit'],
   ['firewall', 'shield', 'Firewall', 'Sys.Audit', '/system'],
   ['updates', 'download', 'Updates', 'Sys.Audit', '/system'],
+  ['history', 'chart', 'History', 'Sys.Audit', '/'],
   ['ai', 'sparkle', 'AI', 'Sys.Modify', '/'],
 ];
 let cur = 'account';
@@ -36,7 +37,7 @@ function open(tab) {
   $('#setTabs').hidden = tabs.length < 2;
   $('#setMeta').textContent = S.me ? `signed in as ${S.me.user}` : '';
   $('#setBody').innerHTML = '<p class="muted">Loading…</p>';
-  ({ account, users, groups, roles, acl, tokens, audit, firewall, updates, ai })[cur]().catch(fail);
+  ({ account, users, groups, roles, acl, tokens, audit, firewall, updates, history, ai })[cur]().catch(fail);
 }
 const again = () => open(cur);
 
@@ -415,6 +416,45 @@ async function updates() {
     '#pkRefresh': () => api('/v1/update/packages', { method: 'POST', body: { upgrade: false } }).then((r) => H.taskLog(r.task, () => updates()), fail),
     '#pkUpgrade': async () => { if (await H.confirmBox('Upgrade system packages?', 'Runs apt-get full-upgrade on this server. Some services may restart.', 'Upgrade')) api('/v1/update/packages', { method: 'POST', body: { upgrade: true } }).then((r) => H.taskLog(r.task, () => updates()), fail); },
   });
+}
+
+// ---------------------------------------------------------------- metric history
+async function history() {
+  const h = await api('/v1/metrics/retention');
+  const r = h.retention, u = h.usage;
+  const edit = H.can('Sys.Modify', '/');
+  const dis = edit ? '' : 'disabled';
+  const size = (b) => (b > 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.max(0.1, b / 1e6).toFixed(1)} MB`);
+  $('#setBody').innerHTML = `
+    <div class="set-grid">
+      <div class="panel set-card">
+        <h3>${ic('chart')}How long to keep history</h3>
+        <p class="muted small">Every 10 s this server records itself, each container, VM and GPU. Older points are averaged into minutes, then hours.</p>
+        <form class="form" id="hiForm">
+          <div class="row2"><label>10-second points, days<input name="raw_days" type="number" min="1" max="90" value="${r.raw_days}" ${dis}></label>
+          <label>1-minute points, days<input name="minute_days" type="number" min="1" max="3650" value="${r.minute_days}" ${dis}></label></div>
+          <label>1-hour points<select name="hour_mode" ${dis}><option value="forever" ${r.hour_days ? '' : 'selected'}>keep forever</option><option value="days" ${r.hour_days ? 'selected' : ''}>for a number of days</option></select></label>
+          <label id="hiDaysL" ${r.hour_days ? '' : 'hidden'}>1-hour points, days<input name="hour_days" type="number" min="1" max="36500" value="${r.hour_days || 365}" ${dis}></label>
+          ${edit ? '<button class="primary-btn">Save</button>' : ''}
+        </form>
+      </div>
+      <div class="panel set-card">
+        <h3>${ic('hdd')}Stored now</h3>
+        <p><b>${size(u.bytes)}</b> on disk${u.oldest ? `, since ${esc(new Date(u.oldest).toLocaleString())}` : ''}.</p>
+        <p class="muted small">Roughly 1 MB per series per year of hourly points; a busy server with 30 containers stays well under 1 GB a year.</p>
+      </div>
+    </div>`;
+  H.hydrateIcons($('#setBody'));
+  const f = $('#hiForm');
+  f.hour_mode.onchange = () => { $('#hiDaysL').hidden = f.hour_mode.value !== 'days'; };
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(f).entries());
+    try {
+      await api('/v1/metrics/retention', { method: 'PUT', body: { raw_days: +v.raw_days, minute_days: +v.minute_days, hour_days: v.hour_mode === 'forever' ? 0 : +v.hour_days } });
+      toast('Saved'); history();
+    } catch (err) { fail(err); }
+  };
 }
 
 function availHtml(a) {

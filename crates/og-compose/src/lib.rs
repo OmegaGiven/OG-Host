@@ -113,6 +113,8 @@ pub struct Service {
     pub labels: BTreeMap<String, String>,
     pub privileged: bool,
     pub gpus: bool,
+    /// GPUs asked for by index or UUID (`device_ids`); empty with `gpus` = all of them
+    pub gpu_ids: Vec<String>,
     pub stop_grace_s: Option<u64>,
 }
 
@@ -540,6 +542,16 @@ pub fn load(file: &Path, project_name: Option<&str>, env: &interp::Vars) -> Resu
                     })
                 });
 
+        let gpu_ids: Vec<String> = deploy
+            .and_then(|d| d.get("resources"))
+            .and_then(|r| r.get("reservations"))
+            .and_then(|r| r.get("devices"))
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+            .flat_map(|d| str_list(d.get("device_ids")))
+            .collect();
+
         let svc_networks = match get("networks") {
             Some(Value::Mapping(n)) => n.keys().filter_map(s).collect(),
             other => str_list(other),
@@ -585,6 +597,7 @@ pub fn load(file: &Path, project_name: Option<&str>, env: &interp::Vars) -> Resu
             labels,
             privileged: matches!(get("privileged"), Some(Value::Bool(true))),
             gpus,
+            gpu_ids,
             stop_grace_s: get("stop_grace_period").map(|v| duration_s(Some(v), 10)),
         };
         if svc.image.is_none() && svc.build.is_none() {
