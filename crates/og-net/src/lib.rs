@@ -336,6 +336,11 @@ impl Net {
                chain forward {{ type filter hook forward priority filter; policy accept; }}\n\
              }}\n"
         ))?;
+        // published ports are reachable from every network, as with Docker: a connection that was
+        // DNAT'd to a container's published port passes the isolation rules below
+        if !self.table_has_comment("og-net:published")? {
+            nft_apply(&format!("insert rule ip {TABLE} forward ct status dnat accept comment \"og-net:published\"\n"))?;
+        }
         Ok(())
     }
 
