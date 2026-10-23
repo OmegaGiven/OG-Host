@@ -91,11 +91,71 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Serve `router` over TLS on `addr` until the process ends.
+/// This node's name on its tailnet (e.g. `og-host2.tail6c6721.ts.net`), when Tailscale can
+/// issue certificates for it.
+fn tailscale_name() -> Option<String> {
+    let out = std::process::Command::new("tailscale").args(["status", "--json"]).output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    if v["CertDomains"].as_array().is_none_or(|a| a.is_empty()) {
+        return None;
+    }
+    v["Self"]["DNSName"].as_str().map(|n| n.trim_end_matches('.').to_string()).filter(|n| !n.is_empty())
+}
+
+/// Get (or renew) a real certificate for the tailnet name; `tailscale cert` only contacts
+/// Let's Encrypt when the current one is close to expiry.
+fn tailscale_cert(dir: &Path, name: &str) -> Option<CertFiles> {
+    let files = CertFiles { cert: dir.join("tailscale.crt"), key: dir.join("tailscale.key") };
+    let ok = std::process::Command::new("tailscale")
+        .arg("cert")
+        .arg("--cert-file")
+        .arg(&files.cert)
+        .arg("--key-file")
+        .arg(&files.key)
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    (ok || (files.cert.exists() && files.key.exists())).then_some(files)
+}
+
+struct Certs {
+    default: (Arc<rustls::ServerConfig>, Option<SystemTime>, Option<SystemTime>),
+    /// (name, config, cert mtime) for connections to the tailnet name
+    tailnet: Option<(String, Arc<rustls::ServerConfig>, Option<SystemTime>)>,
+}
+
+/// Serve `router` over TLS on `addr` until the process ends. Connections to this node's
+/// tailnet name get a real certificate from Tailscale (renewed daily); everything else
+/// (addresses, the plain host name) the configured or self-signed one.
 pub async fn serve(addr: &str, files: CertFiles, router: axum::Router) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
-    let current = Arc::new(Mutex::new((load_config(&files)?, mtime(&files.cert), mtime(&files.key))));
+    let certs = Arc::new(Mutex::new(Certs { default: (load_config(&files)?, mtime(&files.cert), mtime(&files.key)), tailnet: None }));
     eprintln!("og-hostd: web UI and API on https://{addr} (certificate {})", files.cert.display());
+    if let Some(dir) = files.cert.parent().map(Path::to_path_buf) {
+        let c = certs.clone();
+        tokio::spawn(async move {
+            loop {
+                let d = dir.clone();
+                let got = tokio::task::spawn_blocking(move || tailscale_name().and_then(|n| tailscale_cert(&d, &n).map(|f| (n, f)))).await.ok().flatten();
+                if let Some((name, f)) = got {
+                    let m = mtime(&f.cert);
+                    let fresh = c.lock().unwrap().tailnet.as_ref().is_none_or(|t| t.0 != name || t.2 != m);
+                    if fresh {
+                        match load_config(&f) {
+                            Ok(cfg) => {
+                                eprintln!("og-hostd: https://{name}: certificate from Tailscale");
+                                c.lock().unwrap().tailnet = Some((name, cfg, m));
+                            }
+                            Err(e) => eprintln!("og-hostd: tailscale certificate: {e:#}"),
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -105,23 +165,35 @@ pub async fn serve(addr: &str, files: CertFiles, router: axum::Router) -> Result
             }
         };
         // pick up a renewed certificate
-        let cfg = {
-            let mut c = current.lock().unwrap();
+        {
+            let mut c = certs.lock().unwrap();
             let (cm, km) = (mtime(&files.cert), mtime(&files.key));
-            if cm != c.1 || km != c.2 {
+            if cm != c.default.1 || km != c.default.2 {
                 match load_config(&files) {
-                    Ok(n) => *c = (n, cm, km),
+                    Ok(n) => c.default = (n, cm, km),
                     Err(e) => eprintln!("og-hostd: keeping the old certificate: {e:#}"),
                 }
             }
-            c.0.clone()
-        };
+        }
+        let certs = certs.clone();
         // small responses go out at once (Nagle + delayed ACKs added ~40 ms to every API call)
         let _ = tcp.set_nodelay(true);
         let router = router.clone();
         tokio::spawn(async move {
-            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-            let Ok(Ok(tls)) = tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(tcp)).await else { return };
+            // the certificate follows the name the client asked for (SNI)
+            let handshake = async {
+                let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp).await.ok()?;
+                let sni = start.client_hello().server_name().map(|s| s.to_ascii_lowercase());
+                let cfg = {
+                    let c = certs.lock().unwrap();
+                    match (&c.tailnet, sni) {
+                        (Some((name, cfg, _)), Some(s)) if *name == s => cfg.clone(),
+                        _ => c.default.0.clone(),
+                    }
+                };
+                start.into_stream(cfg).await.ok()
+            };
+            let Ok(Some(tls)) = tokio::time::timeout(std::time::Duration::from_secs(10), handshake).await else { return };
             let svc = router.layer(axum::Extension(axum::extract::ConnectInfo::<SocketAddr>(peer))).layer(axum::Extension(Secure));
             let svc = hyper_util::service::TowerToHyperService::new(svc);
             let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())

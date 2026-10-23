@@ -433,7 +433,7 @@ fn deny(code: StatusCode, msg: &str) -> Response {
 pub async fn guard(State(d): State<Arc<Daemon>>, mut req: Request<Body>, next: axum::middleware::Next) -> Response {
     let path = req.uri().path().to_string();
     let is_lab = path.starts_with("/api/") || path == "/mcp" || path == "/message";
-    let public = (!path.starts_with("/v1/") && !is_lab) || matches!(path.as_str(), "/v1/ui/login" | "/v1/ui/tfa" | "/v1/ui/me" | "/v1/ui/logout");
+    let public = (!path.starts_with("/v1/") && !is_lab) || matches!(path.as_str(), "/v1/ui/login" | "/v1/ui/tfa" | "/v1/ui/me" | "/v1/ui/logout") || path.starts_with("/v1/wake/");
     if public {
         return next.run(req).await;
     }

@@ -495,6 +495,11 @@ impl Net {
     }
 
     /// Delete the rules tagged for `owner` (used before re-publishing, and on detach).
+    /// Take `owner`'s published ports down (attachment kept: re-attaching publishes them again).
+    pub fn unpublish_ports(&self, owner: &str) -> Result<()> {
+        self.unpublish(owner)
+    }
+
     fn unpublish(&self, owner: &str) -> Result<()> {
         let tag = format!("og:{owner}");
         if let Ok(rules) = self.table_rules() {

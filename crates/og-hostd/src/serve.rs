@@ -151,6 +151,8 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     tokio::spawn(crate::backup::scheduler(app.clone()));
     // VMs: autostart, and tidying up after ones that stopped on their own
     tokio::spawn(crate::vmrun::supervisor(app.clone()));
+    // containers labelled og.sleep-after: sleep when idle, wake on their next request
+    tokio::spawn(crate::activator::run(app.clone()));
 
     // supervisor + health loop
     {
@@ -197,6 +199,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .route("/v1/info", get(info))
         .route("/v1/events", get(events))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/wake/{name}", get(wake_state))
         .route("/v1/metrics/history", get(metrics_history))
         .route("/v1/metrics/series", get(metrics_series))
         .route("/v1/metrics/retention", get(metrics_retention).put(set_metrics_retention))
@@ -526,7 +529,7 @@ impl Daemon {
         let health = self.health.lock().unwrap().get(id).cloned();
         Some(json!({
             "id": m.id, "name": m.name, "image": m.image, "state": st.state, "exit_code": st.exit_code,
-            "pid": st.pid, "error": st.error, "created_at": m.created_at, "project": m.project, "service": m.service,
+            "pid": st.pid, "error": st.error, "created_at": m.created_at, "sleeping": m.desired == "sleeping", "project": m.project, "service": m.service,
             "restart": m.restart, "desired": m.desired, "network_mode": m.network_mode,
             "ip": m.net.as_ref().and_then(|a| a.ip), "ports": m.net.as_ref().map(|a| a.ports.clone()).unwrap_or_default(),
             "health": health, "started_at": st.started_at, "finished_at": st.finished_at, "oom_killed": st.oom_killed,
@@ -725,6 +728,19 @@ async fn set_metrics_retention(State(app): State<App>, Json(r): Json<og_lab::met
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(metrics_retention(State(app)).await)
+}
+
+/// Whether a sleep-when-idle container is up, asleep (it wakes on its next request) or down,
+/// without waking it: for status pages that would otherwise keep it awake. Public.
+async fn wake_state(State(app): State<App>, UrlPath(name): UrlPath<String>) -> Response {
+    let Ok(m) = app.node.find(&name) else { return (StatusCode::NOT_FOUND, Json(json!({"error": "no such container"}))).into_response() };
+    if crate::activator::sleep_after(&m.labels).is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not a sleep-when-idle container"}))).into_response();
+    }
+    let st = app.node.status(&m.id).state;
+    let state = if st == "running" { "up" } else if m.desired == "sleeping" { "sleeping" } else { "down" };
+    let code = if state == "down" { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
+    (code, Json(json!({"name": m.name, "state": state}))).into_response()
 }
 
 async fn restart(State(app): State<App>, UrlPath(id): UrlPath<String>) -> ApiResult<Json<serde_json::Value>> {

@@ -1,6 +1,7 @@
 //! og-hostd — OG-Host node daemon. Current milestone: images + containers from the CLI.
 
 mod access_api;
+mod activator;
 mod ai;
 mod auth;
 mod backup;
