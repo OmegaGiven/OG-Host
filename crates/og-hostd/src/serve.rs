@@ -136,6 +136,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
             eprintln!("og-hostd: /run/og-host permissions: {e}");
         }
     }
+    crate::memtune::setup_zram();
     crate::memcheck::on_start(&root);
     crate::memcheck::reapply(&root);
     let metric_store = Arc::new(og_lab::metrics::Metrics::open(&root.join("metrics.db")).context("opening the metrics history")?);
@@ -153,6 +154,8 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     tokio::spawn(crate::vmrun::supervisor(app.clone()));
     // containers labelled og.sleep-after: sleep when idle, wake on their next request
     tokio::spawn(crate::activator::run(app.clone()));
+    // idle containers give back memory (to zram / dropped cache)
+    tokio::spawn(crate::memtune::reclaimer(app.clone()));
 
     // supervisor + health loop
     {

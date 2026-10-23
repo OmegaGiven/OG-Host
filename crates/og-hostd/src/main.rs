@@ -22,6 +22,7 @@ mod idmap;
 mod labnode;
 mod logidx;
 mod memcheck;
+mod memtune;
 mod migrate;
 mod pools;
 mod resources;
