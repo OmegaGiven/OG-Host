@@ -1,0 +1,13 @@
+[Unit]
+Description=OG-Host API and Docker API sockets (kept open while og-hostd restarts)
+PartOf=og-hostd.service
+
+[Socket]
+ListenStream=/run/og-host/api.sock
+ListenStream=/run/og-host/docker.sock
+SocketMode=0600
+DirectoryMode=0755
+Service=og-hostd.service
+
+[Install]
+WantedBy=sockets.target

@@ -103,13 +103,54 @@ fn load_or_create_token(root: &Path) -> Result<String> {
     Ok(t)
 }
 
+/// Unix sockets handed over by systemd (socket activation, `og-hostd.socket`), by path. They
+/// stay open while og-hostd restarts, so clients (the Docker API's users, the CLI) queue for a
+/// moment instead of getting "connection refused".
+static INHERITED: std::sync::Mutex<Option<HashMap<PathBuf, std::os::unix::net::UnixListener>>> = std::sync::Mutex::new(None);
+
+fn take_inherited_sockets() {
+    use std::os::fd::FromRawFd;
+    let mine = std::env::var("LISTEN_PID").ok().and_then(|p| p.parse::<u32>().ok()) == Some(std::process::id());
+    let n: i32 = std::env::var("LISTEN_FDS").ok().and_then(|n| n.parse().ok()).unwrap_or(0);
+    // not for our children
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+    if !mine {
+        return;
+    }
+    let mut map = HashMap::new();
+    for fd in 3..3 + n {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        if let Some(p) = l.local_addr().ok().and_then(|a| a.as_pathname().map(PathBuf::from)) {
+            eprintln!("og-hostd: {} from systemd (kept open across restarts)", p.display());
+            map.insert(p, l);
+        } else {
+            std::mem::forget(l); // not a unix socket of ours: leave the fd alone
+        }
+    }
+    *INHERITED.lock().unwrap() = Some(map);
+}
+
+/// The listener for `path`: systemd's if it handed one over, else a fresh one (mode 0600).
+fn unix_listener(path: &std::path::Path) -> Result<std::os::unix::net::UnixListener> {
+    if let Some(l) = INHERITED.lock().unwrap().as_mut().and_then(|m| m.remove(path)) {
+        return Ok(l);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(path);
+    let l = std::os::unix::net::UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(l)
+}
+
 /// Serve the Docker Engine API on a unix socket (optionally scoped to one label).
 fn spawn_docker_socket(app: App, path: PathBuf, scope: Option<crate::dockerapi::Scope>) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::remove_file(&path);
-    let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    let listener = unix_listener(&path)?;
     listener.set_nonblocking(true)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     let router = crate::dockerapi::router(crate::dockerapi::Ctx { d: app, scope: scope.clone() });
     let svc = tower::ServiceExt::map_request(router, crate::dockerapi::strip_version);
@@ -136,6 +177,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
             eprintln!("og-hostd: /run/og-host permissions: {e}");
         }
     }
+    take_inherited_sockets();
     crate::memtune::setup_zram();
     crate::memcheck::on_start(&root);
     crate::memcheck::reapply(&root);
@@ -266,10 +308,9 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     // unix socket, root-only
     let sock = PathBuf::from("/run/og-host/api.sock");
     std::fs::create_dir_all(sock.parent().unwrap())?;
-    let _ = std::fs::remove_file(&sock);
-    let unix = tokio::net::UnixListener::bind(&sock).context("binding api socket")?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+    let unix = unix_listener(&sock).context("api socket")?;
+    unix.set_nonblocking(true)?;
+    let unix = tokio::net::UnixListener::from_std(unix)?;
     eprintln!("og-hostd: API on {}", sock.display());
     spawn_docker_socket(app.clone(), PathBuf::from("/run/og-host/docker.sock"), None)?;
     for spec in docker_scopes {
