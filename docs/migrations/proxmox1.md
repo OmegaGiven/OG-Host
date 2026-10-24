@@ -11,7 +11,7 @@ as **containers on OG-Host**, not VMs. No VM survives the move.
 | Samsung 990 EVO Plus 4 TB NVMe | Proxmox + all VM disks | **wiped**: OG-Host root, state, apps |
 | Seagate 16 TB + 12 TB (mergerfs `/mnt/media`, 13 of 26 TB used) | passed raw into the go VM | **untouched**; mounted on the og-host1 host (same mergerfs pool, same `/mnt/media` path) |
 | RTX 5080 | passed to station VM | **freed** for og-host1 containers (og-play streaming, AI models) |
-| WD Black SN850 NVMe (`6d:00.0`, vfio-bound, unused) and WD Red 2 TB (`sda`, no filesystem found) | idle | candidate mirrored (RAID1) backup datastore, once the user confirms they hold nothing |
+| WD Black SN850 NVMe (`6d:00.0`, vfio-bound, unused) and WD Red 2 TB (`sda`, no filesystem found) | idle | **left alone** (locked read-only during the install) |
 | Ryzen 9 7900X, 64 GB DDR5 at 4800 (rated 6000) | | same; EXPO on at the BIOS visit |
 
 ## Baseline (done)
@@ -68,21 +68,26 @@ the day. Their NFS mounts then point at og-host1 after it.
 - **Wolf** (moving to og-play on OG-Host) and the station VM itself.
 - **DOWNLOAD-VM** (retired yesterday), **og-host-dev** (old dev VM).
 
-### Not covered by the notes — decide (my suggestion in brackets)
+### Decided 2026-10-24 (second round)
 
-| Service | Where | Suggestion |
-|---|---|---|
-| Caddy (+ its TLS state) | go | [drop: tailscale serve on OG-Host replaces it; keep config in backup] |
-| cloudflared (omegagiven.com tunnel) + `omegagiven-site` | go | [bring back as containers: public site] |
-| OG Office dev + personal (`og-office`, `og-office-personal`) | go; data on media `APP-DATA/og-office*`, keys on NVMe | [bring back: keys/ must be backed up] |
-| Graphite editor | go | [bring back, tiny static site] |
-| mcp-tailnet (Claude phone/web tools via funnel) | go | [bring back as container] |
-| go-links (`go.service`, `go/…`) | go | [bring back; later feeds the cluster homepage aliases] |
-| Samba share + NFS export of `/mnt/media` | go | [bring back on the og-host1 host: og-host2's MeTube, liberate, libby, audiobooks write there] |
-| Ollama / llama-server / searxng / chromium-cdp, life worker + tika + memos, bead-render, og-poster agent | station | [life worker: yes, as a container on the 5080; the rest: back up, decide with the new AI system] |
-| EXIT-NODE VM | | [drop the VM; og-host1's own tailscale offers the exit node] |
-| dev VM (45 GB, unused since May), Windows VM, authentik-sso, docker CT | | [archive disk images, don't bring back] |
-| Alerts: libby + epic claimer + hardware alerts use station's Signal relay / OmegaEnv `/message` | | [until the new AI system: a small Signal relay container on og-host1 using the saved signal-cli data] |
+| Service | Decision |
+|---|---|
+| Cloudflare tunnels (`cloudflared` on go: omegagiven.com and others; OG Office tunnels) | **back up** tunnel tokens/credentials + config, **bring back** as containers |
+| OG Office dev + personal | **back up** (`~/og-office*/{keys,app,web}`, images, data on `/mnt/media/APP-DATA/og-office*`), **bring back**, each in its own container |
+| mcp-tailnet | **back up** only; redefine after all migrations |
+| go-links (`go.service`, `~/go-alias-rust`: shortcuts.json, work/hidden shortcuts, board, themes, `aoeu.db`, encrypted connections + key) | **back up**; becomes an **OG-Host cluster feature**: one node hosts the alias service, configured in the OG-Host UI (import these shortcuts) |
+| life worker (+ tika, memos) | **back up** only |
+| Samba share, NFS export | **not brought back** (see the consequence below) |
+| Ollama, searxng, llama-server, chromium-cdp, bead-render, og-poster agent, other station extras | **not brought back**; configs backed up with station's home; AI models saved (above) |
+| Exit node | **back up** its ProtonVPN (WireGuard) config + tailscale state, **bring back** as a container (phones use it) |
+| The two idle drives (WD Black NVMe, WD Red) | **leave alone**; the installer locks them read-only like the media drives |
+| Pterodactyl + OpenClaw backups | keep **until their replacements exist** |
+| Graphite editor | not mentioned yet: back up (static `dist/`), bring back if wanted |
+
+**Consequence of dropping the NFS export:** og-host2's MeTube, liberate (qBittorrent/importer),
+libby and audiobooks write into go's `/mnt/media` over NFS today. Without an export they need to
+**move to og-host1**, where the media drives will be local (recommended: they're light), or the
+media gets shared some other way inside the cluster.
 
 ## Naming and addresses
 
@@ -101,7 +106,7 @@ Remove the old `go`, `station`, `exit`, `download`, `proxmox` nodes from the tai
 3. **Alerts** without OmegaEnv: OG-Host notifications (hardware, integrity, failed containers)
    through the Signal relay container.
 4. **Host-level mergerfs + NFS/Samba export** on og-host1 (a host service, set up at install).
-5. **RAID1 backup datastore** on the two idle drives (the RAID-for-backups wish).
+5. ~~RAID1 backup datastore on the two idle drives~~: the user wants the idle drives left alone.
 6. Nightly OG-Host backup jobs for the app data dirs (none exist on Proxmox today).
 
 GPU/USB passthrough and VM import are **no longer needed** (no VMs come back).
@@ -129,6 +134,14 @@ Two kinds:
 3. Commit+push AudioComic's local changes; write the backup script (one run per service, listed
    above) and dry-run it.
 4. Whole VM images to the NAS; check.
+
+**Install method (decided): on site, from USB, interactive installer.** The installer lists
+every disk with size first, then model, serial, stable id and whether it already holds data;
+nothing is preselected; the final confirmation is typing the chosen disk's name; every other
+disk is set read-only in the kernel before anything is written; no os-prober; volume groups on
+other disks never auto-activate. Tested 2026-10-24 in a VM with decoy disks (an ext4 "media"
+disk, a copy of a real Proxmox disk, random data): byte-identical afterwards. Extra safety on
+site: unplug the two media drives before booting the USB stick if practical.
 
 **Phase 1: switch day**
 5. Disable the sync jobs (both go timers and the NAS cron). Pause og-host2's NFS writers
@@ -159,8 +172,7 @@ NVMe, `qmrestore`); the media drives were never part of it.
 
 ## Open questions
 
-1. The "decide" table above.
-2. Do the WD Black NVMe and the WD Red hold anything? (If not → RAID1 backup datastore.)
-3. On site (unplug drives, USB install, EXPO) or remote (kexec like og-host2)? On site is safer
-   for the media drives.
-4. Pterodactyl and OpenClaw backups: archive forever, or until the replacements exist?
+1. og-host2's NFS writers (MeTube, liberate, libby, audiobooks): move them to og-host1, or share
+   the media inside the cluster another way?
+2. Graphite editor: bring back?
+3. Switch day date (backups run first; nothing is installed before every backup is verified).
