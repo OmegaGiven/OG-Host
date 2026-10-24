@@ -376,6 +376,9 @@ pub fn rule(d: &Daemon, m: &Method, path: &str) -> Option<(String, &'static str)
         ["containers", id, "logs", ..] => r(format!("/containers/{}", ctr_name(d, id)), "Container.Console"),
         ["containers", id, "resources"] => r(format!("/containers/{}", ctr_name(d, id)), if get { "Container.Audit" } else { "Container.Config" }),
         ["stacks"] => r("/stacks".into(), "Stack.Audit"),
+        // the homepage and aliases: anyone who may see containers; changes are an admin's
+        ["apps"] | ["aliases"] => r("/containers".into(), "Container.Audit"),
+        ["apps" | "aliases", _] => r("/".into(), if get { "Sys.Audit" } else { "Sys.Modify" }),
         // a compose file anywhere on disk: root-equivalent
         ["stacks", "up" | "down"] => r("/".into(), "Sys.Modify"),
         ["stacks", name] => r(format!("/stacks/{name}"), if get { "Stack.Audit" } else { "Stack.Modify" }),

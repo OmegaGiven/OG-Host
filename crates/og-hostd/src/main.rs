@@ -2,6 +2,7 @@
 
 mod access_api;
 mod activator;
+mod apps;
 mod ai;
 mod auth;
 mod backup;
@@ -97,6 +98,13 @@ enum Cmd {
     Scrub,
     /// GPU power limits, kept across boots: no arguments lists them; UUID WATTS sets one (0 = default)
     GpuPower { uuid: Option<String>, watts: Option<u32> },
+    /// go-links aliases for this node: ls | add NAME URL [--tile] [--title T] [--group G]
+    /// [--icon I] | rm NAME | name SHORTNAME | listen ADDR|off | import shortcuts.json
+    /// (<root>/aliases.json).
+    Alias {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Test free memory while the server runs; bad pages are taken out of service at once and
     /// remembered (<root>/badram.json). `--boot` also reserves them (2 MiB each) from the next boot.
     Memtest {
@@ -498,6 +506,7 @@ async fn main() -> Result<()> {
             tokio::task::spawn_blocking(move || vma::cli(&root, &file, &pool, &name)).await??;
         }
         Cmd::GpuPower { uuid, watts } => hwhealth::power_cli(&cli.root, uuid, watts)?,
+        Cmd::Alias { args } => apps::cli(&cli.root, &args)?,
         Cmd::Scrub => {
             let root = cli.root.clone();
             tokio::task::spawn_blocking(move || integrity::cli(&root)).await??;

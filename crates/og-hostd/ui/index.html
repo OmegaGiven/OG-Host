@@ -136,6 +136,18 @@
     </div>
   </section>
 
+  <!-- APPS: tiles from this node's compose projects, and go-links aliases -->
+  <section id="view-myapps" class="view" hidden>
+    <div class="hero"><div><h1>Apps</h1><p class="hero-sub" id="maSub"></p></div></div>
+    <div class="toolbar">
+      <div class="seg" id="maTabs"><button data-sub="apps" class="on" data-icon="grid"> Apps</button><button data-sub="links" data-icon="link"> Aliases</button></div>
+      <span class="sp"></span>
+      <div class="q"><span data-icon="search"></span><input id="maQ" placeholder="Find an app or alias…" autocomplete="off"></div>
+    </div>
+    <div id="maApps"></div>
+    <div id="maLinks" hidden></div>
+  </section>
+
   <!-- OVERVIEW -->
   <section id="view-overview" class="view">
     <div class="hero">

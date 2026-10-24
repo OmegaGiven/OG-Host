@@ -227,6 +227,7 @@ async function startApp() {
   try { (await import('./vms.js')).init(H); } catch (e) { console.error(e); }
   try { (await import('./cluster.js')).init(H); } catch (e) { console.error(e); }
   try { (await import('./infra.js')).init(H); } catch (e) { console.error(e); }
+  try { (await import('./homepage.js')).init(H); } catch (e) { console.error(e); }
   if (S.lab) {
     try { (await import('./lab.js')).init(H); }
     catch (e) { console.error(e); S.lab = false; toast(`Lab UI failed to load: ${e.message}`, true); }
@@ -315,11 +316,11 @@ const ROUTES = {
   logs: { el: 'logs', tab: 'logs', run: (arg) => { paintLogSources(); if (arg) openLog(arg); else if (S.log.id) openLog(S.log.id); } },
   vms: { el: 'vms', tab: 'vms', run: () => {} },
 };
-const SERVER_TABS = [['overview', 'grid', 'Overview'], ['vms', 'monitor', 'VMs'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['network', 'net', 'Network'], ['backups', 'shield', 'Backups'], ['logs', 'logs', 'Logs'], ['cluster', 'servers', 'Cluster']];
+const SERVER_TABS = [['myapps', 'grid', 'Apps'], ['overview', 'activity', 'Overview'], ['vms', 'monitor', 'VMs'], ['containers', 'box', 'Containers'], ['stacks', 'layers', 'Stacks'], ['images', 'disc', 'Images'], ['storage', 'drive', 'Storage'], ['network', 'net', 'Network'], ['backups', 'shield', 'Backups'], ['logs', 'logs', 'Logs'], ['cluster', 'servers', 'Cluster']];
 let NAV = SERVER_TABS;
-function defaultView() { const v = S.lab ? 'home' : 'overview'; return allowedTab([v]) ? v : (NAV[0] ? NAV[0][0] : 'settings'); }
+function defaultView() { const v = S.lab ? 'home' : 'myapps'; return allowedTab([v]) ? v : (NAV[0] ? NAV[0][0] : 'settings'); }
 // what a page needs (held anywhere): pages the caller can't use are left out
-const NEEDS = { network: 'Sys.Audit', cluster: 'Cluster.Audit', backups: 'Datastore.Audit', vms: 'VM.Audit', overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
+const NEEDS = { myapps: 'Container.Audit', links: 'Container.Audit', network: 'Sys.Audit', cluster: 'Cluster.Audit', backups: 'Datastore.Audit', vms: 'VM.Audit', overview: 'Sys.Audit', server: 'Sys.Audit', images: 'Sys.Audit', storage: 'Sys.Audit', containers: 'Container.Audit', ctlogs: 'Container.Audit', stacks: 'Stack.Audit', vms: 'VM.Audit', home: 'Lab.Audit', monitor: 'Lab.Audit', explore: 'Lab.Audit', watch: 'Lab.Audit', apps: 'Lab.Audit' };
 let NAV_ALL = SERVER_TABS, SUB_ALL = [];
 const allowedTab = ([id]) => !S.me || !NEEDS[id] || can(NEEDS[id], '*') || (id === 'logs' && (can('Lab.Audit', '*') || can('Container.Audit', '*')));
 function setNav(tabs, sub) {

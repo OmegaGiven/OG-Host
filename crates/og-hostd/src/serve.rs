@@ -204,6 +204,8 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
     tokio::spawn(crate::omegaenv::run(app.clone()));
     // disks, kernel hardware errors, bad RAM: every 30 min
     tokio::spawn(crate::hwhealth::run(app.clone()));
+    // go-links redirects, when aliases.json names a listener
+    tokio::spawn(crate::apps::start(app.clone()));
     {
         let r = root.clone();
         tokio::task::spawn_blocking(move || crate::hwhealth::apply_power_limits(&r));
@@ -291,6 +293,7 @@ pub async fn serve(node: Node, root: PathBuf, listen: Option<String>, docker_sco
         .merge(crate::ai::router(app.clone()))
         .merge(crate::access_api::network_router(app.clone()))
         .merge(crate::ha::router(app.clone()))
+        .merge(crate::apps::router(app.clone()))
         // the Docker Engine API too (images, networks, volumes, exec, ...), for the UI
         .nest("/v1/docker", crate::dockerapi::router(crate::dockerapi::Ctx { d: app.clone(), scope: None }));
     // lab API (OmegaEnv paths): who's calling goes into the request for its handlers; root on
