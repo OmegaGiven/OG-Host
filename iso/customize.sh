@@ -8,6 +8,11 @@ install -m 0644 /src/packaging/og-hostd.service /src/packaging/og-hostd.socket "
 tar -xzf /out/cache/buildkit-*.linux-amd64.tar.gz -C "$R/usr/local" bin/buildkitd bin/buildctl bin/buildkit-runc
 install -m 0644 /src/packaging/og-buildkitd.service "$R/etc/systemd/system/og-buildkitd.service"
 cp -r /src/iso/overlay/. "$R/"
+# LVM: only OG-Host's own volume group activates by itself (install system and installed
+# system); volume groups on other disks (an old Proxmox install, someone else's array) stay
+# inactive unless asked for, so nothing touches them on its own
+sed -i 's|^\(\s*\)# auto_activation_volume_list = \[ "vg1".*|\1auto_activation_volume_list = [ "og" ]|' "$R/etc/lvm/lvm.conf"
+grep -q '^\s*auto_activation_volume_list = \[ "og" \]' "$R/etc/lvm/lvm.conf"
 
 # apt: Debian trixie with security and point-release updates
 rm -f "$R/etc/apt/sources.list"

@@ -50,6 +50,45 @@ struct Answers {
     /// extra kernel options for the installed system (e.g. memtest=4)
     kernel_args: String,
     reboot: bool,
+    /// unattended: the target's serial number, checked before anything is written
+    disk_serial: String,
+    /// unattended: show the plan and wait for `/run/og-installer/go` (holding the target's
+    /// serial) before writing anything; for remote installs watched over SSH
+    wait_for_go: bool,
+}
+
+/// (kernel name e.g. /dev/nvme0n1, serial, model, size) of a whole disk; `path` may be a
+/// /dev/disk/by-id/... link.
+fn disk_info(path: &str) -> Result<(String, String, String, u64)> {
+    let canon = std::fs::canonicalize(path).with_context(|| format!("no disk {path}"))?;
+    let c = canon.to_string_lossy().into_owned();
+    let v: Value = serde_json::from_str(&sh("lsblk", &["-dbJ", "-o", "PATH,TYPE,SERIAL,MODEL,SIZE", &c])?)?;
+    let d = &v["blockdevices"][0];
+    if d["type"] != "disk" {
+        bail!("{path} ({c}) is not a whole disk");
+    }
+    let size = d["size"].as_u64().or_else(|| d["size"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
+    Ok((c, d["serial"].as_str().unwrap_or("").trim().to_string(), d["model"].as_str().unwrap_or("").trim().to_string(), size))
+}
+
+/// Every block device that isn't the target disk or one of its partitions.
+fn other_block_devices(target: &str) -> Vec<String> {
+    // the target and everything stacked on it (partitions, LVM volumes on them)
+    let mine: Vec<String> = sh("lsblk", &["-nlpo", "NAME", target]).unwrap_or_default().lines().map(|l| l.trim().to_string()).collect();
+    let out = sh("lsblk", &["-nlpo", "NAME,TYPE,PKNAME"]).unwrap_or_default();
+    out.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (name, typ) = (*f.first()?, *f.get(1)?);
+            let parent = f.get(2).copied().unwrap_or("");
+            // no media in it (an empty floppy or card reader): nothing to write to
+            let size: u64 = std::fs::read_to_string(format!("/sys/class/block/{}/size", name.trim_start_matches("/dev/"))).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+            if size == 0 || name == target || parent == target || mine.iter().any(|m| m == name) || matches!(typ, "loop" | "rom") || name.starts_with("/dev/zram") || name.starts_with("/dev/ram") {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect()
 }
 
 fn sh(cmd: &str, args: &[&str]) -> Result<String> {
@@ -158,17 +197,131 @@ fn banner() {
     println!("\x1b[1m  ┌──────┐\n  │  OG  │   OG-Host {}\n  │ HOST │   installer\n  └──────┘\x1b[0m\n", crate::update::VERSION);
 }
 
+/// Human sizes the way drives are sold: 4.0 TB, 512 GB.
+fn human(bytes: u64) -> String {
+    let gb = bytes as f64 / 1e9;
+    if gb >= 1000.0 { format!("{:.1} TB", gb / 1000.0) } else { format!("{gb:.0} GB") }
+}
+
+/// The disk's stable name under /dev/disk/by-id (model + serial), e.g. nvme-Samsung_SSD_..._S7U8.
+fn by_id(dev: &str) -> String {
+    let mut best = String::new();
+    for e in std::fs::read_dir("/dev/disk/by-id").into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with("wwn-") || n.starts_with("nvme-eui") || n.contains("-part") {
+            continue;
+        }
+        if std::fs::canonicalize(e.path()).is_ok_and(|t| t.to_string_lossy() == dev) && (best.is_empty() || n.len() < best.len()) {
+            best = n;
+        }
+    }
+    best
+}
+
+/// What's on a disk already: file systems with labels and sizes, so disks holding data stand out.
+fn disk_contents(dev: &str) -> String {
+    let parts: Vec<String> = sh("lsblk", &["-nlpo", "FSTYPE,LABEL,SIZE", dev])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let fs = *f.first()?;
+            (f.len() >= 2 && !fs.chars().next()?.is_ascii_digit()).then(|| f.join(" "))
+        })
+        .collect();
+    if parts.is_empty() { "no file systems found".into() } else { format!("HAS DATA: {}", parts.join(", ")) }
+}
+
+/// Pick the install disk: arrow keys + Enter (or the number), size first. Every disk is listed
+/// with model, serial, stable id and what's on it. Nothing is preselected for Enter alone to take.
+fn pick_disk(ds: &[(String, u64, String)]) -> Result<usize> {
+    struct Row {
+        size: String,
+        dev: String,
+        model: String,
+        serial: String,
+        id: String,
+        has: String,
+    }
+    let rows: Vec<Row> = ds
+        .iter()
+        .map(|(p, s, d)| {
+            let (_, serial, model, _) = disk_info(p).unwrap_or_default();
+            Row { size: human(*s), dev: p.clone(), model: if model.is_empty() { d.clone() } else { model }, serial, id: by_id(p), has: disk_contents(p) }
+        })
+        .collect();
+    let draw = |cur: Option<usize>| {
+        print!("\x1b[2J\x1b[H");
+        println!("\n  \x1b[1mWhich disk should OG-Host be installed on?\x1b[0m");
+        println!("  Only that disk is erased. Every other disk is locked read-only before anything is written.");
+        println!("  \x1b[2mUp/Down to move, Enter to choose (or type its number). Nothing is selected yet.\x1b[0m\n");
+        for (i, r) in rows.iter().enumerate() {
+            let on = cur == Some(i);
+            let (a, b) = if on { ("\x1b[7m", "\x1b[0m") } else { ("", "") };
+            println!("  {a}{} {}) \x1b[1m{:>8}\x1b[22m  {:<36} {:<14}{b}", if on { ">" } else { " " }, i + 1, r.size, r.model, r.dev);
+            println!("        serial {}   id {}", if r.serial.is_empty() { "?" } else { &r.serial }, if r.id.is_empty() { "?" } else { &r.id });
+            let warn = r.has.starts_with("HAS DATA");
+            println!("        {}{}{}\n", if warn { "\x1b[33m" } else { "" }, r.has, if warn { "\x1b[0m" } else { "" });
+        }
+    };
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !tty {
+        draw(None);
+        loop {
+            match ask("Install on disk number", "").parse::<usize>() {
+                Ok(n) if (1..=rows.len()).contains(&n) => return Ok(n),
+                _ => println!("  Type the number of the disk (1 to {}).", rows.len()),
+            }
+        }
+    }
+    let _ = Command::new("stty").args(["-icanon", "-echo", "min", "1"]).status();
+    let mut cur: Option<usize> = None;
+    let result = (|| -> Result<usize> {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        loop {
+            draw(cur);
+            let _ = std::io::stdout().flush();
+            let mut b = [0u8; 1];
+            stdin.read_exact(&mut b)?;
+            match b[0] {
+                0x1b => {
+                    let mut seq = [0u8; 2];
+                    stdin.read_exact(&mut seq)?;
+                    let n = rows.len();
+                    match seq[1] {
+                        b'A' => cur = Some(cur.map(|c| (c + n - 1) % n).unwrap_or(n - 1)),
+                        b'B' => cur = Some(cur.map(|c| (c + 1) % n).unwrap_or(0)),
+                        _ => {}
+                    }
+                }
+                b'\r' | b'\n' => {
+                    if let Some(c) = cur {
+                        return Ok(c + 1);
+                    }
+                }
+                d @ b'1'..=b'9' => {
+                    let i = (d - b'1') as usize;
+                    if i < rows.len() {
+                        cur = Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })();
+    let _ = Command::new("stty").args(["icanon", "echo"]).status();
+    println!();
+    result
+}
+
 fn interactive() -> Result<Answers> {
     banner();
     let ds = disks();
     if ds.is_empty() {
         bail!("no disk of 16 GB or more to install on");
     }
-    println!("  Disks:");
-    for (i, (p, s, d)) in ds.iter().enumerate() {
-        println!("    {}) {p}  {:.0} GB  {d}", i + 1, *s as f64 / 1e9);
-    }
-    let pick: usize = ask("Install on disk number", "1").parse().unwrap_or(1).clamp(1, ds.len());
+    let pick = pick_disk(&ds)?;
     let (disk, size, _) = ds[pick - 1].clone();
     let gb = size >> 30;
     println!("\n  Layout: the system, and the rest of the disk as a thin pool for VM disks (like Proxmox).");
@@ -195,11 +348,13 @@ fn interactive() -> Result<Answers> {
     let root_password = ask_secret("Password");
     let ssh_key = ask("SSH public key for root (optional, Enter to skip)", "-");
     let ssh_key = if ssh_key == "-" { String::new() } else { ssh_key };
-    println!("\n  \x1b[1;31mEverything on {disk} will be erased.\x1b[0m");
-    if ask("Type yes to install", "") != "yes" {
+    let (_, serial, model, _) = disk_info(&disk)?;
+    let short = disk.trim_start_matches("/dev/").to_string();
+    println!("\n  \x1b[1;31mEverything on {disk} ({model}, serial {serial}) will be erased.\x1b[0m");
+    if ask(&format!("Type the disk's name ({short}) to install"), "") != short {
         bail!("cancelled");
     }
-    Ok(Answers { disk, fs, root_gb, thin: root_gb > 0, hostname, net, iface, address, gateway, dns, timezone, admin_user, admin_password, root_password, ssh_key, kernel_args: String::new(), reboot: true })
+    Ok(Answers { disk, fs, root_gb, thin: root_gb > 0, hostname, net, iface, address, gateway, dns, timezone, admin_user, admin_password, root_password, ssh_key, kernel_args: String::new(), reboot: true, disk_serial: String::new(), wait_for_go: false })
 }
 
 fn from_file(p: &Path) -> Result<Answers> {
@@ -220,10 +375,25 @@ fn from_file(p: &Path) -> Result<Answers> {
     };
     let kv: BTreeMap<String, String> = text.lines().filter(|l| !l.trim().starts_with('#')).filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches('"').to_string()))).collect();
     let g = |k: &str, d: &str| kv.get(k).cloned().unwrap_or_else(|| d.to_string());
+    // the target: never a guess when there's more than one disk
+    let candidates = disks();
     let disk = match g("disk", "auto").as_str() {
-        "auto" => disks().first().map(|d| d.0.clone()).context("no disk to install on")?,
+        "auto" if candidates.len() == 1 => candidates[0].0.clone(),
+        "auto" => bail!("this machine has {} disks: name the one to install on (disk = /dev/disk/by-id/...) and its serial (disk_serial = ...)", candidates.len()),
         d => d.to_string(),
     };
+    let (disk, serial, model, size) = disk_info(&disk)?;
+    if !candidates.iter().any(|c| c.0 == disk) {
+        bail!("{disk} isn't a disk OG-Host can be installed on (read-only, too small or the install medium)");
+    }
+    let want_serial = g("disk_serial", "");
+    if candidates.len() > 1 && want_serial.is_empty() {
+        bail!("this machine has {} disks: disk_serial is required (the target's is {serial:?})", candidates.len());
+    }
+    if !want_serial.is_empty() && want_serial != serial {
+        bail!("{disk} has serial {serial:?}, not {want_serial:?}: refusing to install");
+    }
+    step(&format!("target disk: {disk} ({model}, {} GB, serial {serial})", size / 1_000_000_000));
     let root_gb = g("root_gb", "24").parse().unwrap_or(24);
     // the install system itself takes SSH logins with this key (watch a remote install)
     let live_key = g("live_ssh_key", "");
@@ -256,6 +426,8 @@ fn from_file(p: &Path) -> Result<Answers> {
         ssh_key: g("ssh_key", ""),
         kernel_args: g("kernel_args", "").chars().filter(|c| c.is_ascii_graphic() || *c == ' ').filter(|c| !"\"'`$\\".contains(*c)).collect(),
         reboot: g("reboot", "yes") == "yes",
+        disk_serial: want_serial,
+        wait_for_go: g("wait_for_go", "no") == "yes",
     })
 }
 
@@ -280,15 +452,55 @@ fn install(a: &Answers) -> Result<()> {
         bail!("passwords missing (admin: 10+ characters), or give an ssh_key and no passwords");
     }
     let disk = a.disk.as_str();
+    let (_, serial, model, size) = disk_info(disk)?;
+    // every other disk is made read-only in the kernel first: whatever happens below (or any
+    // tool it runs) can't write to them; it lasts until the next boot
+    let mut others = other_block_devices(disk);
+    let mut no_media = Vec::new();
+    for d in &others {
+        if sh("blockdev", &["--setro", d]).is_err() {
+            // a device that can't even be opened (empty floppy/card slot) can't be written either
+            let gone = std::fs::File::open(d).err().and_then(|e| e.raw_os_error()).is_some_and(|c| c == libc::ENXIO || c == libc::ENOMEDIUM);
+            if !gone {
+                bail!("couldn't make {d} read-only: refusing to go on");
+            }
+            no_media.push(d.clone());
+        }
+    }
+    others.retain(|d| !no_media.contains(d));
+    let still_rw: Vec<&String> = others.iter().filter(|d| sh("blockdev", &["--getro", d]).map(|r| r.trim() != "1").unwrap_or(true)).collect();
+    if !still_rw.is_empty() {
+        bail!("still writable: {still_rw:?}: refusing to go on");
+    }
+    step(&format!("will erase {disk} ({model}, {} GB, serial {serial}); read-only now: {}", size / 1_000_000_000, if others.is_empty() { "none".to_string() } else { others.join(" ") }));
+    if a.wait_for_go {
+        let go = Path::new("/run/og-installer/go");
+        std::fs::create_dir_all("/run/og-installer")?;
+        std::fs::write("/run/og-installer/plan.txt", format!("erase {disk} {model} {} GB serial {serial}\nread-only: {}\n", size / 1_000_000_000, others.join(" ")))?;
+        step(&format!("waiting: write the target's serial to {} to start (plan in /run/og-installer/plan.txt)", go.display()));
+        loop {
+            if let Ok(t) = std::fs::read_to_string(go) {
+                if t.trim() == serial {
+                    break;
+                }
+                let _ = std::fs::remove_file(go);
+                step("that isn't the target's serial: still waiting");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
     step(&format!("partitioning {disk}"));
-    // what an earlier attempt (or an older install on this disk) left mounted or active
+    // what an earlier attempt (or an older install on this disk) left mounted or active, on
+    // this disk only
     let _ = sh("swapoff", &["-a"]);
     let _ = sh("umount", &["-R", TARGET]);
     let _ = sh("umount", &["-R", "-l", TARGET]);
-    for v in ["og", "pve"] {
-        let _ = sh("vgchange", &["-an", v]);
+    let tree = sh("lsblk", &["-nlpo", "NAME,TYPE", disk]).unwrap_or_default();
+    let mapped: Vec<String> = tree.lines().filter_map(|l| l.split_once(char::is_whitespace)).filter(|(_, t)| matches!(t.trim(), "lvm" | "crypt" | "dm")).map(|(n, _)| n.to_string()).collect();
+    for m in mapped.iter().rev() {
+        let name = m.trim_start_matches("/dev/mapper/");
+        let _ = sh("dmsetup", &["remove", "--retry", "-f", name]);
     }
-    let _ = sh("dmsetup", &["remove_all"]);
     let _ = sh("udevadm", &["settle"]);
     sh("wipefs", &["-a", "-f", disk])?;
     // GPT: BIOS boot, EFI, /boot (GRUB can't read thin volumes), the rest LVM
@@ -439,13 +651,13 @@ fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str, bootp: &str, state
     }
     // the install system's own pieces go
     step("boot loader");
-    let _ = chroot(&["dpkg", "--purge", "live-boot", "live-boot-initramfs-tools"]);
+    let _ = chroot(&["dpkg", "--purge", "live-boot", "live-boot-initramfs-tools", "os-prober"]);
     let _ = chroot(&["systemctl", "disable", "og-installer.service", "og-live-shell.service"]);
     chroot(&["update-initramfs", "-u", "-k", "all"])?;
     // GRUB boots the saved entry: an update tries a new kernel once before it becomes the default;
     // a kernel that panics reboots (into the previous one) after 10 s
     std::fs::create_dir_all(format!("{TARGET}/etc/default/grub.d"))?;
-    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), format!("GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet{}\"\n", if a.kernel_args.is_empty() { String::new() } else { format!(" {}", a.kernel_args) }))?;
+    std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host.cfg"), format!("GRUB_DISTRIBUTOR=\"OG-Host\"\nGRUB_TIMEOUT=3\n# never look at other disks for operating systems (mounting them can write to them)\nGRUB_DISABLE_OS_PROBER=true\nGRUB_CMDLINE_LINUX_DEFAULT=\"quiet{}\"\n", if a.kernel_args.is_empty() { String::new() } else { format!(" {}", a.kernel_args) }))?;
     std::fs::write(format!("{TARGET}/etc/default/grub.d/og-host-saved.cfg"), "# OG-Host updates: boot the saved entry; a panicking kernel reboots after 10 s\nGRUB_DEFAULT=saved\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX panic=10\"\n")?;
     // UEFI (also at the fallback path, so it boots without an NVRAM entry) and BIOS
     let efi = Path::new("/sys/firmware/efi").exists();
@@ -455,6 +667,15 @@ fn configure(a: &Answers, disk: &str, rootp: &str, esp: &str, bootp: &str, state
     }
     chroot(&["grub-install", "--target=i386-pc", disk])?;
     chroot(&["update-grub"])?;
+    // everything on the disk before saying done: a power cut right after must not leave the
+    // thin pools' metadata half-written
+    let _ = sh("umount", &["-R", TARGET]);
+    let _ = sh("sync", &[]);
+    if sh("vgchange", &["-an", "og"]).is_err() {
+        let _ = sh("umount", &["-R", "-l", TARGET]);
+        sh("vgchange", &["-an", "og"]).context("deactivating the new volumes")?;
+    }
+    let _ = sh("sync", &[]);
     step("done");
     Ok(())
 }
