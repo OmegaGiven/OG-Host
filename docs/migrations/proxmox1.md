@@ -1,109 +1,166 @@
-# Migrating proxmox1 to OG-Host
+# Migrating proxmox1 to OG-Host (`og-host1`)
 
-Inventory taken 2026-10-23/24. Usage history archived first (see "Baseline").
+Plan v2, 2026-10-24, from the inventory of 2026-10-23/24 and the user's decisions.
+Principle: **the media drives are never written to by the migration**, and services come back
+as **containers on OG-Host**, not VMs. No VM survives the move.
 
-## The machine
+## Hardware and what happens to it
 
-| | |
-|---|---|
-| Board / CPU | ASUS ROG STRIX B650E-F, Ryzen 9 7900X (12c/24t) |
-| RAM | 2 x 32 GB DDR5 at 4800 MT/s (rated 6000: EXPO off). 52 of 62 GB used, 3 GB swap in use |
-| NVMe | Samsung 990 EVO Plus 4 TB: Proxmox root 96 G + thin pool 3.5 T (1.9 T used) — **the only disk the install touches** |
-| HDDs (passed to go) | Seagate 16 TB (`ata-ST16000NT001-3LV101_K3S06HLY`, go `/mnt/disk1`, 12/15 T used), Seagate 12 TB (`ata-ST12000VN0008-3MH101_ZZ30N287-part1`, go `/mnt/disk2`, 0.7/11 T used); mergerfs → go `/mnt/media` |
-| Idle | WD Red 2 TB `sda` (one 931 G partition, no filesystem signature, healthy), WD Black SN850/SN810 NVMe `6d:00.0` (bound to vfio-pci, no VM uses it) |
-| GPU | RTX 5080 `01:00.0/.1` → station (vfio-pci at boot) |
-| Network | one NIC, bridge `vmbr0` 192.168.0.129/24, tailscale on the host |
-| Boot args | `amd_iommu=on iommu=pt vfio-pci.ids=15b7:5011,10de:2c02,10de:22e9` |
-| Backups | **none configured on the host** (no vzdump jobs) |
-
-## Guests
-
-| ID | Name | State | CPU / RAM | Disk | What it is / does |
-|---|---|---|---|---|---|
-| 100 | SERVICES (`go`) | running, autostart order 1 | 6c / 8 GB (swapping, 4/5 GB swap) | 300 G (80 %) + both HDDs raw | Main services: Immich, Jellyfin (native), Nextcloud, Navidrome, Audiobookshelf, Kavita, DroppedNeedle, Firefly, life, og-vault, OG Paper, OG Office x2, omegagiven.com, monmmo, Graphite, Caddy, cloudflared, OmegaEnv, mcp-tailnet, go-links (`go.service`), Samba, **NFS export of /mnt/media** (og-host2 depends on it), NAS sync timers, backups (life/firefly) |
-| 101 | EXIT-NODE | running | 2c / 2 GB | 20 G | Tailscale exit node only (`exit`, 100.81.18.1) |
-| 104 | DOWNLOAD-VM | running | 2c / 6 GB | 20 G | **Retired** 2026-10-23 (everything moved to og-host2); only leftover configs |
-| 105 | GPU-STATION (`station`) | running | 12c / 38 GB, RTX 5080 + USB 258a:010c | 2 T (72 %) | Game servers (Pterodactyl panel + Wings: Palworld, Necesse, Factorio, Bedrock, Minecraft Create; sleep/wake proxies), Wolf (Moonlight), Ollama, OpenClaw + Signal + OmegaEnv relay, life worker + tika, llama-server, searxng, chromium-cdp, audiocomic/bead-render/og-poster. Hidden from anti-cheat (`kvm=off,-hypervisor`, copied SMBIOS). Quirk: 5080 can fall off the bus after a VM restart |
-| 120 | og-host-dev | running, no autostart | 4c / 4 GB | 40 G | Old OG-Host development VM (superseded by og-host2 + bench VMs) |
-| 103 | dev | stopped | 2c / 6 GB | 128 G (45 G data) | Debian; config unchanged since 2026-05-15 |
-| 106 | Windows | stopped | 2c / 4 GB | 100 G | Win11 (installer ISO attached), last changed 2026-07-14 |
-| CT 102 | authentik-sso | stopped | 2c / 4 GB | 20 G | SSO; offline on the tailnet for 144 days |
-| CT 110 | docker | stopped, protected | 2c / 2 GB | 32 G | community-scripts Docker LXC |
-
-Host itself runs only tailscale, omega-agent, smartd.
+| Part | Today | After |
+|---|---|---|
+| Samsung 990 EVO Plus 4 TB NVMe | Proxmox + all VM disks | **wiped**: OG-Host root, state, apps |
+| Seagate 16 TB + 12 TB (mergerfs `/mnt/media`, 13 of 26 TB used) | passed raw into the go VM | **untouched**; mounted on the og-host1 host (same mergerfs pool, same `/mnt/media` path) |
+| RTX 5080 | passed to station VM | **freed** for og-host1 containers (og-play streaming, AI models) |
+| WD Black SN850 NVMe (`6d:00.0`, vfio-bound, unused) and WD Red 2 TB (`sda`, no filesystem found) | idle | candidate mirrored (RAID1) backup datastore, once the user confirms they hold nothing |
+| Ryzen 9 7900X, 64 GB DDR5 at 4800 (rated 6000) | | same; EXPO on at the BIOS visit |
 
 ## Baseline (done)
 
-All usage, log and capacity history is archived before anything changes, in two independent
-copies with identical checksums:
+All Proxmox usage/log/capacity history (RRD from 2026-03-14, journals, task logs, configs,
+SMART, OmegaEnv metrics + logs) is in two verified copies: og-host2
+`/var/lib/og-host/archive/proxmox1-baseline-2026-10-23/` and station-sway
+`~/archive/proxmox1-baseline-2026-10-23/`. Refresh it on switch day.
 
-- og-host2 `/var/lib/og-host/archive/proxmox1-baseline-2026-10-23/`
-- station-sway `~/archive/proxmox1-baseline-2026-10-23/`
+## Service by service
 
-Contents: Proxmox RRD history (host, every VM/CT, both storages; hour→decade, AVERAGE+MAX; data
-back to 2026-03-14) as JSON plus the raw rrdcached files; the host journal, `/var/log/pve` task
-logs and syslog; all guest configs and `/etc/pve`; SMART for every disk; current status
-snapshots; OmegaEnv's metrics database (all hosts, since 2026-10-11) and its logs for proxmox,
-go, station and download. **Refresh it the day of the switch** (same commands; the archive
-README in the og-host2 copy lists them) so the last weeks are in.
+Where the data lives today decides the work: data already on the media drives just stays;
+anything on the NVMe (VM disks) must be backed up before the wipe.
 
-## Decisions for the user
+### Bring back as containers on og-host1
 
-1. **Stopped guests and leftovers:** dev, Windows, authentik-sso, docker CT, og-host-dev,
-   DOWNLOAD-VM — import, archive (backup kept, not imported), or drop?
-2. **Idle drives:** the WD Black NVMe and the 2 TB WD Red: what's on them, and can they become
-   OG-Host's backup datastore (RAID1 of the two? the RAID-for-backups wish)?
-3. **go:** move it as a VM first and containerize later (recommended, lowest risk for the daily
-   services), or straight to host containers?
-4. **Window:** on-site (USB install) or remote (kexec install like og-host2)? Planned downtime
-   for go's services: about 2 hours; station: about 3–4 hours.
-5. **BIOS visit** (if on site): turn EXPO on for the DDR5 (6000), and check the result with the
-   boot memtest.
+| Service | Data on media (stays) | Data on NVMe (back up, restore) | Notes |
+|---|---|---|---|
+| **Immich** | library `/mnt/media/immich-library` (+ its nightly DB dumps in `…/backups`) | postgres `~/immich/postgres` (1.1 GB), ML model cache (0.8 GB, re-downloadable), compose + `.env` | restore from a fresh `pg_dumpall` taken after the services stop (not just the nightly dump); same Immich version first, upgrade later |
+| **Jellyfin** | the media | `/var/lib/jellyfin` (20 GB: library DB, metadata, images), `/etc/jellyfin`, `/var/cache` (skip) | native install today → official container with the same data/config dirs; library paths stay `/mnt/media/...` |
+| **Audiobookshelf** | `/mnt/media/BOOKS` | `/opt/audiobookshelf/{config,metadata}` (85 MB) | |
+| **OG Paper** | | `~/og-paper-server/data` (45 MB) + image | |
+| **monmmo** | ROMs per monmmo-deploy memory | docker volume `deploy_og-pokemmo-data` (170 MB) + `~/monmmo` (1.4 GB: assets/data/deploy) | rebuild image per the monmmo-deploy memory |
+| **Firefly III** | `/mnt/media/APP-DATA/firefly/{pgdata,upload}` | compose + `.env`, `~/firefly/simplefin-sync` (+ its timer), `ogfin` | pg data already on media; still take a `pg_dump` before stopping |
+| **life** (DB + API + gather) | `/mnt/media/APP-DATA/life/{pgdata,blobs,inbox,backups}` | `~/life/deploy` (compose, **secrets/**), `life-backup.timer` | life worker/tika/memos ran on station: see "Decide" |
+| **NAS sync jobs** | | `~/sync-scripts/` (push/pull + status server), their user timers, `~/sync-logs`; **NAS side:** `nas-push-to-go` cron + scripts on antietam-vault | **very important**; come back as host systemd timers on og-host1. Fix while at it: `--update` on the NAS→go job and the in-progress-file problem (memory go-nas-sync-hazard). Paths stay `/mnt/media` so the scripts barely change. **Disable both directions for the whole migration window** |
 
-## OG-Host work needed first
+### Move to og-host2 (containers, media over NFS)
 
-- **GPU passthrough on real hardware:** implemented, never tested on metal. Test on og-host2 by
-  passing its RTX 2060 to a VM (with a reserved-at-boot vfio binding).
-- **Reserve devices for VMs at boot:** a node setting that writes the vfio-pci ids + IOMMU
-  kernel args (today Proxmox has them in its own cmdline/modprobe files).
-- **VM start order and delay** (go before everything that mounts its NFS).
-- **GPU reset hook** for the 5080's "fallen off the bus" quirk (remove + rescan before start).
-- **Raw disk passthrough** check (`file: /dev/disk/by-id/...`) and `realistic` mode with station's
-  copied SMBIOS + `-cpu host,kvm=off,-hypervisor` + USB passthrough.
-- **Import of the backup format we choose** (`og-hostd import-vma` exists and was verified).
+| Service | Media | Back up from go |
+|---|---|---|
+| **Kavita** | `/mnt/media/BOOKS/Comics` (read via NFS) | `~/kavita/config` (2.4 GB) |
+| **Navidrome** | `/mnt/media/MUSIC` | `~/navidrome/data` (146 MB) |
+| **DroppedNeedle** | `/mnt/media/MUSIC`, `/mnt/media/downloads/soulseek` | `~/droppedneedle/{config,cache}` (7 MB) |
 
-## Plan
+These can move **before** the switch (og-host2 already mounts go's `/mnt/media`): less to do on
+the day. Their NFS mounts then point at og-host1 after it.
 
-**Phase 0 — prepare (no downtime)**
-1. Build and test the OG-Host items above (og-host2 for GPU passthrough).
-2. Backups of every guest we keep, to a place the install won't touch and the NAS sync can't
-   clobber: `vzdump --stdout | zstd` onto the 12 TB disk (9.7 T free), into a folder that is
-   first added to the exclusions of all three sync jobs (go push, go pull, NAS push-to-go), named
-   `*.partial` until complete then renamed; `zstd -t` each; test-import go's backup on og-host2.
-   Roughly 1.3–1.6 TB compressed for all guests.
-3. Refresh the baseline archive; write down go's and station's tailnet IPs/MACs (keep them, so
-   nothing else needs reconfiguring).
+### Back up only (not brought back)
 
-**Phase 1 — install (downtime starts)**
-4. Shut down guests cleanly (station first, then go). Install OG-Host on the 990 EVO Plus only
-   (disk picked by its by-id name; the HDDs are never touched). Same hostname/IP or new name
-   `og-host1`.
-5. Kernel args for IOMMU/vfio; tailscale up (approve link); join og-host2 as a cluster node.
+| What | Back up |
+|---|---|
+| **Nextcloud** (a new drive suite comes later) | `~/nextcloud-docker` (1.9 GB: app, config), `mysqldump` of the DB, users' files and notes (its data dir; `my_shared_media` is just `/mnt/media`, don't copy that). Export notes as files too |
+| **OG Note** (`og-vault`) | volume `og-vault-deploy_og-vault-data` (13 MB) + `notes-public/` |
+| **Pterodactyl** (game servers, not restarted yet) | panel DB `~/pterodactyl/panel/data/database` (+ `mysqldump`), panel data, Wings config, **server volumes `/var/lib/pterodactyl/volumes` (7.5 GB: Palworld, Necesse, Factorio, Bedrock, Create worlds)**, the wake/lazymc proxy units |
+| **OpenClaw** (a better AI system replaces it) | `~/.openclaw` (116 MB: agents, **skills**: firefly-report, homelab-map/-monitor/-triage, news-digest, note-catalog; credentials, identity, MCP auth), `~/openclaw`, unit files |
+| **Signal connectors** | `~/.local/share/signal-cli` (138 MB, the "Omega Lab" number's keys), `signal-omega` + `omegaenv-claw-relay` units, `libby-signal-relay` script + its allowed-recipient file |
+| **AI models** (kept for later) | `~/ollama/ollama-data` (6 GB), `~/ai-companion/models` (16 GB), `~/ai-companion/llama-models` (19 GB, incl. hermes-qwen3.5-35b), life-ollama models |
+| **AudioComic** (retired) | code is on GitHub (OmegaGiven/AudioComic, last push 2026-09-05) **but 6 local changes are uncommitted**: commit+push them; archive `~/comic-audiobook` (35 GB incl. venvs/outputs) and `~/audiocomic-secrets.env` |
+| **OmegaEnv** (decommissioned: OG-Host UI + cluster homepage replace it) | `~/omegaenv` incl. `core/data` (tiles, watches, secrets, notify config), `/mnt/media/APP-DATA/omegaenv` (metrics.db, logs; already in the baseline) — for `og-hostd lab import` into the new UI |
 
-**Phase 2 — bring services back**
-6. **go:** import as a VM (same MAC → same LAN IP and tailnet node), both HDDs passed through raw
-   as before, autostart first. Check: Immich, Jellyfin, Nextcloud, Firefly, OmegaEnv, NFS export
-   (og-host2's MeTube/liberate/libby/audiobooks write there), Caddy sites.
-7. **exit node:** either import the VM or make the OG-Host host itself the exit node (drop a VM).
-8. **station:** import as a VM, 5080 + USB passthrough, realistic mode with its SMBIOS; check
-   anti-cheat games, Wolf pairing, Pterodactyl game servers (never `docker stop` them).
+### Let go
 
-**Phase 3 — get the efficiency (over the following weeks)**
-9. Move go's services out of the VM into OG-Host containers one at a time (media disks mounted
-   on the host with mergerfs; NFS + Samba served by the host), then retire the go VM: that's
-   where most of the RAM goes back (8 GB VM that swaps → shared host RAM, as on og-host2).
-10. Sleep-when-idle for heavy idle services; GPU power caps; zram.
-11. After a week, compare with the baseline (`bench/results/`): host RAM, CPU, power, per-service.
+- **Wolf** (moving to og-play on OG-Host) and the station VM itself.
+- **DOWNLOAD-VM** (retired yesterday), **og-host-dev** (old dev VM).
 
-**Rollback:** until Phase 3 starts, the backups + a Proxmox ISO restore everything (reinstall
-Proxmox, `qmrestore` each backup). Keep the backups at least until go is fully containerized.
+### Not covered by the notes — decide (my suggestion in brackets)
+
+| Service | Where | Suggestion |
+|---|---|---|
+| Caddy (+ its TLS state) | go | [drop: tailscale serve on OG-Host replaces it; keep config in backup] |
+| cloudflared (omegagiven.com tunnel) + `omegagiven-site` | go | [bring back as containers: public site] |
+| OG Office dev + personal (`og-office`, `og-office-personal`) | go; data on media `APP-DATA/og-office*`, keys on NVMe | [bring back: keys/ must be backed up] |
+| Graphite editor | go | [bring back, tiny static site] |
+| mcp-tailnet (Claude phone/web tools via funnel) | go | [bring back as container] |
+| go-links (`go.service`, `go/…`) | go | [bring back; later feeds the cluster homepage aliases] |
+| Samba share + NFS export of `/mnt/media` | go | [bring back on the og-host1 host: og-host2's MeTube, liberate, libby, audiobooks write there] |
+| Ollama / llama-server / searxng / chromium-cdp, life worker + tika + memos, bead-render, og-poster agent | station | [life worker: yes, as a container on the 5080; the rest: back up, decide with the new AI system] |
+| EXIT-NODE VM | | [drop the VM; og-host1's own tailscale offers the exit node] |
+| dev VM (45 GB, unused since May), Windows VM, authentik-sso, docker CT | | [archive disk images, don't bring back] |
+| Alerts: libby + epic claimer + hardware alerts use station's Signal relay / OmegaEnv `/message` | | [until the new AI system: a small Signal relay container on og-host1 using the saved signal-cli data] |
+
+## Naming and addresses
+
+go (192.168.0.137) is referenced by og-host2's NFS mount, the NAS sync jobs, liberate's
+`extra_hosts` and old bookmarks. Proposal: **og-host1 takes LAN IP 192.168.0.137** (so NFS
+clients and the NAS keep working) with tailnet name `og-host1`; update the few `go` names.
+Remove the old `go`, `station`, `exit`, `download`, `proxmox` nodes from the tailnet after.
+
+## OG-Host work before the switch
+
+1. **Cluster** og-host1 + og-host2 (exists: `og-hostd` cluster join; test on the bench pair again).
+2. **Cluster homepage** that builds itself from the services on both nodes (tiles from compose
+   projects: name, URL from `tailscale serve`/published ports, health, sleeping state, icons via
+   `og.*` labels; go-links aliases) — the "auto front-end tiles" request — plus import of
+   OmegaEnv's tiles/watches (`og-hostd lab import`).
+3. **Alerts** without OmegaEnv: OG-Host notifications (hardware, integrity, failed containers)
+   through the Signal relay container.
+4. **Host-level mergerfs + NFS/Samba export** on og-host1 (a host service, set up at install).
+5. **RAID1 backup datastore** on the two idle drives (the RAID-for-backups wish).
+6. Nightly OG-Host backup jobs for the app data dirs (none exist on Proxmox today).
+
+GPU/USB passthrough and VM import are **no longer needed** (no VMs come back).
+
+## Backups: where
+
+Not on the media drives (user rule), not on the NVMe (wiped). Two copies:
+- **NAS** (antietam-vault, 9.4 TB free) in a folder **outside** `/srv/media` (the sync only covers
+  `/srv/media`), e.g. `/srv/backup/proxmox1-2026-10-xx/`.
+- **og-host2** `/var/lib/og-host/archive/` (545 GB free) for the app-level backups (small).
+
+Two kinds:
+- **App-level** (what gets restored): DB dumps taken with services stopped, config/data dirs,
+  compose files, secrets, unit files — about **120 GB** with the AI models and AudioComic, ~25 GB
+  without. Checksums recorded at the source, compared at both copies.
+- **Whole VM images** (insurance, never restored unless something was missed): vzdump of go
+  (300 G disk) and station (2 T disk, ~1.4 T used) + the small/stopped guests to the NAS only
+  (~1–1.5 TB compressed), each written as `.partial` then renamed, `zstd -t` checked.
+
+## Schedule
+
+**Phase 0: prepare (no downtime, days before)**
+1. Build items 1–4 above on og-host2 / bench.
+2. Move Kavita, Navidrome, DroppedNeedle to og-host2; check they read the media over NFS.
+3. Commit+push AudioComic's local changes; write the backup script (one run per service, listed
+   above) and dry-run it.
+4. Whole VM images to the NAS; check.
+
+**Phase 1: switch day**
+5. Disable the sync jobs (both go timers and the NAS cron). Pause og-host2's NFS writers
+   (MeTube, liberate importer, libby, audiobooks).
+6. Stop services on go and station; take the final app-level backups (DB dumps with everything
+   stopped); verify both copies' checksums. Refresh the baseline archive.
+7. Shut down all guests and the host. **If on site: unplug the two media drives (and the idle
+   ones) before installing.** Install OG-Host on the 990 EVO Plus, picked by its by-id name.
+8. Plug the drives back, mount the mergerfs pool read-only first and check it (file counts and a
+   checksum sample against the NAS copy), then read-write.
+
+**Phase 2: bring back (same day, in this order)**
+9. Host: tailscale up, IP .137, NFS + Samba exports, join the cluster with og-host2, Signal relay.
+10. Firefly, life, Immich, Jellyfin, Audiobookshelf (the daily ones), then OG Paper, monmmo,
+    OG Office, omegagiven.com, mcp-tailnet, go-links, Graphite.
+11. Re-enable og-host2's NFS writers; re-enable the sync jobs **last**, after a dry run
+    (`RSYNC_EXTRA="-n -i"`) shows no unexpected deletions or overwrites.
+12. og-play on the 5080; life worker on the 5080.
+
+**Phase 3: after**
+13. Cluster homepage live; OmegaEnv on go was the VM, so it's gone with it: confirm everything it
+    did is covered (dashboard, alerts, logs, metrics).
+14. A week later: compare with the baseline (`bench/results/`).
+15. Keep the backups until everything has run cleanly for a month.
+
+**Rollback:** the whole-VM images + a Proxmox ISO restore the old setup (reinstall Proxmox on the
+NVMe, `qmrestore`); the media drives were never part of it.
+
+## Open questions
+
+1. The "decide" table above.
+2. Do the WD Black NVMe and the WD Red hold anything? (If not → RAID1 backup datastore.)
+3. On site (unplug drives, USB install, EXPO) or remote (kexec like og-host2)? On site is safer
+   for the media drives.
+4. Pterodactyl and OpenClaw backups: archive forever, or until the replacements exist?
